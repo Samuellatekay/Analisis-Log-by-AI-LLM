@@ -1,0 +1,503 @@
+"""
+main.py - Orchestrator "Analisis Log by AI/LLM"
+
+Redis Stream (consumer group) -> hitung risk -> PostgreSQL (temp) -> Logstash (log awal, 1 POST/batch)
+                                                   `-> antrean prioritas -> worker Ollama (background)
+                                                          -> Logstash (hasil AI, UUID sama) + update PostgreSQL
+
+Ketahanan terhadap burst:
+- Redis Streams + consumer group (at-least-once, bisa scale horizontal, XAUTOCLAIM untuk pesan nyangkut)
+- Pemrosesan per-batch (1 pipeline Redis, 1 executemany DB, 1 POST Logstash)
+- Connection pool (asyncpg, httpx, redis)
+- UUID deterministik (uuid5 dari ID pesan stream) => redelivery idempoten
+- Antrean AI terbatas + prioritas risk tertinggi; kelebihan beban => status 'skipped_overload'
+- Dead-letter stream untuk pesan rusak / gagal kirim ke Logstash
+"""
+from __future__ import annotations
+
+import asyncio
+import itertools
+import logging
+import os
+import signal
+import socket
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+import asyncpg
+import httpx
+import orjson
+import redis.asyncio as aioredis
+from redis.exceptions import ResponseError
+
+from llm_analyzer import build_analyzer
+from risk_calculator import assess_event
+
+try:
+    import uvloop
+except ImportError:  # opsional
+    uvloop = None
+
+log = logging.getLogger("log-analyzer")
+UUID_NS = uuid.UUID("6f1c2f0e-8c1e-4e0a-9d52-3b1f7a5e9c11")
+LATENCY_BUDGET_S = 1.0
+
+
+# ----------------------------------------------------------------- Konfigurasi
+def _e(name: str, default: str) -> str:
+    return os.environ.get(name, default)
+
+
+@dataclass(frozen=True)
+class Settings:
+    redis_url: str
+    stream_key: str
+    group: str
+    dlq_key: str
+    consumer_workers: int
+    batch_size: int
+    block_ms: int
+    reclaim_idle_ms: int
+    repeat_window_s: int
+    pg_dsn: str
+    pg_pool_min: int
+    pg_pool_max: int
+    retention_minutes: int
+    retention_interval_s: int
+    logstash_url: str
+    logstash_user: str
+    logstash_password: str
+    logstash_timeout_s: float
+    ollama_url: str
+    ollama_model: str
+    ollama_timeout_s: float
+    persona_path: str
+    ai_workers: int
+    ai_queue_max: int
+    ai_min_risk: float
+    risk_normalize: bool
+    shutdown_grace_s: float
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        return cls(
+            redis_url=_e("REDIS_URL", "redis://localhost:6379/0"),
+            stream_key=_e("REDIS_STREAM", "logs:raw"),
+            group=_e("REDIS_GROUP", "log-analyzer"),
+            dlq_key=_e("REDIS_DLQ_STREAM", "logs:dlq"),
+            consumer_workers=int(_e("CONSUMER_WORKERS", "2")),
+            batch_size=int(_e("BATCH_SIZE", "200")),
+            block_ms=int(_e("BLOCK_MS", "1000")),
+            reclaim_idle_ms=int(_e("RECLAIM_IDLE_MS", "30000")),
+            repeat_window_s=int(_e("REPEAT_WINDOW_S", "300")),
+            pg_dsn=_e("POSTGRES_DSN", "postgresql://analyzer:analyzer@localhost:5432/analyzer"),
+            pg_pool_min=int(_e("PG_POOL_MIN", "2")),
+            pg_pool_max=int(_e("PG_POOL_MAX", "10")),
+            retention_minutes=int(_e("RETENTION_MINUTES", "60")),
+            retention_interval_s=int(_e("RETENTION_INTERVAL_S", "60")),
+            logstash_url=_e("LOGSTASH_URL", "http://localhost:8080"),
+            logstash_user=_e("LOGSTASH_USER", ""),
+            logstash_password=_e("LOGSTASH_PASSWORD", ""),
+            logstash_timeout_s=float(_e("LOGSTASH_TIMEOUT_S", "5")),
+            ollama_url=_e("OLLAMA_URL", "http://localhost:11434"),
+            ollama_model=_e("OLLAMA_MODEL", "llama3.1:8b"),
+            ollama_timeout_s=float(_e("OLLAMA_TIMEOUT_S", "600")),
+            persona_path=_e("PERSONA_PATH", "soc_persona.md"),
+            ai_workers=int(_e("AI_WORKERS", "2")),
+            ai_queue_max=int(_e("AI_QUEUE_MAX", "1000")),
+            ai_min_risk=float(_e("AI_MIN_RISK", "40")),
+            risk_normalize=_e("RISK_NORMALIZE", "false").lower() == "true",
+            shutdown_grace_s=float(_e("SHUTDOWN_GRACE_S", "20")),
+        )
+
+
+# ------------------------------------------------------------------ Data model
+@dataclass(slots=True)
+class Record:
+    msg_id: str
+    log_uuid: uuid.UUID
+    received_at: datetime
+    log_day: str
+    risk_score: float
+    ai_status: str
+    doc: dict
+
+
+SCHEMA_SQL = """
+CREATE UNLOGGED TABLE IF NOT EXISTS log_events (
+    log_uuid      UUID PRIMARY KEY,
+    received_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    risk_score    REAL NOT NULL,
+    payload       JSONB NOT NULL,
+    ai_status     TEXT NOT NULL DEFAULT 'pending',
+    ai_result     JSONB,
+    ai_updated_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_log_events_received_at ON log_events (received_at);
+"""
+
+
+# -------------------------------------------------------------------- Database
+class Database:
+    def __init__(self, s: Settings):
+        self.s = s
+        self.pool: asyncpg.Pool | None = None
+
+    async def start(self) -> None:
+        for attempt in range(10):  # tunggu DB siap
+            try:
+                self.pool = await asyncpg.create_pool(
+                    self.s.pg_dsn, min_size=self.s.pg_pool_min,
+                    max_size=self.s.pg_pool_max, command_timeout=10)
+                break
+            except (OSError, asyncpg.PostgresError) as exc:
+                log.warning("DB belum siap (%s), retry %d", type(exc).__name__, attempt + 1)
+                await asyncio.sleep(2)
+        else:
+            raise RuntimeError("Tidak bisa terhubung ke PostgreSQL")
+        async with self.pool.acquire() as conn:
+            await conn.execute(SCHEMA_SQL)
+
+    async def insert_many(self, records: list[Record]) -> None:
+        rows = [(r.log_uuid, r.received_at, r.risk_score,
+                 orjson.dumps(r.doc).decode(), r.ai_status) for r in records]
+        async with self.pool.acquire() as conn:
+            await conn.executemany(
+                "INSERT INTO log_events (log_uuid, received_at, risk_score, payload, ai_status) "
+                "VALUES ($1,$2,$3,$4::jsonb,$5) ON CONFLICT (log_uuid) DO NOTHING", rows)
+
+    async def update_ai(self, log_uuid: uuid.UUID, status: str, result: dict | None = None) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE log_events SET ai_status=$2, ai_result=$3::jsonb, ai_updated_at=now() "
+                "WHERE log_uuid=$1",
+                log_uuid, status, orjson.dumps(result).decode() if result is not None else None)
+
+    async def mark_many(self, ids: list[uuid.UUID], status: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE log_events SET ai_status=$2, ai_updated_at=now() WHERE log_uuid = ANY($1::uuid[])",
+                ids, status)
+
+    async def purge_old(self, minutes: int) -> int:
+        """Retensi: hapus log yang umurnya > N menit (default 60)."""
+        async with self.pool.acquire() as conn:
+            res = await conn.execute(
+                "DELETE FROM log_events WHERE received_at < now() - make_interval(mins => $1)", minutes)
+        return int(res.split()[-1])
+
+    async def close(self) -> None:
+        if self.pool:
+            await self.pool.close()
+
+
+# -------------------------------------------------------------------- Logstash
+class LogstashClient:
+    """Logstash http input (codec json): array JSON dipecah menjadi banyak event."""
+
+    def __init__(self, s: Settings):
+        auth = (s.logstash_user, s.logstash_password) if s.logstash_user else None
+        self._client = httpx.AsyncClient(
+            base_url=s.logstash_url, auth=auth,
+            timeout=httpx.Timeout(s.logstash_timeout_s, connect=2.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
+
+    async def send(self, docs: list[dict], attempts: int = 3) -> bool:
+        body = orjson.dumps(docs)
+        for i in range(attempts):
+            try:
+                r = await self._client.post("/", content=body,
+                                            headers={"Content-Type": "application/json"})
+                if r.status_code < 300:
+                    return True
+                if r.status_code < 500 and r.status_code != 429:
+                    log.error("Logstash menolak payload: HTTP %s", r.status_code)
+                    return False
+            except httpx.HTTPError as exc:
+                log.warning("Logstash error (%s) percobaan %d", type(exc).__name__, i + 1)
+            await asyncio.sleep(min(0.2 * 2 ** i, 2.0))
+        return False
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+
+# ------------------------------------------------------------------------- App
+class App:
+    def __init__(self, s: Settings):
+        self.s = s
+        self.stop = asyncio.Event()
+        self.db = Database(s)
+        self.logstash = LogstashClient(s)
+        self.llm = build_analyzer(os.environ, s.persona_path)  # ollama/openai/anthropic/gemini + fallback
+        self.redis = aioredis.from_url(s.redis_url, decode_responses=True, max_connections=50,
+                                       health_check_interval=30, socket_keepalive=True)
+        self.ai_queue: asyncio.PriorityQueue = asyncio.PriorityQueue(maxsize=s.ai_queue_max)
+        self._seq = itertools.count()
+        self._host = socket.gethostname()
+
+    # ---- lifecycle
+    async def run(self) -> None:
+        s = self.s
+        await self.db.start()
+        await self._ensure_group()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, self.stop.set)
+
+        ai_tasks = [asyncio.create_task(self._ai_worker(i)) for i in range(s.ai_workers)]
+        loops = [asyncio.create_task(self._consumer_loop(f"{self._host}-{os.getpid()}-{i}"))
+                 for i in range(s.consumer_workers)]
+        loops += [asyncio.create_task(self._reclaim_loop()), asyncio.create_task(self._retention_loop())]
+        log.info("Started: %d consumer, %d AI worker, providers=%s",
+                 s.consumer_workers, s.ai_workers, self.llm.label)
+
+        await self.stop.wait()
+        log.info("Shutdown: menghentikan consumer...")
+        await asyncio.gather(*loops, return_exceptions=True)
+        try:
+            await asyncio.wait_for(self.ai_queue.join(), s.shutdown_grace_s)
+        except asyncio.TimeoutError:
+            log.warning("Antrean AI belum kosong (%d); sisa dibuang", self.ai_queue.qsize())
+        for t in ai_tasks:
+            t.cancel()
+        await asyncio.gather(*ai_tasks, return_exceptions=True)
+        await asyncio.gather(self.llm.aclose(), self.logstash.aclose(), self.db.close(),
+                             self.redis.aclose(), return_exceptions=True)
+
+    async def _ensure_group(self) -> None:
+        try:
+            await self.redis.xgroup_create(self.s.stream_key, self.s.group, id="0", mkstream=True)
+        except ResponseError as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
+
+    async def _sleep(self, seconds: float) -> None:
+        try:
+            await asyncio.wait_for(self.stop.wait(), seconds)
+        except asyncio.TimeoutError:
+            pass
+
+    # ---- ingestion
+    async def _consumer_loop(self, name: str) -> None:
+        s, backoff = self.s, 0.5
+        while not self.stop.is_set():
+            try:
+                resp = await self.redis.xreadgroup(s.group, name, {s.stream_key: ">"},
+                                                   count=s.batch_size, block=s.block_ms)
+                if resp:
+                    await self._handle_batch(resp[0][1])
+                backoff = 0.5
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Consumer %s error; pesan tetap pending (akan di-reclaim)", name)
+                await self._sleep(backoff)
+                backoff = min(backoff * 2, 5.0)
+
+    async def _reclaim_loop(self) -> None:
+        """Ambil alih pesan pending yang menggantung (crash / DB error sesaat)."""
+        s, name = self.s, f"{self._host}-{os.getpid()}-reclaim"
+        while not self.stop.is_set():
+            await self._sleep(s.reclaim_idle_ms / 2000)
+            try:
+                cursor = "0-0"
+                while not self.stop.is_set():
+                    res = await self.redis.xautoclaim(s.stream_key, s.group, name,
+                                                      min_idle_time=s.reclaim_idle_ms,
+                                                      start_id=cursor, count=s.batch_size)
+                    cursor, entries = res[0], res[1]
+                    if entries:
+                        log.info("Reclaim %d pesan pending", len(entries))
+                        await self._handle_batch([e for e in entries if e and e[1]])
+                    if cursor in ("0-0", b"0-0") or not entries:
+                        break
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Reclaim error")
+
+    async def _handle_batch(self, entries: list) -> None:
+        s, t0 = self.s, time.perf_counter()
+        parsed: list[tuple[str, dict]] = []
+        dlq: list[tuple[str, str, str]] = []  # (msg_id, reason, payload)
+        for msg_id, fields in entries:
+            try:
+                data = orjson.loads(fields["data"])
+                if not isinstance(data, dict):
+                    raise ValueError("payload bukan objek")
+                parsed.append((msg_id, data))
+            except Exception as exc:
+                dlq.append((msg_id, f"parse_error:{type(exc).__name__}", orjson.dumps(fields).decode()))
+
+        records: list[Record] = []
+        if parsed:
+            extras = await self._enrich([d for _, d in parsed])
+            now = datetime.now(timezone.utc)
+            for (msg_id, data), (repeat, crit) in zip(parsed, extras):
+                records.append(self._build_record(msg_id, data, repeat, crit, now))
+            # Jika DB gagal -> exception -> tidak di-ACK -> diproses ulang (idempoten)
+            await self.db.insert_many(records)
+            ok = await self.logstash.send([r.doc for r in records])
+            sent_s = time.perf_counter() - t0
+            if not ok:
+                for r in records:
+                    dlq.append((r.msg_id, "logstash_failed", orjson.dumps(r.doc).decode()))
+            records_ok = records if ok else []
+        else:
+            sent_s, records_ok = 0.0, []
+
+        if dlq:
+            await self._send_dlq(dlq)
+        await self.redis.xack(s.stream_key, s.group, *[e[0] for e in entries])
+
+        if records_ok:
+            await self._enqueue_ai(records_ok)
+            now_ms = time.time() * 1000
+            e2e = max(now_ms - int(r.msg_id.split("-")[0]) for r in records_ok) / 1000
+            level = logging.WARNING if sent_s > LATENCY_BUDGET_S else logging.DEBUG
+            log.log(level, "batch=%d proses+kirim=%.3fs e2e_max=%.3fs ai_queue=%d",
+                    len(records_ok), sent_s, e2e, self.ai_queue.qsize())
+
+    async def _enrich(self, events: list[dict]) -> list[tuple[int, float | None]]:
+        """1 pipeline Redis per batch: counter pengulangan (+ fallback asset criticality)."""
+        s = self.s
+        pipe = self.redis.pipeline(transaction=False)
+        need_asset: list[bool] = []
+        for d in events:
+            pipe.incr(self._repeat_key(d))
+            pipe.expire(self._repeat_key(d), s.repeat_window_s)
+            asset = d.get("asset") if isinstance(d.get("asset"), dict) else {}
+            host = (d.get("host") or {}).get("name") if isinstance(d.get("host"), dict) else None
+            need = asset.get("criticality") is None and bool(host or asset.get("id"))
+            if need:
+                pipe.hget(f"asset:{asset.get('id') or host}", "criticality")
+            need_asset.append(need)
+        res = await pipe.execute()
+        out, i = [], 0
+        for need in need_asset:
+            repeat = int(res[i]); i += 2
+            crit = None
+            if need:
+                try:
+                    crit = float(res[i]) if res[i] is not None else None
+                except (TypeError, ValueError):
+                    crit = None
+                i += 1
+            out.append((repeat, crit))
+        return out
+
+    @staticmethod
+    def _repeat_key(d: dict) -> str:
+        src = d.get("source") if isinstance(d.get("source"), dict) else {}
+        ev = d.get("event") if isinstance(d.get("event"), dict) else {}
+        host = d.get("host") if isinstance(d.get("host"), dict) else {}
+        who = str(src.get("ip") or host.get("name") or "unknown")[:80]
+        what = str(ev.get("action") or ev.get("category") or "unknown")[:80]
+        return f"repeat:{who}:{what}"
+
+    def _build_record(self, msg_id: str, data: dict, repeat: int, crit: float | None,
+                      now: datetime) -> Record:
+        risk = assess_event(data, repeat, crit, self.s.risk_normalize)
+        log_uuid = uuid.uuid5(UUID_NS, msg_id)  # deterministik => idempoten
+        ev = data.get("event") if isinstance(data.get("event"), dict) else {}
+        ai_status = "pending" if risk.score >= self.s.ai_min_risk else "skipped_low_risk"
+        log_day = now.strftime("%Y.%m.%d")
+        doc = {
+            "event_type": "raw",
+            "log_uuid": str(log_uuid),
+            "log_day": log_day,
+            "@timestamp": data.get("@timestamp") or now.isoformat(),
+            "event": {k: ev.get(k) for k in ("action", "category", "severity", "outcome") if k in ev},
+            "source": data.get("source"),
+            "reputation": data.get("reputation"),
+            "geolocation": data.get("geolocation"),
+            "asset": data.get("asset"),
+            "domain": data.get("domain"),
+            "risk": {**risk.as_dict(), "repeat_count": repeat},
+            "ai": {"status": ai_status},
+        }
+        return Record(msg_id, log_uuid, now, log_day, risk.score, ai_status, doc)
+
+    async def _send_dlq(self, items: list[tuple[str, str, str]]) -> None:
+        pipe = self.redis.pipeline(transaction=False)
+        for msg_id, reason, payload in items:
+            pipe.xadd(self.s.dlq_key, {"msg_id": msg_id, "reason": reason, "data": payload},
+                      maxlen=100_000, approximate=True)
+        await pipe.execute()
+        log.error("%d pesan dikirim ke DLQ (%s)", len(items), self.s.dlq_key)
+
+    # ---- background AI
+    async def _enqueue_ai(self, records: list[Record]) -> None:
+        skipped: list[Record] = []
+        for r in records:
+            if r.ai_status != "pending":
+                continue
+            try:  # prioritas: risk tertinggi diproses lebih dulu
+                self.ai_queue.put_nowait((-r.risk_score, next(self._seq), r))
+            except asyncio.QueueFull:
+                skipped.append(r)
+        if skipped:
+            log.warning("Antrean AI penuh: %d log di-skip (overload)", len(skipped))
+            try:
+                await self.db.mark_many([r.log_uuid for r in skipped], "skipped_overload")
+                await self.logstash.send([self._ai_doc(r, {"status": "skipped_overload"}) for r in skipped])
+            except Exception:
+                log.exception("Gagal mencatat skipped_overload")
+
+    @staticmethod
+    def _ai_doc(r: Record, ai: dict) -> dict:
+        return {"event_type": "ai_analysis", "log_uuid": str(r.log_uuid),
+                "log_day": r.log_day, "ai": ai}
+
+    async def _ai_worker(self, n: int) -> None:
+        while True:
+            _, _, r = await self.ai_queue.get()
+            t0 = time.perf_counter()
+            try:
+                await self.db.update_ai(r.log_uuid, "running")
+                result, provider, model = await self.llm.analyze(str(r.log_uuid), r.doc)
+                ai = {"status": "done", "analysis": result, "provider": provider, "model": model,
+                      "duration_s": round(time.perf_counter() - t0, 2),
+                      "completed_at": datetime.now(timezone.utc).isoformat()}
+                await self.db.update_ai(r.log_uuid, "done", result)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("AI gagal untuk %s: %s", r.log_uuid, type(exc).__name__)
+                ai = {"status": "failed", "error": type(exc).__name__, "providers": self.llm.label}
+                try:
+                    await self.db.update_ai(r.log_uuid, "failed")
+                except Exception:
+                    pass
+            try:
+                # UUID sama => Logstash/ES meng-upsert ke dokumen log mentah
+                if not await self.logstash.send([self._ai_doc(r, ai)], attempts=5):
+                    log.error("Hasil AI %s gagal dikirim ke Logstash", r.log_uuid)
+            finally:
+                self.ai_queue.task_done()
+
+    # ---- retensi
+    async def _retention_loop(self) -> None:
+        while not self.stop.is_set():
+            try:
+                n = await self.db.purge_old(self.s.retention_minutes)
+                if n:
+                    log.info("Retensi: %d baris > %d menit dihapus", n, self.s.retention_minutes)
+            except Exception:
+                log.exception("Retensi gagal")
+            await self._sleep(self.s.retention_interval_s)
+
+
+def main() -> None:
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if uvloop:
+        uvloop.install()
+    asyncio.run(App(Settings.from_env()).run())
+
+
+if __name__ == "__main__":
+    main()
