@@ -286,7 +286,8 @@ class App:
         self.logstash = LogstashClient(s)
         self.llm = build_analyzer(os.environ, s.persona_path)  # ollama/openai/anthropic/gemini + fallback
         self.redis = aioredis.from_url(s.redis_url, decode_responses=True, max_connections=50,
-                                       health_check_interval=30, socket_keepalive=True)
+                                       health_check_interval=30, socket_keepalive=True,
+                                       socket_connect_timeout=5)
         if s.iris_mode not in ("alert", "alert_case", "case"):
             raise ValueError("IRIS_MODE harus: alert | alert_case | case")
         self.iris = IrisClient.from_env(os.environ)  # None jika IRIS_ENABLED!=true
@@ -299,6 +300,7 @@ class App:
     async def run(self) -> None:
         s = self.s
         await self.db.start()
+        await self._wait_redis()
         if s.redis_mode == "list":
             ver = (await self.redis.info("server")).get("redis_version", "0")
             if tuple(int(x) for x in ver.split(".")[:2]) < (6, 2):
@@ -337,6 +339,19 @@ class App:
         await asyncio.gather(self.llm.aclose(), self.logstash.aclose(), self.db.close(),
                              *([self.iris.aclose()] if self.iris else []),
                              self.redis.aclose(), return_exceptions=True)
+
+    async def _wait_redis(self) -> None:
+        for attempt in range(1, 11):
+            try:
+                await self.redis.ping()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("Redis belum bisa dihubungi (%s) percobaan %d/10. Cek REDIS_URL (IP/port/password), "
+                            "firewall, dan 'bind' di redis.conf", type(exc).__name__, attempt)
+                await asyncio.sleep(3)
+        raise RuntimeError("Tidak bisa terhubung ke Redis; periksa REDIS_URL dan firewall")
 
     async def _ensure_group(self) -> None:
         try:
