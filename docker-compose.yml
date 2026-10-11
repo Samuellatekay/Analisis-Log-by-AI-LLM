@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     depends_on:
       postgres: { condition: service_healthy }
-      redis: { condition: service_started }
+#      redis: { condition: service_started }
     extra_hosts:
       - "host.docker.internal:host-gateway"   # akses Ollama di host
     read_only: true
