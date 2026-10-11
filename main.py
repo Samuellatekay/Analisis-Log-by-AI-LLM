@@ -16,6 +16,7 @@ Ketahanan terhadap burst:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
 import logging
 import os
@@ -24,6 +25,7 @@ import socket
 import time
 import uuid
 from dataclasses import dataclass
+from typing import Awaitable, Callable
 from datetime import datetime, timezone
 
 import asyncpg
@@ -34,6 +36,7 @@ from redis.exceptions import ResponseError
 
 from iris_client import IrisClient
 from llm_analyzer import build_analyzer
+from normalizer import normalize
 from risk_calculator import assess_event
 
 try:
@@ -57,6 +60,8 @@ class Settings:
     stream_key: str
     group: str
     dlq_key: str
+    redis_mode: str
+    redis_lists: tuple
     consumer_workers: int
     batch_size: int
     block_ms: int
@@ -92,6 +97,8 @@ class Settings:
             stream_key=_e("REDIS_STREAM", "logs:raw"),
             group=_e("REDIS_GROUP", "log-analyzer"),
             dlq_key=_e("REDIS_DLQ_STREAM", "logs:dlq"),
+            redis_mode=_e("REDIS_MODE", "list").lower(),
+            redis_lists=tuple(x.strip() for x in _e("REDIS_LISTS", "analysis-in").split(",") if x.strip()),
             consumer_workers=int(_e("CONSUMER_WORKERS", "2")),
             batch_size=int(_e("BATCH_SIZE", "200")),
             block_ms=int(_e("BLOCK_MS", "1000")),
@@ -134,6 +141,14 @@ class Record:
     doc: dict
 
 
+@dataclass(slots=True)
+class Item:
+    msg_id: str          # ID stream, atau hash konten (mode list) -> UUID deterministik
+    source: str          # nama list/stream asal
+    raw: str | None      # payload JSON mentah
+    ts_ms: int | None    # waktu masuk Redis (hanya stream) untuk latensi e2e
+
+
 SCHEMA_SQL = """
 CREATE UNLOGGED TABLE IF NOT EXISTS log_events (
     log_uuid      UUID PRIMARY KEY,
@@ -170,13 +185,27 @@ class Database:
         async with self.pool.acquire() as conn:
             await conn.execute(SCHEMA_SQL)
 
-    async def insert_many(self, records: list[Record]) -> None:
+    async def insert_many(self, records: list[Record]) -> list[Record]:
+        """Insert batch. Baris yang ditolak PostgreSQL (DataError) dikembalikan -> DLQ,
+        agar satu payload aneh tidak membuat seluruh batch gagal selamanya."""
+        sql = ("INSERT INTO log_events (log_uuid, received_at, risk_score, payload, ai_status) "
+               "VALUES ($1,$2,$3,$4::jsonb,$5) ON CONFLICT (log_uuid) DO NOTHING")
         rows = [(r.log_uuid, r.received_at, r.risk_score,
-                 orjson.dumps(r.doc).decode(), r.ai_status) for r in records]
+                 orjson.dumps(r.doc).decode().replace("\\u0000", ""),  # JSONB menolak NUL
+                 r.ai_status) for r in records]
         async with self.pool.acquire() as conn:
-            await conn.executemany(
-                "INSERT INTO log_events (log_uuid, received_at, risk_score, payload, ai_status) "
-                "VALUES ($1,$2,$3,$4::jsonb,$5) ON CONFLICT (log_uuid) DO NOTHING", rows)
+            try:
+                await conn.executemany(sql, rows)
+                return []
+            except asyncpg.exceptions.DataError:
+                pass
+            failed = []
+            for r, row in zip(records, rows):
+                try:
+                    await conn.execute(sql, *row)
+                except asyncpg.exceptions.DataError:
+                    failed.append(r)
+            return failed
 
     async def update_ai(self, log_uuid: uuid.UUID, status: str, result: dict | None = None) -> None:
         async with self.pool.acquire() as conn:
@@ -258,18 +287,23 @@ class App:
     async def run(self) -> None:
         s = self.s
         await self.db.start()
-        await self._ensure_group()
+        if s.redis_mode == "list":
+            ver = (await self.redis.info("server")).get("redis_version", "0")
+            if tuple(int(x) for x in ver.split(".")[:2]) < (6, 2):
+                raise RuntimeError(f"Redis {ver}: mode list butuh >= 6.2 (BLMOVE)")
+        else:
+            await self._ensure_group()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self.stop.set)
 
         ai_tasks = [asyncio.create_task(self._ai_worker(i)) for i in range(s.ai_workers)]
         iris_tasks = [asyncio.create_task(self._iris_worker()) for _ in range(s.iris_workers if self.iris else 0)]
-        loops = [asyncio.create_task(self._consumer_loop(f"{self._host}-{os.getpid()}-{i}"))
-                 for i in range(s.consumer_workers)]
+        loops = [asyncio.create_task(self._consumer_loop(f"{self._host}-{os.getpid()}-{i}", src))
+                 for src in self._sources() for i in range(s.consumer_workers)]
         loops += [asyncio.create_task(self._reclaim_loop()), asyncio.create_task(self._retention_loop())]
-        log.info("Started: %d consumer, %d AI worker, providers=%s",
-                 s.consumer_workers, s.ai_workers, self.llm.label)
+        log.info("Started: mode=%s sources=%s, %d worker/sumber, %d AI worker, providers=%s",
+                 s.redis_mode, self._sources(), s.consumer_workers, s.ai_workers, self.llm.label)
 
         await self.stop.wait()
         log.info("Shutdown: menghentikan consumer...")
@@ -306,84 +340,159 @@ class App:
             pass
 
     # ---- ingestion
-    async def _consumer_loop(self, name: str) -> None:
+    def _sources(self) -> list[str]:
+        return list(self.s.redis_lists) if self.s.redis_mode == "list" else [self.s.stream_key]
+
+    async def _consumer_loop(self, name: str, src: str) -> None:
         s, backoff = self.s, 0.5
+        proc, lease = f"{src}:processing:{name}", f"{src}:lease:{name}"
         while not self.stop.is_set():
             try:
-                resp = await self.redis.xreadgroup(s.group, name, {s.stream_key: ">"},
-                                                   count=s.batch_size, block=s.block_ms)
-                if resp:
-                    await self._handle_batch(resp[0][1])
+                if s.redis_mode == "list":
+                    await self.redis.set(lease, "1", ex=60)  # tanda "worker ini masih hidup"
+                    items = await self._fetch_list(src, proc)
+                    if items:
+                        try:
+                            await self._handle_batch(items, lambda: self.redis.delete(proc))
+                        except Exception:
+                            n = await self._requeue(proc, src)  # kembalikan ke antrean, jangan hilang
+                            log.warning("Batch gagal; %d item dikembalikan ke %s", n, src)
+                            raise
+                else:
+                    resp = await self.redis.xreadgroup(s.group, name, {src: ">"},
+                                                       count=s.batch_size, block=s.block_ms)
+                    if resp:
+                        items = self._stream_items(resp[0][1], src)
+                        await self._handle_batch(items, self._stream_ack(items))
                 backoff = 0.5
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("Consumer %s error; pesan tetap pending (akan di-reclaim)", name)
+                log.exception("Consumer %s/%s error", src, name)
                 await self._sleep(backoff)
                 backoff = min(backoff * 2, 5.0)
 
+    async def _fetch_list(self, src: str, proc: str) -> list[Item]:
+        """Pop andal: pindahkan atomik list -> processing list (BLMOVE/LMOVE), bukan BLPOP,
+        sehingga data tidak hilang jika proses mati di tengah jalan."""
+        first = await self.redis.blmove(src, proc, max(1, self.s.block_ms // 1000), "LEFT", "RIGHT")
+        if first is None:
+            return []
+        raws = [first]
+        if self.s.batch_size > 1:
+            pipe = self.redis.pipeline(transaction=False)
+            for _ in range(self.s.batch_size - 1):
+                pipe.lmove(src, proc, "LEFT", "RIGHT")
+            raws += [r for r in await pipe.execute() if r is not None]
+        return [Item(hashlib.sha256(f"{src}\0{raw}".encode()).hexdigest(), src, raw, None) for raw in raws]
+
+    async def _requeue(self, proc: str, src: str) -> int:
+        n = 0
+        while await self.redis.lmove(proc, src, "RIGHT", "LEFT") is not None:  # urutan asli terjaga
+            n += 1
+        return n
+
+    @staticmethod
+    def _stream_items(entries: list, src: str) -> list[Item]:
+        out = []
+        for msg_id, fields in entries:
+            try:
+                ts = int(msg_id.split("-")[0])
+            except ValueError:
+                ts = None
+            out.append(Item(msg_id, src, (fields or {}).get("data"), ts))
+        return out
+
+    def _stream_ack(self, items: list[Item]) -> Callable[[], Awaitable]:
+        ids = [i.msg_id for i in items]
+        return lambda: self.redis.xack(self.s.stream_key, self.s.group, *ids)
+
     async def _reclaim_loop(self) -> None:
-        """Ambil alih pesan pending yang menggantung (crash / DB error sesaat)."""
-        s, name = self.s, f"{self._host}-{os.getpid()}-reclaim"
+        """Mode stream: XAUTOCLAIM pesan pending. Mode list: kembalikan processing list
+        milik worker yang sudah mati (lease habis)."""
+        s = self.s
         while not self.stop.is_set():
             await self._sleep(s.reclaim_idle_ms / 2000)
             try:
-                cursor = "0-0"
-                while not self.stop.is_set():
-                    res = await self.redis.xautoclaim(s.stream_key, s.group, name,
-                                                      min_idle_time=s.reclaim_idle_ms,
-                                                      start_id=cursor, count=s.batch_size)
-                    cursor, entries = res[0], res[1]
-                    if entries:
-                        log.info("Reclaim %d pesan pending", len(entries))
-                        await self._handle_batch([e for e in entries if e and e[1]])
-                    if cursor in ("0-0", b"0-0") or not entries:
-                        break
+                if s.redis_mode == "list":
+                    await self._reclaim_lists()
+                else:
+                    await self._reclaim_stream()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("Reclaim error")
 
-    async def _handle_batch(self, entries: list) -> None:
+    async def _reclaim_lists(self) -> None:
+        for src in self.s.redis_lists:
+            async for key in self.redis.scan_iter(match=f"{src}:processing:*", count=100):
+                name = key.rsplit(":", 1)[1]
+                if await self.redis.exists(f"{src}:lease:{name}"):
+                    continue  # worker masih hidup
+                n = await self._requeue(key, src)
+                if n:
+                    log.warning("Reclaim: %d item dari worker mati (%s) dikembalikan ke %s", n, name, src)
+
+    async def _reclaim_stream(self) -> None:
+        s, name = self.s, f"{self._host}-{os.getpid()}-reclaim"
+        cursor = "0-0"
+        while not self.stop.is_set():
+            res = await self.redis.xautoclaim(s.stream_key, s.group, name,
+                                              min_idle_time=s.reclaim_idle_ms,
+                                              start_id=cursor, count=s.batch_size)
+            cursor, entries = res[0], [e for e in res[1] if e and e[1]]
+            if entries:
+                log.info("Reclaim %d pesan pending", len(entries))
+                items = self._stream_items(entries, s.stream_key)
+                await self._handle_batch(items, self._stream_ack(items))
+            if cursor in ("0-0", b"0-0") or not res[1]:
+                break
+
+    async def _handle_batch(self, items: list[Item], ack: Callable[[], Awaitable]) -> None:
         s, t0 = self.s, time.perf_counter()
-        parsed: list[tuple[str, dict]] = []
+        parsed: list[tuple[Item, dict]] = []
         dlq: list[tuple[str, str, str]] = []  # (msg_id, reason, payload)
-        for msg_id, fields in entries:
+        for it in items:
             try:
-                data = orjson.loads(fields["data"])
+                if it.raw is None:
+                    raise ValueError("payload kosong")
+                data = orjson.loads(it.raw)
                 if not isinstance(data, dict):
                     raise ValueError("payload bukan objek")
-                parsed.append((msg_id, data))
+                parsed.append((it, normalize(it.source, data)))
             except Exception as exc:
-                dlq.append((msg_id, f"parse_error:{type(exc).__name__}", orjson.dumps(fields).decode()))
+                dlq.append((it.msg_id, f"parse_error:{type(exc).__name__}", (it.raw or "")[:20000]))
 
-        records: list[Record] = []
+        records_ok: list[Record] = []
+        sent_s = 0.0
         if parsed:
             extras = await self._enrich([d for _, d in parsed])
             now = datetime.now(timezone.utc)
-            for (msg_id, data), (repeat, crit) in zip(parsed, extras):
-                records.append(self._build_record(msg_id, data, repeat, crit, now))
-            # Jika DB gagal -> exception -> tidak di-ACK -> diproses ulang (idempoten)
-            await self.db.insert_many(records)
-            ok = await self.logstash.send([r.doc for r in records])
+            records = [self._build_record(it.msg_id, data, repeat, crit, now)
+                       for (it, data), (repeat, crit) in zip(parsed, extras)]
+            # Error koneksi DB -> exception -> batch dikembalikan & diulang (idempoten)
+            rejected = {r.msg_id for r in await self.db.insert_many(records)}
+            for r in records:
+                if r.msg_id in rejected:
+                    dlq.append((r.msg_id, "db_rejected", orjson.dumps(r.doc).decode()))
+            records = [r for r in records if r.msg_id not in rejected]
+            ok = await self.logstash.send([r.doc for r in records]) if records else True
             sent_s = time.perf_counter() - t0
             if not ok:
                 for r in records:
                     dlq.append((r.msg_id, "logstash_failed", orjson.dumps(r.doc).decode()))
             records_ok = records if ok else []
-        else:
-            sent_s, records_ok = 0.0, []
 
         if dlq:
             await self._send_dlq(dlq)
-        await self.redis.xack(s.stream_key, s.group, *[e[0] for e in entries])
+        await ack()
 
         if records_ok:
             await self._enqueue_ai(records_ok)
-            now_ms = time.time() * 1000
-            e2e = max(now_ms - int(r.msg_id.split("-")[0]) for r in records_ok) / 1000
+            ts = [i.ts_ms for i in items if i.ts_ms]
+            e2e = f" e2e_max={(time.time() * 1000 - min(ts)) / 1000:.3f}s" if ts else ""
             level = logging.WARNING if sent_s > LATENCY_BUDGET_S else logging.DEBUG
-            log.log(level, "batch=%d proses+kirim=%.3fs e2e_max=%.3fs ai_queue=%d",
+            log.log(level, "batch=%d proses+kirim=%.3fs%s ai_queue=%d",
                     len(records_ok), sent_s, e2e, self.ai_queue.qsize())
 
     async def _enrich(self, events: list[dict]) -> list[tuple[int, float | None]]:
@@ -436,7 +545,9 @@ class App:
             "log_day": log_day,
             "@timestamp": data.get("@timestamp") or now.isoformat(),
             "event": {k: ev.get(k) for k in ("action", "category", "severity", "outcome") if k in ev},
+            "data_source": data.get("data_source"),
             "source": data.get("source"),
+            "original": data.get("original"),
             "reputation": data.get("reputation"),
             "geolocation": data.get("geolocation"),
             "asset": data.get("asset"),
