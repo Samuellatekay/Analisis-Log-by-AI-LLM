@@ -18,7 +18,7 @@ services:
     networks: [internal]
     # Scale horizontal saat burst:  docker compose up -d --scale app=3
     volumes:
-      - ./iris-ca.crt:/app/iris-ca.crt:ro
+      - /etc/ssl/custom/iris-ca.pem:/app/iris-ca.crt:ro
 
   postgres:
     image: postgres:16-alpine
