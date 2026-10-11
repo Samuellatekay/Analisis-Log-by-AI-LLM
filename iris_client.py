@@ -120,11 +120,10 @@ class IrisClient:
         return payload
 
     # --------------------------------------------------------------- kirim
-    async def create_alert(self, doc: dict, ai: dict | None) -> int | None:
-        payload = self.build_payload(doc, ai)
+    async def _post(self, path: str, body: dict) -> dict:
         for attempt in range(3):
             try:
-                r = await self._client.post("/alerts/add", json=payload)
+                r = await self._client.post(path, json=body)
             except httpx.TransportError:
                 if attempt == 2:
                     raise
@@ -134,8 +133,36 @@ class IrisClient:
                 await asyncio.sleep(1 + attempt)
                 continue
             r.raise_for_status()
-            return _d(r.json().get("data")).get("alert_id")
-        return None
+            return _d(r.json().get("data"))
+        return {}
+
+    async def create_alert(self, doc: dict, ai: dict | None) -> int | None:
+        return (await self._post("/alerts/add", self.build_payload(doc, ai))).get("alert_id")
+
+    async def create_case(self, doc: dict, ai: dict | None) -> int | None:
+        """Buat case langsung (POST /manage/cases/add), tanpa alert."""
+        p = self.build_payload(doc, ai)
+        body = {"case_name": p["alert_title"][:250], "case_description": p["alert_description"],
+                "case_customer": self.customer_id, "case_soc_id": str(doc.get("log_uuid"))}
+        return (await self._post("/manage/cases/add", body)).get("case_id")
+
+    async def escalate_alert(self, alert_id: int, doc: dict, ai: dict | None) -> int | None:
+        """Eskalasi alert menjadi case baru (POST /alerts/escalate/{id})."""
+        p = self.build_payload(doc, ai)
+        body = {"iocs_import_list": [], "assets_import_list": [], "import_as_event": False,
+                "note": "Dieskalasi otomatis oleh Analisis-Log-AI (risk tinggi).",
+                "case_title": p["alert_title"][:250], "case_tags": p["alert_tags"]}
+        data = await self._post(f"/alerts/escalate/{alert_id}", body)
+        return data.get("case_id")
+
+    async def merge_alert(self, alert_id: int, case_id: int, doc: dict) -> None:
+        """Gabungkan alert ke case yang sudah ada (POST /alerts/merge/{id})."""
+        risk = _d(doc.get("risk"))
+        body = {"target_case_id": case_id, "iocs_import_list": [], "assets_import_list": [],
+                "import_as_event": False,
+                "note": f"Alert terkait dari sumber yang sama (risk {risk.get('score')}, "
+                        f"{risk.get('level')}) digabung otomatis. log_uuid={doc.get('log_uuid')}"}
+        await self._post(f"/alerts/merge/{alert_id}", body)
 
     async def aclose(self) -> None:
         await self._client.aclose()

@@ -35,7 +35,7 @@ import redis.asyncio as aioredis
 from redis.exceptions import ResponseError
 
 from iris_client import IrisClient
-from llm_analyzer import build_analyzer
+from llm_analyzer import build_analyzer, describe_error
 from normalizer import normalize
 from risk_calculator import assess_event
 
@@ -87,6 +87,9 @@ class Settings:
     iris_dedup_s: int
     iris_workers: int
     iris_queue_max: int
+    iris_mode: str
+    iris_case_min_risk: float
+    iris_case_window_s: int
     risk_normalize: bool
     shutdown_grace_s: float
 
@@ -124,6 +127,9 @@ class Settings:
             iris_dedup_s=int(_e("IRIS_DEDUP_WINDOW_S", "300")),
             iris_workers=int(_e("IRIS_WORKERS", "1")),
             iris_queue_max=int(_e("IRIS_QUEUE_MAX", "500")),
+            iris_mode=_e("IRIS_MODE", "alert").lower(),
+            iris_case_min_risk=float(_e("IRIS_CASE_MIN_RISK", "75")),
+            iris_case_window_s=int(_e("IRIS_CASE_WINDOW_S", "3600")),
             risk_normalize=_e("RISK_NORMALIZE", "false").lower() == "true",
             shutdown_grace_s=float(_e("SHUTDOWN_GRACE_S", "20")),
         )
@@ -161,6 +167,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS log_events (
 );
 CREATE INDEX IF NOT EXISTS idx_log_events_received_at ON log_events (received_at);
 ALTER TABLE log_events ADD COLUMN IF NOT EXISTS iris_alert_id INTEGER;
+ALTER TABLE log_events ADD COLUMN IF NOT EXISTS iris_case_id INTEGER;
 """
 
 
@@ -214,9 +221,12 @@ class Database:
                 "WHERE log_uuid=$1",
                 log_uuid, status, orjson.dumps(result).decode() if result is not None else None)
 
-    async def set_iris_alert(self, log_uuid: uuid.UUID, alert_id: int) -> None:
+    async def set_iris(self, log_uuid: uuid.UUID, alert_id: int | None, case_id: int | None) -> None:
         async with self.pool.acquire() as conn:
-            await conn.execute("UPDATE log_events SET iris_alert_id=$2 WHERE log_uuid=$1", log_uuid, alert_id)
+            await conn.execute(
+                "UPDATE log_events SET iris_alert_id=COALESCE($2::int, iris_alert_id), "
+                "iris_case_id=COALESCE($3::int, iris_case_id) WHERE log_uuid=$1",
+                log_uuid, alert_id, case_id)
 
     async def mark_many(self, ids: list[uuid.UUID], status: str) -> None:
         async with self.pool.acquire() as conn:
@@ -277,6 +287,8 @@ class App:
         self.llm = build_analyzer(os.environ, s.persona_path)  # ollama/openai/anthropic/gemini + fallback
         self.redis = aioredis.from_url(s.redis_url, decode_responses=True, max_connections=50,
                                        health_check_interval=30, socket_keepalive=True)
+        if s.iris_mode not in ("alert", "alert_case", "case"):
+            raise ValueError("IRIS_MODE harus: alert | alert_case | case")
         self.iris = IrisClient.from_env(os.environ)  # None jika IRIS_ENABLED!=true
         self.iris_queue: asyncio.Queue = asyncio.Queue(maxsize=s.iris_queue_max)
         self.ai_queue: asyncio.PriorityQueue = asyncio.PriorityQueue(maxsize=s.ai_queue_max)
@@ -632,33 +644,77 @@ class App:
             log.warning("Antrean IRIS penuh; alert %s tidak dikirim", r.log_uuid)
 
     @staticmethod
-    def _dedup_key(doc: dict) -> str:
+    def _who(doc: dict) -> str:
         src = doc.get("source") if isinstance(doc.get("source"), dict) else {}
         asset = doc.get("asset") if isinstance(doc.get("asset"), dict) else {}
+        return str(src.get("ip") or asset.get("name") or "unknown")[:80]
+
+    @classmethod
+    def _dedup_key(cls, doc: dict) -> str:
         ev = doc.get("event") if isinstance(doc.get("event"), dict) else {}
-        who = str(src.get("ip") or asset.get("name") or "unknown")[:80]
         what = str(ev.get("action") or ev.get("category") or "unknown")[:80]
-        return f"iris:dedup:{who}:{what}"
+        return f"iris:dedup:{cls._who(doc)}:{what}"
+
+    async def _case_for(self, r: Record, ai: dict | None, alert_id: int) -> int | None:
+        """Alert risk tinggi -> case. Alert dari sumber yang sama dalam jendela waktu digabung
+        ke case yang sudah ada (bukan membuat case baru tiap alert)."""
+        who = self._who(r.doc)
+        case_key, lock = f"iris:case:{who}", f"iris:case-lock:{who}"
+        got_lock = False
+        try:
+            got_lock = bool(await self.redis.set(lock, "1", nx=True, ex=30))
+            if not got_lock:
+                await asyncio.sleep(1.5)  # worker lain sedang membuat case untuk sumber ini
+            existing = await self.redis.get(case_key)
+            if existing:
+                try:
+                    await self.iris.merge_alert(alert_id, int(existing), r.doc)
+                    return int(existing)
+                except httpx.HTTPStatusError:  # mis. case sudah ditutup -> buat case baru
+                    await self.redis.delete(case_key)
+            case_id = await self.iris.escalate_alert(alert_id, r.doc, ai)
+            if case_id is not None:
+                await self.redis.set(case_key, case_id, ex=self.s.iris_case_window_s)
+            else:
+                log.warning("Alert %s dieskalasi tapi ID case tidak terbaca dari respons IRIS", alert_id)
+            return case_id
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error("Gagal eskalasi alert %s ke case: %s", alert_id, describe_error(exc))
+            return None  # alert tetap ada, analis bisa eskalasi manual
+        finally:
+            if got_lock:
+                await self.redis.delete(lock)
 
     async def _iris_worker(self) -> None:
+        s = self.s
         while True:
             r, ai = await self.iris_queue.get()
             key = self._dedup_key(r.doc)
             try:
-                # cegah banjir alert saat burst: 1 alert / (source, action) / window
-                if not await self.redis.set(key, "1", nx=True, ex=self.s.iris_dedup_s):
+                # cegah banjir: 1 item / (source, action) / window
+                if not await self.redis.set(key, "1", nx=True, ex=s.iris_dedup_s):
                     continue
+                alert_id = case_id = None
                 try:
-                    alert_id = await self.iris.create_alert(r.doc, ai)
+                    if s.iris_mode == "case":
+                        case_id = await self.iris.create_case(r.doc, ai)
+                    else:
+                        alert_id = await self.iris.create_alert(r.doc, ai)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     await self.redis.delete(key)  # izinkan retry oleh event berikutnya
-                    log.error("Gagal membuat alert IRIS %s: %s", r.log_uuid, type(exc).__name__)
+                    log.error("Gagal membuat %s IRIS %s: %s", "case" if s.iris_mode == "case" else "alert",
+                              r.log_uuid, describe_error(exc))
                     continue
-                if alert_id is not None:
-                    await self.db.set_iris_alert(r.log_uuid, int(alert_id))
-                log.info("Alert IRIS dibuat: id=%s log=%s", alert_id, r.log_uuid)
+                if s.iris_mode == "alert_case" and alert_id and r.risk_score >= s.iris_case_min_risk:
+                    case_id = await self._case_for(r, ai, int(alert_id))
+                if alert_id is not None or case_id is not None:
+                    await self.db.set_iris(r.log_uuid, int(alert_id) if alert_id else None,
+                                           int(case_id) if case_id else None)
+                log.info("IRIS: alert=%s case=%s log=%s", alert_id, case_id, r.log_uuid)
             except asyncio.CancelledError:
                 raise
             except Exception:
