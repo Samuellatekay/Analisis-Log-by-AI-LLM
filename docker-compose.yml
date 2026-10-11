@@ -2,6 +2,8 @@ services:
   app:
     build: .
     env_file: .env
+    environment:
+      - IRIS_CA_CERT=/app/iris-ca.crt
     restart: unless-stopped
     depends_on:
       postgres: { condition: service_healthy }
