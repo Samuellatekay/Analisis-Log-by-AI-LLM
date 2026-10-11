@@ -10,6 +10,7 @@ services:
 #      redis: { condition: service_started }
     extra_hosts:
       - "host.docker.internal:host-gateway"   # akses Ollama di host
+      - "iris.local:192.168.51.40"
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]
