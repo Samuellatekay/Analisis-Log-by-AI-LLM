@@ -180,7 +180,7 @@ async def check_iris():
         from iris_client import IrisClient
         c = IrisClient.from_env(os.environ)
         t = time.perf_counter()
-        r = await c._client.get("/manage/cases/list")
+        r = await c._client.get("/")
         ms = (time.perf_counter() - t) * 1000
         await c.aclose()
         tgt = hostport(E("IRIS_URL", ""))
