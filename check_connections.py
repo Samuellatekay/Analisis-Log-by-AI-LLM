@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 #!/usr/bin/env python3
 """
 Cek semua koneksi dari DALAM container (jaringan yang sama dengan aplikasi):
@@ -580,4 +579,3 @@ async def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(asyncio.run(main()))
->>>>>>> 073fb3059042fe1980c4dc31678a172b3a118017
