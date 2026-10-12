@@ -21,18 +21,12 @@ RETRY_STATUS = {429, 500, 502, 503, 504}
 # IRIS v2.4.x memakai path legacy; IRIS v3 hanya melayani /api/v2 (path legacy -> HTML frontend)
 PATHS = {
     "legacy": {"alert": "/alerts/add", "escalate": "/alerts/escalate/{id}", "merge": "/alerts/merge/{id}",
-<<<<<<< HEAD
                "case": "/manage/cases/add", "probe": "/manage/cases/list",
                "severity_list": ["/manage/severities/list"], "status_list": ["/manage/alert-status/list"]},
     "v2": {"alert": "/api/v2/alerts", "escalate": "/api/v2/alerts/escalate/{id}",
            "merge": "/api/v2/alerts/merge/{id}", "case": "/api/v2/cases", "probe": "/api/v2/cases",
            "severity_list": ["/api/v2/manage/severities"],
            "status_list": ["/api/v2/manage/alert-statuses", "/api/v2/manage/alert-status"]},
-=======
-               "case": "/manage/cases/add", "probe": "/manage/cases/list"},
-    "v2": {"alert": "/api/v2/alerts", "escalate": "/api/v2/alerts/escalate/{id}",
-           "merge": "/api/v2/alerts/merge/{id}", "case": "/api/v2/cases", "probe": "/api/v2/cases"},
->>>>>>> 073fb3059042fe1980c4dc31678a172b3a118017
 }
 
 
@@ -106,11 +100,8 @@ class IrisClient:
                    float(env.get("IRIS_TIMEOUT_S", "10")), smap,
                    int(status) if status else None, env.get("IRIS_SOURCE_LINK_TEMPLATE", ""),
                    env.get("IRIS_API_VERSION", "v2").lower())
-<<<<<<< HEAD
         obj._severity_explicit = bool(env.get("IRIS_SEVERITY_MAP", "").strip())
         return obj
-=======
->>>>>>> 073fb3059042fe1980c4dc31678a172b3a118017
 
     # ------------------------------------------------------------ payload
     def build_payload(self, doc: dict, ai: dict | None) -> dict:
@@ -191,10 +182,7 @@ class IrisClient:
         return {}
 
     async def create_alert(self, doc: dict, ai: dict | None) -> int | None:
-<<<<<<< HEAD
         await self._ensure_ids()
-=======
->>>>>>> 073fb3059042fe1980c4dc31678a172b3a118017
         d = await self._post(self.paths["alert"], self.build_payload(doc, ai))
         return d.get("alert_id") or d.get("id")
 
@@ -224,7 +212,6 @@ class IrisClient:
                         f"{risk.get('level')}) digabung otomatis. log_uuid={doc.get('log_uuid')}"}
         await self._post(self.paths["merge"].format(id=alert_id), body)
 
-<<<<<<< HEAD
     async def _list(self, paths: list[str]) -> list[tuple[int, str]]:
         """Baca daftar (id, nama) dari endpoint master data; toleran terhadap bentuk respons."""
         for p in paths:
@@ -314,30 +301,6 @@ class IrisClient:
         if self.api_version == "v2" and self.status_id is None:
             return "CEK", info + " | alert_status_id belum diketahui: set IRIS_STATUS_ID (lihat --iris-ids)"
         return "OK", info
-=======
-    async def check(self) -> tuple[str, str]:
-        """Cek koneksi + API key + kecocokan versi API. Mengembalikan (OK|GAGAL|CEK, detail)."""
-        r = await self._client.get("/api/ping")  # /api/ping sama di semua versi
-        if "html" in r.headers.get("content-type", ""):
-            return "GAGAL", "/api/ping mengembalikan HTML: IRIS_URL salah (bukan alamat IRIS / lewat proxy lain)"
-        if r.status_code in (401, 403):
-            return "GAGAL", f"HTTP {r.status_code}: API key salah / user tanpa izin"
-        if r.status_code != 200:
-            return "CEK", f"/api/ping HTTP {r.status_code}"
-        ver = ""
-        try:
-            v = _unwrap((await self._client.get("/api/versions")).json())
-            ver = f", IRIS {v.get('iris_current')} (API {v.get('api_current')})"
-        except Exception:
-            pass
-        probe = await self._client.get(self.paths["probe"])
-        if "html" in probe.headers.get("content-type", ""):
-            return "GAGAL", (f"API key valid{ver}, tapi {self.paths['probe']} mengembalikan HTML. "
-                             f"Server ini IRIS v3: set IRIS_API_VERSION=v2")
-        if probe.status_code in (401, 403):
-            return "GAGAL", f"API key valid{ver}, tapi HTTP {probe.status_code} di {self.paths['probe']}: user tanpa izin"
-        return "OK", f"API key valid{ver}, api_version={self.api_version}, customer_id={self.customer_id}"
->>>>>>> 073fb3059042fe1980c4dc31678a172b3a118017
 
     async def aclose(self) -> None:
         await self._client.aclose()
