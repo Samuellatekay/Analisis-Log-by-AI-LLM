@@ -571,7 +571,7 @@ class App:
             "log_uuid": str(log_uuid),
             "log_day": log_day,
             "@timestamp": data.get("@timestamp") or now.isoformat(),
-            "event": {k: ev.get(k) for k in ("action", "category", "severity", "outcome") if k in ev},
+            "event": {k: ev.get(k) for k in ("action", "category", "severity", "outcome", "wazuh_level", "rule_id") if k in ev},
             "data_source": data.get("data_source"),
             "source": data.get("source"),
             "original": data.get("original"),
@@ -582,6 +582,9 @@ class App:
             "risk": {**risk.as_dict(), "repeat_count": repeat},
             "ai": {"status": ai_status},
         }
+        for k in ("destination", "file"):  # opsional dari normalizer (mis. Wazuh dstip / hash syscheck)
+            if data.get(k):
+                doc[k] = data[k]
         return Record(msg_id, log_uuid, now, log_day, risk.score, ai_status, doc)
 
     async def _send_dlq(self, items: list[tuple[str, str, str]]) -> None:
@@ -648,7 +651,7 @@ class App:
 
     # ---- DFIR-IRIS
     def _to_iris(self, r: Record, ai: dict | None) -> None:
-        if not self.iris or r.risk_score < self.s.iris_min_risk:
+        if not self.iris or r.risk_score < self.s.iris_min_risk or not self.iris.allows(r.doc):
             return
         verdict = ((ai or {}).get("analysis") or {}).get("verdict")
         if verdict in ("false_positive", "benign"):

@@ -71,6 +71,8 @@ class IrisClient:
         self.paths = PATHS[api_version]
         self.customer_id = customer_id
         self._severity_explicit = False  # True jika IRIS_SEVERITY_MAP diisi manual
+        self.min_wazuh_level = 0  # 0 = filter level Wazuh nonaktif
+        self.max_wazuh_level = 0  # 0 = tanpa batas atas
         self._ids_ready = False
         self._ids_lock = asyncio.Lock()
         self.severity_map = severity_map
@@ -97,11 +99,25 @@ class IrisClient:
             smap[k.strip().lower()] = int(v)
         status = env.get("IRIS_STATUS_ID", "").strip()
         obj = cls(url, key, int(env.get("IRIS_CUSTOMER_ID", "1")), verify,
-                   float(env.get("IRIS_TIMEOUT_S", "10")), smap,
+                   float(env.get("IRIS_TIMEOUT_S", "30")), smap,
                    int(status) if status else None, env.get("IRIS_SOURCE_LINK_TEMPLATE", ""),
                    env.get("IRIS_API_VERSION", "v2").lower())
         obj._severity_explicit = bool(env.get("IRIS_SEVERITY_MAP", "").strip())
+        obj.min_wazuh_level = int(env.get("IRIS_MIN_WAZUH_LEVEL", "0") or 0)
+        obj.max_wazuh_level = int(env.get("IRIS_MAX_WAZUH_LEVEL", "0") or 0)
         return obj
+
+    # ------------------------------------------------------------ filter
+    def allows(self, doc: dict) -> bool:
+        """Filter level alert Wazuh (event.wazuh_level). Event tanpa level (bukan Wazuh) tidak difilter."""
+        lvl = _d(doc.get("event")).get("wazuh_level")
+        try:
+            lvl = int(lvl)
+        except (TypeError, ValueError):
+            return True
+        if lvl < self.min_wazuh_level:
+            return False
+        return not (self.max_wazuh_level and lvl > self.max_wazuh_level)
 
     # ------------------------------------------------------------ payload
     def build_payload(self, doc: dict, ai: dict | None) -> dict:
@@ -170,7 +186,9 @@ class IrisClient:
         for attempt in range(3):
             try:
                 r = await self._client.post(path, json=body)
-            except httpx.TransportError:
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                # Retry HANYA jika koneksi belum terbentuk (permintaan pasti belum diproses).
+                # ReadTimeout dll. TIDAK diulang: IRIS mungkin sudah membuat alert -> duplikat.
                 if attempt == 2:
                     raise
                 await asyncio.sleep(1 + attempt)
@@ -298,6 +316,8 @@ class IrisClient:
             pass
         await self._ensure_ids()
         info = f"API key valid{ver}, api_version={self.api_version}, customer_id={self.customer_id}, status_id={self.status_id}"
+        if self.min_wazuh_level or self.max_wazuh_level:
+            info += f", level_wazuh={self.min_wazuh_level or 0}-{self.max_wazuh_level or 'maks'}"
         if self.api_version == "v2" and self.status_id is None:
             return "CEK", info + " | alert_status_id belum diketahui: set IRIS_STATUS_ID (lihat --iris-ids)"
         return "OK", info
