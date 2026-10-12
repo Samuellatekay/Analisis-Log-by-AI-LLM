@@ -12,6 +12,7 @@ Skema internal (dibaca risk_calculator, iris_client, llm):
 """
 from __future__ import annotations
 
+import ipaddress
 import os
 from typing import Any, Callable
 
@@ -76,11 +77,20 @@ def _wazuh_outcome(data: dict, groups: list[str]) -> str:
     return "alert"
 
 
+def _valid_ip(v: Any) -> str | None:
+    """Hanya IP sungguhan. Auditd sering menulis addr=? / '-' ; loopback & 0.0.0.0 bukan sumber serangan."""
+    try:
+        ip = ipaddress.ip_address(str(v).strip())
+    except ValueError:
+        return None
+    return None if (ip.is_loopback or ip.is_unspecified) else str(ip)
+
+
 def _srcip(data: dict) -> str | None:
     cand = (data.get("srcip"), data.get("src_ip"), data.get("source_ip"),
             _dict(_dict(data.get("win")).get("eventdata")).get("ipAddress"),
             _dict(data.get("audit")).get("addr"))
-    return next((str(c) for c in cand if c and str(c) not in ("-", "::1", "127.0.0.1")), None)
+    return next((ip for ip in (_valid_ip(c) for c in cand if c) if ip), None)
 
 
 def is_wazuh(p: dict) -> bool:
