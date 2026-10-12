@@ -97,7 +97,7 @@ class IrisClient:
             smap[k.strip().lower()] = int(v)
         status = env.get("IRIS_STATUS_ID", "").strip()
         obj = cls(url, key, int(env.get("IRIS_CUSTOMER_ID", "1")), verify,
-                   float(env.get("IRIS_TIMEOUT_S", "10")), smap,
+                   float(env.get("IRIS_TIMEOUT_S", "30")), smap,
                    int(status) if status else None, env.get("IRIS_SOURCE_LINK_TEMPLATE", ""),
                    env.get("IRIS_API_VERSION", "v2").lower())
         obj._severity_explicit = bool(env.get("IRIS_SEVERITY_MAP", "").strip())
@@ -170,7 +170,9 @@ class IrisClient:
         for attempt in range(3):
             try:
                 r = await self._client.post(path, json=body)
-            except httpx.TransportError:
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                # Retry HANYA jika koneksi belum terbentuk (permintaan pasti belum diproses).
+                # ReadTimeout dll. TIDAK diulang: IRIS mungkin sudah membuat alert -> duplikat.
                 if attempt == 2:
                     raise
                 await asyncio.sleep(1 + attempt)
