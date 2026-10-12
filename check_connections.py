@@ -176,21 +176,47 @@ async def check_llm(name: str):
 async def check_iris():
     if E("IRIS_ENABLED", "false").lower() != "true":
         return SKIP, "DFIR-IRIS", "-", "IRIS_ENABLED=false"
+    tgt = hostport(E("IRIS_URL", ""))
     try:
         from iris_client import IrisClient
         c = IrisClient.from_env(os.environ)
-        t = time.perf_counter()
-        r = await c._client.get("/")
-        ms = (time.perf_counter() - t) * 1000
-        await c.aclose()
-        tgt = hostport(E("IRIS_URL", ""))
-        if r.status_code == 200:
-            return OK, "DFIR-IRIS", tgt, f"API key valid ({ms:.0f}ms), customer_id={E('IRIS_CUSTOMER_ID', '1')}, mode={E('IRIS_MODE', 'alert')}"
-        if r.status_code in (401, 403):
-            return FAIL, "DFIR-IRIS", tgt, f"HTTP {r.status_code}: API key salah / user tanpa izin"
-        return WARN, "DFIR-IRIS", tgt, f"HTTP {r.status_code}: terjangkau tapi respons tak terduga (versi IRIS?)"
+        try:
+            t = time.perf_counter()
+            st, detail = await c.check()
+            ms = (time.perf_counter() - t) * 1000
+        finally:
+            await c.aclose()
+        status = {"OK": OK, "GAGAL": FAIL}.get(st, WARN)
+        return status, "DFIR-IRIS", tgt, f"{detail} ({ms:.0f}ms), mode={E('IRIS_MODE', 'alert')}"
     except Exception as exc:
-        return FAIL, "DFIR-IRIS", hostport(E("IRIS_URL", "")), explain(exc)
+        return FAIL, "DFIR-IRIS", tgt, explain(exc)
+
+
+async def iris_selftest(with_case: bool):
+    """MEMBUAT objek uji sungguhan di IRIS (1 alert, + 1 case jika with_case)."""
+    try:
+        from iris_client import IrisClient
+        from llm_analyzer import describe_error
+        c = IrisClient.from_env(os.environ)
+        if c is None:
+            return SKIP, "IRIS uji", "-", "IRIS_ENABLED=false"
+        doc = {"log_uuid": "test-" + uuid.uuid4().hex[:8], "event": {"action": "koneksi-uji", "outcome": "success",
+               "category": ["test"], "severity": 1}, "source": {"ip": "203.0.113.1"},
+               "risk": {"score": 30, "level": "low", "asset_criticality": 1, "event_severity": 1,
+                        "event_outcome": 1, "threat_weight": 1, "repeat_count": 0}}
+        try:
+            alert_id = await c.create_alert(doc, None)
+            msg = f"alert_id={alert_id}"
+            if with_case:
+                if alert_id is None:
+                    return FAIL, "IRIS uji", "-", "alert dibuat tapi ID tak terbaca dari respons"
+                msg += f", case_id={await c.escalate_alert(int(alert_id), doc, None)}"
+        finally:
+            await c.aclose()
+        return OK, "IRIS uji", "-", msg + "  -> HAPUS objek uji ini di IRIS"
+    except Exception as exc:
+        from llm_analyzer import describe_error
+        return FAIL, "IRIS uji", "-", describe_error(exc) + " (lihat baris 'IRIS ... HTTP' di atas untuk alasan dari server)"
 
 
 async def check_live(name: str):
@@ -225,11 +251,15 @@ def config_warnings() -> list[str]:
 async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true", help="uji analisis AI sungguhan (memakai token/waktu)")
+    ap.add_argument("--iris-test", action="store_true", help="BUAT 1 alert uji di IRIS")
+    ap.add_argument("--iris-test-case", action="store_true", help="BUAT 1 alert uji + eskalasi jadi case")
     a = ap.parse_args()
     providers = [x.strip() for x in E("LLM_PROVIDERS", "ollama").split(",") if x.strip()]
     tasks = [check_redis(), check_postgres(), check_logstash(), check_iris()] + [check_llm(p) for p in providers]
     if a.live:
         tasks += [check_live(p) for p in providers]
+    if a.iris_test or a.iris_test_case:
+        tasks.append(iris_selftest(a.iris_test_case))
     results = await asyncio.gather(*[asyncio.wait_for(t, 200) for t in tasks], return_exceptions=True)
     print(f"\n{'STATUS':8} {'KOMPONEN':14} {'TARGET':28} DETAIL\n" + "-" * 100)
     bad = 0

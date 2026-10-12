@@ -93,6 +93,8 @@ def describe_error(exc: Exception) -> str:
     """Hanya tipe + status code; jangan log pesan (bisa memuat URL/key)."""
     if isinstance(exc, httpx.HTTPStatusError):
         return f"HTTP{exc.response.status_code}"
+    if getattr(exc, "public_message", None):
+        return str(exc.public_message)[:200]
     return type(exc).__name__
 
 

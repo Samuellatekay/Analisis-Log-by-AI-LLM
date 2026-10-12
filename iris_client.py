@@ -7,6 +7,7 @@ dari risk score (deterministik), BUKAN dari output AI. AI hanya memberi konteks 
 from __future__ import annotations
 
 import asyncio
+import logging
 import ssl
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -14,7 +15,30 @@ from typing import Any, Mapping
 import httpx
 import orjson
 
+log = logging.getLogger("iris")
 RETRY_STATUS = {429, 500, 502, 503, 504}
+
+# IRIS v2.4.x memakai path legacy; IRIS v3 hanya melayani /api/v2 (path legacy -> HTML frontend)
+PATHS = {
+    "legacy": {"alert": "/alerts/add", "escalate": "/alerts/escalate/{id}", "merge": "/alerts/merge/{id}",
+               "case": "/manage/cases/add", "probe": "/manage/cases/list"},
+    "v2": {"alert": "/api/v2/alerts", "escalate": "/api/v2/alerts/escalate/{id}",
+           "merge": "/api/v2/alerts/merge/{id}", "case": "/api/v2/cases", "probe": "/api/v2/cases"},
+}
+
+
+class IrisError(Exception):
+    def __init__(self, msg: str):
+        super().__init__(msg)
+        self.public_message = msg
+
+
+def _unwrap(j) -> dict:
+    """Legacy membungkus hasil di {"data": {...}}; v2 bisa mengembalikan objek langsung."""
+    if not isinstance(j, dict):
+        return {}
+    d = j.get("data")
+    return d if isinstance(d, dict) else j
 DEFAULT_SEVERITY_MAP = {"low": 3, "medium": 4, "high": 5, "critical": 6}  # default severity IRIS
 
 
@@ -37,7 +61,11 @@ def _md_escape(v: Any, n: int = 300) -> str:
 class IrisClient:
     def __init__(self, url: str, api_key: str, customer_id: int, verify: bool | ssl.SSLContext,
                  timeout_s: float, severity_map: dict[str, int], status_id: int | None,
-                 source_link_tpl: str):
+                 source_link_tpl: str, api_version: str = "v2"):
+        if api_version not in PATHS:
+            raise ValueError("IRIS_API_VERSION harus: v2 | legacy")
+        self.api_version = api_version
+        self.paths = PATHS[api_version]
         self.customer_id = customer_id
         self.severity_map = severity_map
         self.status_id = status_id
@@ -64,7 +92,8 @@ class IrisClient:
         status = env.get("IRIS_STATUS_ID", "").strip()
         return cls(url, key, int(env.get("IRIS_CUSTOMER_ID", "1")), verify,
                    float(env.get("IRIS_TIMEOUT_S", "10")), smap,
-                   int(status) if status else None, env.get("IRIS_SOURCE_LINK_TEMPLATE", ""))
+                   int(status) if status else None, env.get("IRIS_SOURCE_LINK_TEMPLATE", ""),
+                   env.get("IRIS_API_VERSION", "v2").lower())
 
     # ------------------------------------------------------------ payload
     def build_payload(self, doc: dict, ai: dict | None) -> dict:
@@ -120,6 +149,15 @@ class IrisClient:
         return payload
 
     # --------------------------------------------------------------- kirim
+    def _parse(self, r: httpx.Response, path: str) -> dict:
+        if r.status_code >= 400:
+            log.warning("IRIS %s -> HTTP %s: %s", path, r.status_code, r.text[:300].replace("\n", " "))
+            r.raise_for_status()
+        try:
+            return _unwrap(r.json())
+        except ValueError:
+            raise IrisError("Respons IRIS bukan JSON (path API salah? IRIS v3 butuh IRIS_API_VERSION=v2)") from None
+
     async def _post(self, path: str, body: dict) -> dict:
         for attempt in range(3):
             try:
@@ -132,37 +170,61 @@ class IrisClient:
             if r.status_code in RETRY_STATUS and attempt < 2:
                 await asyncio.sleep(1 + attempt)
                 continue
-            r.raise_for_status()
-            return _d(r.json().get("data"))
+            return self._parse(r, path)
         return {}
 
     async def create_alert(self, doc: dict, ai: dict | None) -> int | None:
-        return (await self._post("/alerts/add", self.build_payload(doc, ai))).get("alert_id")
+        d = await self._post(self.paths["alert"], self.build_payload(doc, ai))
+        return d.get("alert_id") or d.get("id")
 
     async def create_case(self, doc: dict, ai: dict | None) -> int | None:
-        """Buat case langsung (POST /manage/cases/add), tanpa alert."""
+        """Buat case langsung, tanpa alert."""
         p = self.build_payload(doc, ai)
         body = {"case_name": p["alert_title"][:250], "case_description": p["alert_description"],
                 "case_customer": self.customer_id, "case_soc_id": str(doc.get("log_uuid"))}
-        return (await self._post("/manage/cases/add", body)).get("case_id")
+        d = await self._post(self.paths["case"], body)
+        return d.get("case_id") or d.get("id")
 
     async def escalate_alert(self, alert_id: int, doc: dict, ai: dict | None) -> int | None:
-        """Eskalasi alert menjadi case baru (POST /alerts/escalate/{id})."""
+        """Eskalasi alert menjadi case baru."""
         p = self.build_payload(doc, ai)
         body = {"iocs_import_list": [], "assets_import_list": [], "import_as_event": False,
                 "note": "Dieskalasi otomatis oleh Analisis-Log-AI (risk tinggi).",
                 "case_title": p["alert_title"][:250], "case_tags": p["alert_tags"]}
-        data = await self._post(f"/alerts/escalate/{alert_id}", body)
-        return data.get("case_id")
+        d = await self._post(self.paths["escalate"].format(id=alert_id), body)
+        return d.get("case_id") or d.get("id")
 
     async def merge_alert(self, alert_id: int, case_id: int, doc: dict) -> None:
-        """Gabungkan alert ke case yang sudah ada (POST /alerts/merge/{id})."""
+        """Gabungkan alert ke case yang sudah ada."""
         risk = _d(doc.get("risk"))
         body = {"target_case_id": case_id, "iocs_import_list": [], "assets_import_list": [],
                 "import_as_event": False,
                 "note": f"Alert terkait dari sumber yang sama (risk {risk.get('score')}, "
                         f"{risk.get('level')}) digabung otomatis. log_uuid={doc.get('log_uuid')}"}
-        await self._post(f"/alerts/merge/{alert_id}", body)
+        await self._post(self.paths["merge"].format(id=alert_id), body)
+
+    async def check(self) -> tuple[str, str]:
+        """Cek koneksi + API key + kecocokan versi API. Mengembalikan (OK|GAGAL|CEK, detail)."""
+        r = await self._client.get("/api/ping")  # /api/ping sama di semua versi
+        if "html" in r.headers.get("content-type", ""):
+            return "GAGAL", "/api/ping mengembalikan HTML: IRIS_URL salah (bukan alamat IRIS / lewat proxy lain)"
+        if r.status_code in (401, 403):
+            return "GAGAL", f"HTTP {r.status_code}: API key salah / user tanpa izin"
+        if r.status_code != 200:
+            return "CEK", f"/api/ping HTTP {r.status_code}"
+        ver = ""
+        try:
+            v = _unwrap((await self._client.get("/api/versions")).json())
+            ver = f", IRIS {v.get('iris_current')} (API {v.get('api_current')})"
+        except Exception:
+            pass
+        probe = await self._client.get(self.paths["probe"])
+        if "html" in probe.headers.get("content-type", ""):
+            return "GAGAL", (f"API key valid{ver}, tapi {self.paths['probe']} mengembalikan HTML. "
+                             f"Server ini IRIS v3: set IRIS_API_VERSION=v2")
+        if probe.status_code in (401, 403):
+            return "GAGAL", f"API key valid{ver}, tapi HTTP {probe.status_code} di {self.paths['probe']}: user tanpa izin"
+        return "OK", f"API key valid{ver}, api_version={self.api_version}, customer_id={self.customer_id}"
 
     async def aclose(self) -> None:
         await self._client.aclose()
