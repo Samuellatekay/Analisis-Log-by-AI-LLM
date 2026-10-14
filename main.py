@@ -37,6 +37,7 @@ from redis.exceptions import ResponseError
 from iris_client import IrisClient
 from llm_analyzer import build_analyzer, describe_error
 from normalizer import normalize
+from optimalisasi import aggregate_event, attack_aggregation_key
 from risk_calculator import assess_event
 
 try:
@@ -626,13 +627,7 @@ class App:
     # ---- background AI
     @staticmethod
     def _ai_aggregation_key(r: Record) -> tuple[str, str] | None:
-        source = r.doc.get("source") if isinstance(r.doc.get("source"), dict) else {}
-        event = r.doc.get("event") if isinstance(r.doc.get("event"), dict) else {}
-        source_ip = source.get("ip")
-        signature = event.get("rule_id") or event.get("action")
-        if not source_ip or not signature:
-            return None
-        return str(source_ip), str(signature)
+        return attack_aggregation_key(r.doc)
 
     async def _build_ai_jobs(self, records: list[Record]) -> list[AIJob]:
         representative = max(records, key=lambda r: r.risk_score)
@@ -641,30 +636,12 @@ class App:
 
         ordered = sorted(records, key=lambda r: r.received_at)
         first, last = ordered[0].received_at, ordered[-1].received_at
-        related_ids = [str(r.log_uuid) for r in ordered]
-        doc = dict(representative.doc)
-        aggregate_uuid = uuid.uuid5(UUID_NS, "aggregate:" + ":".join(sorted(related_ids)))
-        doc["event_type"] = "attack_aggregate"
-        doc["log_uuid"] = str(aggregate_uuid)
-        doc["attack_aggregation"] = {
-            "count": len(records),
-            "threshold": self.s.ai_aggregation_threshold,
-            "window_seconds": self.s.ai_aggregation_window_s,
-            "window_start": first.isoformat(),
-            "window_end": last.isoformat(),
-            "aggregate_log_uuid": str(aggregate_uuid),
-            "representative_log_uuid": str(representative.log_uuid),
-            "related_log_uuids": related_ids[:100],
-            "samples": [
-                {
-                    "log_uuid": str(r.log_uuid),
-                    "timestamp": r.doc.get("@timestamp"),
-                    "event": r.doc.get("event"),
-                    "risk_score": r.risk_score,
-                }
-                for r in ordered[:10]
-            ],
-        }
+        doc, aggregate_uuid = aggregate_event(
+            ordered,
+            self.s.ai_aggregation_threshold,
+            self.s.ai_aggregation_window_s,
+            representative=representative,
+        )
         aggregate_record = Record(
             msg_id=f"aggregate:{aggregate_uuid}",
             log_uuid=aggregate_uuid,
