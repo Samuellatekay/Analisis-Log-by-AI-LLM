@@ -24,7 +24,7 @@ import signal
 import socket
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Awaitable, Callable
 from datetime import datetime, timezone
 
@@ -83,6 +83,8 @@ class Settings:
     ai_workers: int
     ai_queue_max: int
     ai_min_risk: float
+    ai_aggregation_threshold: int
+    ai_aggregation_window_s: int
     iris_min_risk: float
     iris_dedup_s: int
     iris_workers: int
@@ -123,6 +125,8 @@ class Settings:
             ai_workers=int(_e("AI_WORKERS", "2")),
             ai_queue_max=int(_e("AI_QUEUE_MAX", "1000")),
             ai_min_risk=float(_e("AI_MIN_RISK", "40")),
+            ai_aggregation_threshold=int(_e("AI_AGGREGATION_THRESHOLD", "10")),
+            ai_aggregation_window_s=int(_e("AI_AGGREGATION_WINDOW_S", "60")),
             iris_min_risk=float(_e("IRIS_MIN_RISK", "60")),
             iris_dedup_s=int(_e("IRIS_DEDUP_WINDOW_S", "300")),
             iris_workers=int(_e("IRIS_WORKERS", "1")),
@@ -145,6 +149,15 @@ class Record:
     risk_score: float
     ai_status: str
     doc: dict
+
+
+@dataclass(slots=True)
+class AIJob:
+    representative: Record
+    records: list[Record]
+    doc: dict
+    aggregated: bool = False
+    aggregate_record: Record | None = None
 
 
 @dataclass(slots=True)
@@ -221,6 +234,16 @@ class Database:
                 "WHERE log_uuid=$1",
                 log_uuid, status, orjson.dumps(result).decode() if result is not None else None)
 
+    async def update_ai_many(self, log_uuids: list[uuid.UUID], status: str,
+                             result: dict | None = None) -> None:
+        if not log_uuids:
+            return
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE log_events SET ai_status=$2, ai_result=$3::jsonb, ai_updated_at=now() "
+                "WHERE log_uuid = ANY($1::uuid[])",
+                log_uuids, status, orjson.dumps(result).decode() if result is not None else None)
+
     async def set_iris(self, log_uuid: uuid.UUID, alert_id: int | None, case_id: int | None) -> None:
         async with self.pool.acquire() as conn:
             await conn.execute(
@@ -293,6 +316,7 @@ class App:
         self.iris = IrisClient.from_env(os.environ)  # None jika IRIS_ENABLED!=true
         self.iris_queue: asyncio.Queue = asyncio.Queue(maxsize=s.iris_queue_max)
         self.ai_queue: asyncio.PriorityQueue = asyncio.PriorityQueue(maxsize=s.ai_queue_max)
+        self._ai_buckets: dict[tuple[str, str], tuple[datetime, list[Record]]] = {}
         self._seq = itertools.count()
         self._host = socket.gethostname()
 
@@ -316,12 +340,16 @@ class App:
         loops = [asyncio.create_task(self._consumer_loop(f"{self._host}-{os.getpid()}-{i}", src))
                  for src in self._sources() for i in range(s.consumer_workers)]
         loops += [asyncio.create_task(self._reclaim_loop()), asyncio.create_task(self._retention_loop())]
+        aggregation_task = asyncio.create_task(self._ai_aggregation_loop())
         log.info("Started: mode=%s sources=%s, %d worker/sumber, %d AI worker, providers=%s",
                  s.redis_mode, self._sources(), s.consumer_workers, s.ai_workers, self.llm.label)
 
         await self.stop.wait()
         log.info("Shutdown: menghentikan consumer...")
         await asyncio.gather(*loops, return_exceptions=True)
+        aggregation_task.cancel()
+        await asyncio.gather(aggregation_task, return_exceptions=True)
+        await self._flush_ai_buckets(force=True)
         try:
             await asyncio.wait_for(self.ai_queue.join(), s.shutdown_grace_s)
         except asyncio.TimeoutError:
@@ -596,25 +624,128 @@ class App:
         log.error("%d pesan dikirim ke DLQ (%s)", len(items), self.s.dlq_key)
 
     # ---- background AI
+    @staticmethod
+    def _ai_aggregation_key(r: Record) -> tuple[str, str] | None:
+        source = r.doc.get("source") if isinstance(r.doc.get("source"), dict) else {}
+        event = r.doc.get("event") if isinstance(r.doc.get("event"), dict) else {}
+        source_ip = source.get("ip")
+        signature = event.get("rule_id") or event.get("action")
+        if not source_ip or not signature:
+            return None
+        return str(source_ip), str(signature)
+
+    async def _build_ai_jobs(self, records: list[Record]) -> list[AIJob]:
+        representative = max(records, key=lambda r: r.risk_score)
+        if len(records) <= self.s.ai_aggregation_threshold:
+            return [AIJob(r, [r], r.doc) for r in records]
+
+        ordered = sorted(records, key=lambda r: r.received_at)
+        first, last = ordered[0].received_at, ordered[-1].received_at
+        related_ids = [str(r.log_uuid) for r in ordered]
+        doc = dict(representative.doc)
+        aggregate_uuid = uuid.uuid5(UUID_NS, "aggregate:" + ":".join(sorted(related_ids)))
+        doc["event_type"] = "attack_aggregate"
+        doc["log_uuid"] = str(aggregate_uuid)
+        doc["attack_aggregation"] = {
+            "count": len(records),
+            "threshold": self.s.ai_aggregation_threshold,
+            "window_seconds": self.s.ai_aggregation_window_s,
+            "window_start": first.isoformat(),
+            "window_end": last.isoformat(),
+            "aggregate_log_uuid": str(aggregate_uuid),
+            "representative_log_uuid": str(representative.log_uuid),
+            "related_log_uuids": related_ids[:100],
+            "samples": [
+                {
+                    "log_uuid": str(r.log_uuid),
+                    "timestamp": r.doc.get("@timestamp"),
+                    "event": r.doc.get("event"),
+                    "risk_score": r.risk_score,
+                }
+                for r in ordered[:10]
+            ],
+        }
+        aggregate_record = Record(
+            msg_id=f"aggregate:{aggregate_uuid}",
+            log_uuid=aggregate_uuid,
+            received_at=last,
+            log_day=representative.log_day,
+            risk_score=representative.risk_score,
+            ai_status="pending",
+            doc=doc,
+        )
+        rejected = await self.db.insert_many([aggregate_record])
+        if rejected:
+            raise RuntimeError(f"Database menolak record agregat {aggregate_uuid}")
+        return [AIJob(aggregate_record, records, doc, aggregated=True, aggregate_record=aggregate_record)]
+
     async def _enqueue_ai(self, records: list[Record]) -> None:
-        skipped: list[Record] = []
+        ready: list[AIJob] = []
+        now = datetime.now(timezone.utc)
         for r in records:
             if r.ai_status != "pending":
                 self._to_iris(r, None)  # AI tidak jalan, tapi risk tinggi tetap dieskalasi
                 continue
-            try:  # prioritas: risk tertinggi diproses lebih dulu
-                self.ai_queue.put_nowait((-r.risk_score, next(self._seq), r))
-            except asyncio.QueueFull:
-                skipped.append(r)
-        if skipped:
-            log.warning("Antrean AI penuh: %d log di-skip (overload)", len(skipped))
-            for r in skipped:
-                self._to_iris(r, None)
+            key = self._ai_aggregation_key(r)
+            if key is None:
+                ready.extend(await self._build_ai_jobs([r]))
+                continue
+            bucket = self._ai_buckets.get(key)
+            if bucket and (now - bucket[0]).total_seconds() >= self.s.ai_aggregation_window_s:
+                jobs = await self._build_ai_jobs(bucket[1])
+                await self._enqueue_ai_jobs(jobs)
+                del self._ai_buckets[key]
+                bucket = None
+            if bucket is None:
+                self._ai_buckets[key] = (now, [r])
+            else:
+                bucket[1].append(r)
+        if ready:
+            await self._enqueue_ai_jobs(ready)
+
+    async def _ai_aggregation_loop(self) -> None:
+        while not self.stop.is_set():
+            await asyncio.sleep(1)
             try:
-                await self.db.mark_many([r.log_uuid for r in skipped], "skipped_overload")
-                await self.logstash.send([self._ai_doc(r, {"status": "skipped_overload"}) for r in skipped])
+                await self._flush_ai_buckets()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Gagal memproses jendela agregasi AI; akan dicoba lagi")
+
+    async def _flush_ai_buckets(self, force: bool = False) -> None:
+        now = datetime.now(timezone.utc)
+        for key, (started, records) in list(self._ai_buckets.items()):
+            if force or (now - started).total_seconds() >= self.s.ai_aggregation_window_s:
+                jobs = await self._build_ai_jobs(records)
+                await self._enqueue_ai_jobs(jobs)
+                del self._ai_buckets[key]
+
+    async def _enqueue_ai_jobs(self, jobs: list[AIJob]) -> None:
+        skipped: list[AIJob] = []
+        for job in jobs:
+            try:  # prioritas: risk tertinggi diproses lebih dulu
+                self.ai_queue.put_nowait((-job.representative.risk_score, next(self._seq), job))
+            except asyncio.QueueFull:
+                skipped.append(job)
+        if skipped:
+            skipped_records = [r for job in skipped for r in job.records]
+            skipped_ids = [r.log_uuid for r in skipped_records]
+            skipped_ids.extend(job.aggregate_record.log_uuid for job in skipped if job.aggregate_record)
+            log.warning("Antrean AI penuh: %d log di-skip (overload)", len(skipped_records))
+            for job in skipped:
+                self._to_iris(job.representative, None)
+            try:
+                await self.db.mark_many(skipped_ids, "skipped_overload")
+                await self._send_ai_updates(skipped_records, {"status": "skipped_overload"})
             except Exception:
                 log.exception("Gagal mencatat skipped_overload")
+
+    async def _send_ai_updates(self, records: list[Record], ai: dict) -> None:
+        for offset in range(0, len(records), 200):
+            docs = [self._ai_doc(r, ai) for r in records[offset:offset + 200]]
+            if not await self.logstash.send(docs, attempts=5):
+                log.error("Gagal mengirim hasil AI untuk %d log ke Logstash", len(docs))
 
     @staticmethod
     def _ai_doc(r: Record, ai: dict) -> dict:
@@ -623,28 +754,38 @@ class App:
 
     async def _ai_worker(self, n: int) -> None:
         while True:
-            _, _, r = await self.ai_queue.get()
+            _, _, job = await self.ai_queue.get()
+            r = job.representative
+            log_uuids = [item.log_uuid for item in job.records]
+            if job.aggregate_record:
+                log_uuids.append(job.aggregate_record.log_uuid)
             t0 = time.perf_counter()
             try:
-                await self.db.update_ai(r.log_uuid, "running")
-                result, provider, model = await self.llm.analyze(str(r.log_uuid), r.doc)
+                await self.db.update_ai_many(log_uuids, "running")
+                result, provider, model = await self.llm.analyze(str(r.log_uuid), job.doc)
                 ai = {"status": "done", "analysis": result, "provider": provider, "model": model,
                       "duration_s": round(time.perf_counter() - t0, 2),
                       "completed_at": datetime.now(timezone.utc).isoformat()}
-                await self.db.update_ai(r.log_uuid, "done", result)
+                if job.aggregated:
+                    ai["aggregation"] = {
+                        "count": len(job.records),
+                        "representative_log_uuid": str(r.log_uuid),
+                        "aggregate_log_uuid": str(job.aggregate_record.log_uuid) if job.aggregate_record else None,
+                        "related_log_uuids": [str(item.log_uuid) for item in job.records[:100]],
+                    }
+                await self.db.update_ai_many(log_uuids, "done", result)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 log.warning("AI gagal untuk %s: %s", r.log_uuid, type(exc).__name__)
                 ai = {"status": "failed", "error": type(exc).__name__, "providers": self.llm.label}
                 try:
-                    await self.db.update_ai(r.log_uuid, "failed")
+                    await self.db.update_ai_many(log_uuids, "failed")
                 except Exception:
                     pass
             try:
-                # UUID sama => Logstash/ES meng-upsert ke dokumen log mentah
-                if not await self.logstash.send([self._ai_doc(r, ai)], attempts=5):
-                    log.error("Hasil AI %s gagal dikirim ke Logstash", r.log_uuid)
+                # Attach one shared analysis result to every original log document.
+                await self._send_ai_updates(job.records, ai)
                 self._to_iris(r, ai)
             finally:
                 self.ai_queue.task_done()
