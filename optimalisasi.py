@@ -57,16 +57,57 @@ def _log_uuid(value: Any) -> str:
     return "unknown"
 
 
-def attack_aggregation_key(value: Any) -> tuple[str, str] | None:
-    """Kunci grouping burst: IP sumber + signature serangan."""
+def attack_aggregation_key(value: Any) -> tuple[str, str]:
+    """Kunci grouping burst: usahakan selalu mengembalikan kunci.
+
+    Priority identifier:
+    - source.ip (jika ada)
+    - domain.name (jika ada)
+    - asset.name / host.name (jika ada)
+    - event.rule_id atau event.action
+    - fallback: hash singkat dari original / payload
+
+    Signature:
+    - event.rule_id jika ada
+    - else event.action
+    - else category
+
+    Mengembalikan tuple (identifier, signature) — selalu non-None sehingga semua event
+    dapat digabung jika threshold/window terpenuhi.
+    """
+    import hashlib
+
     doc = _as_doc(value)
     source = doc.get("source") if isinstance(doc.get("source"), dict) else {}
     event = doc.get("event") if isinstance(doc.get("event"), dict) else {}
-    source_ip = source.get("ip")
-    signature = event.get("rule_id") or event.get("action")
-    if not source_ip or not signature:
-        return None
-    return str(source_ip), str(signature)
+    domain = doc.get("domain") if isinstance(doc.get("domain"), dict) else {}
+    asset = doc.get("asset") if isinstance(doc.get("asset"), dict) else {}
+    host = doc.get("host") if isinstance(doc.get("host"), dict) else {}
+
+    # identifier candidates
+    candidates = []
+    if source.get("ip"):
+        candidates.append(("ip", str(source.get("ip"))))
+    if domain.get("name"):
+        candidates.append(("domain", str(domain.get("name"))))
+    if asset.get("name"):
+        candidates.append(("asset", str(asset.get("name"))))
+    if host.get("name"):
+        candidates.append(("host", str(host.get("name"))))
+
+    signature = event.get("rule_id") or event.get("action") or (event.get("category") if isinstance(event.get("category"), str) else None)
+
+    if not candidates:
+        # fallback: create short hash from original / full payload
+        orig = doc.get("original") or str(doc)
+        h = hashlib.sha1(orig.encode() if isinstance(orig, str) else orjson.dumps(orig, default=str)).hexdigest()
+        candidates.append(("hash", h[:16]))
+
+    identifier_type, identifier_value = candidates[0]
+    # Build canonical identifier string so different types don't collide (e.g., ip vs domain)
+    identifier = f"{identifier_type}:{identifier_value}"
+    sig = str(signature) if signature is not None else "unknown"
+    return identifier, sig
 
 
 def aggregate_event(records: Iterable[Any], threshold: int, window_seconds: int,
