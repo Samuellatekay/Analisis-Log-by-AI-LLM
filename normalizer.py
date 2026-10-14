@@ -133,9 +133,128 @@ def norm_wazuh(p: dict) -> dict:
     return out
 
 
+# ------------------------------------------------------------ OpenCTI / GLPI
+def _merged_payload(p: dict) -> dict:
+    """Support common connector envelopes while retaining fields from the envelope."""
+    data = _dict(p.get("data"))
+    return {**p, **data} if data else p
+
+
+def _first(*values: Any) -> Any:
+    return next((v for v in values if v not in (None, "")), None)
+
+
+def _severity(value: Any, default: int = 1) -> int:
+    levels = {
+        "informational": 1, "info": 1, "debug": 1,
+        "low": 2, "warning": 2, "medium": 3, "moderate": 3,
+        "high": 4, "error": 4, "critical": 5, "very high": 5,
+    }
+    if isinstance(value, str) and value.strip().lower() in levels:
+        return levels[value.strip().lower()]
+    try:
+        return max(1, min(5, int(float(value) + 0.5)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _opencti_indicator_ip(pattern: Any) -> str | None:
+    """Extract only an IP literal from a common STIX indicator pattern."""
+    if not isinstance(pattern, str):
+        return None
+    import re
+
+    match = re.search(r"(?:ipv4-addr|ipv6-addr):value\s*=\s*['\"]([^'\"]+)", pattern, re.I)
+    return _valid_ip(match.group(1)) if match else None
+
+
+def norm_opencti(payload: dict) -> dict:
+    """Map OpenCTI/STIX records and connector envelopes to the internal event schema."""
+    p = _merged_payload(payload)
+    existing_event = _dict(p.get("event"))
+    entity_type = str(_first(p.get("entity_type"), p.get("type"), p.get("x_opencti_type"), ""))
+    entity_type = entity_type.lower()
+    pattern = p.get("pattern")
+    is_indicator = entity_type in {"indicator", "ipv4-addr", "ipv6-addr", "domain-name", "url"} or bool(pattern)
+    score = _first(p.get("x_opencti_score"), p.get("score"))
+    try:
+        score = max(0, min(100, float(score))) if score is not None else None
+    except (TypeError, ValueError):
+        score = None
+
+    event = dict(existing_event)
+    event.setdefault("action", _first(p.get("name"), p.get("description"), entity_type, "OpenCTI threat intelligence"))
+    event.setdefault("category", ["threat"])
+    event.setdefault("outcome", "alert")
+    if "severity" not in event:
+        event["severity"] = _severity(score / 20 if score is not None else None, 4 if is_indicator else 1)
+
+    out = dict(p)
+    out["event"] = event
+    out["data_source"] = "opencti"
+    out["threat"] = {**_dict(p.get("threat")), "base_weight": _dict(p.get("threat")).get("base_weight", 4)}
+    if score is not None or is_indicator:
+        out["reputation"] = {
+            **_dict(p.get("reputation")),
+            **({"score": score} if score is not None else {}),
+            "ioc_match": bool(_dict(p.get("reputation")).get("ioc_match")) or is_indicator,
+        }
+
+    ip = _first(_dict(p.get("source")).get("ip"), p.get("srcip"), p.get("ip"), _opencti_indicator_ip(pattern))
+    if ip and _valid_ip(ip):
+        out["source"] = {**_dict(p.get("source")), "ip": _valid_ip(ip)}
+    domain = _first(_dict(p.get("domain")).get("name"), p.get("domain_name"))
+    if domain:
+        out["domain"] = {**_dict(p.get("domain")), "name": domain}
+    out.setdefault("original", orjson.dumps(payload, default=str).decode()[:MAX_ORIGINAL_CHARS])
+    return out
+
+
+def norm_glpi(payload: dict) -> dict:
+    """Map GLPI ticket/log/asset records to the internal event schema."""
+    p = _merged_payload(payload)
+    existing_event = _dict(p.get("event"))
+    priority = _first(p.get("priority"), p.get("urgency"), p.get("severity"))
+    event = dict(existing_event)
+    event.setdefault("action", _first(
+        p.get("name"), p.get("message"), p.get("content"), p.get("title"),
+        p.get("itemtype"), "GLPI event",
+    ))
+    event.setdefault("category", ["configuration"])
+    event.setdefault("outcome", "alert")
+    event.setdefault("severity", _severity(priority))
+
+    out = dict(p)
+    out["event"] = event
+    out["data_source"] = "glpi"
+    item_name = _first(p.get("item_name"), p.get("asset_name"), p.get("name"))
+    item_type = _first(p.get("itemtype"), p.get("item_type"), p.get("asset_type"))
+    asset = dict(_dict(p.get("asset")))
+    if item_name:
+        asset.setdefault("name", item_name)
+    if item_type:
+        asset.setdefault("type", item_type)
+    if asset:
+        out["asset"] = asset
+    source_ip = _first(_dict(p.get("source")).get("ip"), p.get("source_ip"), p.get("ip"))
+    if source_ip and _valid_ip(source_ip):
+        out["source"] = {**_dict(p.get("source")), "ip": _valid_ip(source_ip)}
+    out.setdefault("original", orjson.dumps(payload, default=str).decode()[:MAX_ORIGINAL_CHARS])
+    return out
+
+
+NORMALIZERS.update({
+    "opencti-events": norm_opencti,
+    "opencti": norm_opencti,
+    "glpi-logs": norm_glpi,
+    "glpi": norm_glpi,
+})
+
+
 # ------------------------------------------------------------------- entry
 def normalize(source: str, payload: dict) -> dict:
-    fn = NORMALIZERS.get(source)
+    source_key = source.strip().lower().replace("_", "-")
+    fn = NORMALIZERS.get(source_key)
     if fn is None and is_wazuh(payload):
         fn = norm_wazuh
     data = fn(payload) if fn else dict(payload)
