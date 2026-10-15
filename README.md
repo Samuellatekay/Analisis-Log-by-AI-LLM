@@ -21,6 +21,12 @@ membuat objek Asset/IOC native baru di IRIS. Jika alert belum datang, enrichment
 sementara di Redis dan digabungkan saat alert yang cocok diproses. Data korelasi mengikuti
 masa retensi database (`RETENTION_MINUTES`); cache Redis bertahan setidaknya 24 jam.
 
+Alert IRIS dikirim segera setelah lolos filter risiko dan level Wazuh, tanpa menunggu LLM
+atau jendela agregasi AI. Status awal menyatakan bahwa analisis sedang berjalan. Saat LLM selesai,
+alert yang sama diperbarui dengan hasilnya; jika alert sudah menjadi case, case juga menerima
+catatan pembaruan. Untuk alert yang dianalisis secara agregat, hasil yang sama dipasang ke setiap
+alert sumber yang termasuk agregasi.
+
 Contoh isi yang diteruskan ke LLM:
 
 ```json

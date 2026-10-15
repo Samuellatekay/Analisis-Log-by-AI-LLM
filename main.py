@@ -928,6 +928,7 @@ class App:
             if r.ai_status != "pending":
                 self._to_iris(r, None)  # AI tidak jalan, tapi risk tinggi tetap dieskalasi
                 continue
+            self._to_iris(r, {"status": "running"})
             key = self._ai_aggregation_key(r)
             if key is None:
                 ready.extend(await self._build_ai_jobs([r]))
@@ -976,7 +977,8 @@ class App:
             skipped_ids.extend(job.aggregate_record.log_uuid for job in skipped if job.aggregate_record)
             log.warning("Antrean AI penuh: %d log di-skip (overload)", len(skipped_records))
             for job in skipped:
-                self._to_iris(job.representative, None)
+                for record in job.records:
+                    self._to_iris(record, {"status": "skipped_overload"})
             try:
                 await self.db.mark_many(skipped_ids, "skipped_overload")
                 await self._send_ai_updates(skipped_records, {"status": "skipped_overload"})
@@ -1028,17 +1030,14 @@ class App:
             try:
                 # Attach one shared analysis result to every original log document.
                 await self._send_ai_updates(job.records, ai)
-                self._to_iris(r, ai)
+                for record in job.records:
+                    self._to_iris(record, ai)
             finally:
                 self.ai_queue.task_done()
 
     # ---- DFIR-IRIS
     def _to_iris(self, r: Record, ai: dict | None) -> None:
         if not self.iris or r.risk_score < self.s.iris_min_risk or not self.iris.allows(r.doc):
-            return
-        verdict = ((ai or {}).get("analysis") or {}).get("verdict")
-        has_enrichment = bool((r.doc.get("enrichment") or {}).get("observables"))
-        if verdict in ("false_positive", "benign") and not has_enrichment:
             return
         try:
             self.iris_queue.put_nowait((r, ai))
@@ -1089,13 +1088,17 @@ class App:
             if got_lock:
                 await self.redis.delete(lock)
 
-    async def _add_case_enrichment_note(
-        self, case_id: int, r: Record, ai: dict | None, observables: list[dict]
+    async def _add_case_update_note(
+        self, case_id: int, r: Record, ai: dict | None
     ) -> None:
+        observables = (r.doc.get("enrichment") or {}).get("observables") or []
         note_hash = hashlib.sha256(
-            orjson.dumps(observables, option=orjson.OPT_SORT_KEYS)
+            orjson.dumps(
+                {"observables": observables, "ai": ai},
+                option=orjson.OPT_SORT_KEYS,
+            )
         ).hexdigest()
-        note_key = f"iris:enrichment-note:{case_id}:{note_hash}"
+        note_key = f"iris:update-note:{case_id}:{note_hash}"
         if not await self.redis.set(note_key, "1", nx=True, ex=86400):
             return
         try:
@@ -1113,25 +1116,20 @@ class App:
             try:
                 alert_id, case_id = await self.db.get_iris_ids(r.log_uuid)
                 if alert_id is not None:
-                    observables = (r.doc.get("enrichment") or {}).get("observables")
-                    if observables:
-                        await self.iris.update_alert(int(alert_id), r.doc, ai)
-                        log.info("IRIS alert %s diperbarui dengan enrichment log=%s",
-                                 alert_id, r.log_uuid)
-                        if case_id is not None:
-                            await self._add_case_enrichment_note(
-                                int(case_id), r, ai, observables
-                            )
+                    await self.iris.update_alert(int(alert_id), r.doc, ai)
+                    log.info("IRIS alert %s diperbarui log=%s", alert_id, r.log_uuid)
+                    if case_id is not None and (
+                        (r.doc.get("enrichment") or {}).get("observables")
+                        or (ai and ai.get("status") != "running")
+                    ):
+                        await self._add_case_update_note(int(case_id), r, ai)
                     continue
                 if case_id is not None:
-                    observables = (r.doc.get("enrichment") or {}).get("observables")
-                    if observables:
-                        await self._add_case_enrichment_note(
-                            int(case_id), r, ai, observables
-                        )
-                    continue
-                verdict = ((ai or {}).get("analysis") or {}).get("verdict")
-                if verdict in ("false_positive", "benign"):
+                    if (
+                        (r.doc.get("enrichment") or {}).get("observables")
+                        or (ai and ai.get("status") != "running")
+                    ):
+                        await self._add_case_update_note(int(case_id), r, ai)
                     continue
                 # cegah banjir: 1 item / (source, action) / window
                 if not await self.redis.set(key, "1", nx=True, ex=s.iris_dedup_s):

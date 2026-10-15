@@ -137,6 +137,8 @@ class IrisClient:
             lines += ["## Ringkasan AI", _md_escape(analysis.get("summary", ""), 1500), "",
                       f"**Verdict:** {verdict} (confidence {analysis.get('confidence', 0)})  "
                       f"| **Model:** {_md_escape(_d(ai).get('provider', ''), 30)}/{_md_escape(_d(ai).get('model', ''), 60)}", ""]
+        elif _d(ai).get("status") in ("running", "pending"):
+            lines += ["_Analisis AI sedang berjalan; hasilnya akan ditambahkan ke alert ini._", ""]
         else:
             lines += [f"_Analisis AI tidak tersedia (status: {_md_escape(_d(ai).get('status', 'not_run'), 30)})._", ""]
         lines += [
