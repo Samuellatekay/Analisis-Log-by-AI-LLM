@@ -205,28 +205,44 @@ def merge_enrichment(target: dict, event: dict) -> None:
             target["geolocation"] = geolocation
 
         asset_result = event.get("asset")
-        items = asset_result.get("items") if isinstance(asset_result, dict) else None
-        if isinstance(items, list):
-            glpi_asset = next((item for item in items if isinstance(item, dict)), None)
-            if glpi_asset:
-                asset = target.get("asset")
-                asset = dict(asset) if isinstance(asset, dict) else {}
-                host = target.get("host")
-                host_name = host.get("name") if isinstance(host, dict) else None
-                if host_name and host_name != glpi_asset.get("name"):
-                    asset["agent_name"] = host_name
-                for source, destination in (
-                    ("name", "name"),
-                    ("ip", "ip"),
-                    ("owner", "owner"),
-                    ("serial_number", "serial_number"),
-                    ("operating_system", "operating_system"),
-                    ("status", "status"),
-                ):
-                    if glpi_asset.get(source) is not None:
-                        asset[destination] = glpi_asset[source]
-                asset["inventory_source"] = "GLPI"
-                target["asset"] = asset
+        asset_candidates: list[dict] = []
+        if isinstance(asset_result, dict):
+            items = asset_result.get("items")
+            if isinstance(items, list):
+                asset_candidates.extend(item for item in items if isinstance(item, dict))
+            if not asset_candidates:
+                asset_candidates.append(asset_result)
+        elif isinstance(asset_result, list):
+            asset_candidates.extend(item for item in asset_result if isinstance(item, dict))
+
+        glpi_asset = next(
+            (
+                item for item in asset_candidates
+                if any(item.get(k) is not None for k in (
+                    "name", "ip", "owner", "serial_number", "operating_system", "status"
+                ))
+            ),
+            asset_candidates[0] if asset_candidates else None,
+        )
+        if glpi_asset:
+            asset = target.get("asset")
+            asset = dict(asset) if isinstance(asset, dict) else {}
+            host = target.get("host")
+            host_name = host.get("name") if isinstance(host, dict) else None
+            if host_name and host_name != glpi_asset.get("name"):
+                asset["agent_name"] = host_name
+            for source, destination in (
+                ("name", "name"),
+                ("ip", "ip"),
+                ("owner", "owner"),
+                ("serial_number", "serial_number"),
+                ("operating_system", "operating_system"),
+                ("status", "status"),
+            ):
+                if glpi_asset.get(source) is not None:
+                    asset[destination] = glpi_asset[source]
+            asset["inventory_source"] = "GLPI"
+            target["asset"] = asset
 
     elif entity_type == "domain-name" and value:
         domain = target.get("domain")
