@@ -655,7 +655,9 @@ class App:
             if not ok:
                 for r in records:
                     dlq.append((r.msg_id, "logstash_failed", orjson.dumps(r.doc).decode()))
-            records_ok = records if ok else []
+                log.error("Logstash tidak tersedia; %d alert tetap diteruskan ke antrean AI",
+                          len(records))
+            records_ok = records
 
         if dlq:
             await self._send_dlq(dlq)
@@ -712,7 +714,11 @@ class App:
         records = list(matched.values())
         if records:
             if not await self.logstash.send([record.doc for record in records]):
-                raise RuntimeError("Logstash menolak alert yang diperbarui dengan enrichment")
+                for record in records:
+                    dlq.append((record.msg_id, "logstash_enrichment_failed",
+                                orjson.dumps(record.doc).decode()))
+                log.error("Logstash tidak tersedia; %d alert hasil enrichment tetap "
+                          "diteruskan ke antrean AI", len(records))
             await self._enqueue_ai(records)
             log.info("Enrichment dicocokkan ke %d alert; analisis AI dijadwalkan", len(records))
         elif parsed:

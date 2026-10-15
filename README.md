@@ -36,3 +36,7 @@ Contoh isi yang diteruskan ke LLM:
 Hash file dicocokkan terhadap hash pada alert Wazuh, bukan terhadap IP. Event enrichment
 yang tidak memiliki alert cocok tetap dicache untuk alert yang datang kemudian dan tidak
 dibuat sebagai analisis LLM terpisah.
+
+Kegagalan pengiriman ke Logstash dicatat ke DLQ dan log aplikasi, tetapi tidak lagi
+menghentikan analisis AI atau pengiriman ke IRIS. PostgreSQL tetap menjadi penyimpanan
+untuk analisis; Logstash hanya tujuan penerusan/indexing.
