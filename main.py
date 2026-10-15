@@ -718,6 +718,9 @@ class App:
                 if r.msg_id in rejected:
                     dlq.append((r.msg_id, "db_rejected", orjson.dumps(r.doc).decode()))
             records = [r for r in records if r.msg_id not in rejected]
+            accepted_data = [data for item, data in parsed if item.msg_id not in rejected]
+            if accepted_data:
+                await self._queue_glpi_asset_lookups(accepted_data)
             ok = await self.logstash.send([r.doc for r in records]) if records else True
             sent_s = time.perf_counter() - t0
             if not ok:
@@ -832,6 +835,43 @@ class App:
         for (data, _), raw_event in zip(lookups, cached_events):
             if raw_event:
                 merge_enrichment(data, orjson.loads(raw_event))
+
+    async def _queue_glpi_asset_lookups(self, events: list[dict]) -> None:
+        """Ask the GLPI collector to enrich Wazuh source IPs, using its configured GLPI credentials."""
+        for event in events:
+            if event.get("data_source") != "wazuh":
+                continue
+            source = event.get("source") if isinstance(event.get("source"), dict) else {}
+            value = source.get("ip")
+            if not isinstance(value, str):
+                continue
+            try:
+                address = ipaddress.ip_address(value)
+            except ValueError:
+                continue
+            ip = str(address)
+            entity_type = "IPv4-Addr" if address.version == 4 else "IPv6-Addr"
+            cache_key = self._enrichment_cache_key(entity_type, ip)
+            cached = await self.redis.get(cache_key)
+            if cached:
+                try:
+                    cached_event = orjson.loads(cached)
+                except orjson.JSONDecodeError:
+                    cached_event = {}
+                asset = cached_event.get("asset") if isinstance(cached_event, dict) else None
+                if isinstance(asset, dict) and asset.get("found") and asset.get("items"):
+                    continue
+
+            lookup_key = f"analysis:glpi-lookup:{ip}"
+            if not await self.redis.set(lookup_key, "1", nx=True, ex=300):
+                continue
+            request = {"action": "lookup_asset", "ip": ip, "entity_type": entity_type}
+            try:
+                await self.redis.rpush("outbound-glpi", orjson.dumps(request).decode())
+                log.info("GLPI asset lookup queued ip=%s", ip)
+            except Exception:
+                await self.redis.delete(lookup_key)
+                log.exception("Gagal mengantrekan pencarian aset GLPI untuk IP %s", ip)
 
     async def _enrich(self, events: list[dict]) -> list[tuple[int, float | None]]:
         """1 pipeline Redis per batch: counter pengulangan (+ fallback asset criticality)."""
