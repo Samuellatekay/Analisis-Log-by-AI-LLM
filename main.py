@@ -210,7 +210,9 @@ def merge_enrichment(target: dict, event: dict) -> None:
             items = asset_result.get("items")
             if isinstance(items, list):
                 asset_candidates.extend(item for item in items if isinstance(item, dict))
-            if not asset_candidates:
+            elif any(asset_result.get(k) is not None for k in (
+                "name", "ip", "owner", "serial_number", "operating_system", "status"
+            )):
                 asset_candidates.append(asset_result)
         elif isinstance(asset_result, list):
             asset_candidates.extend(item for item in asset_result if isinstance(item, dict))
@@ -218,11 +220,11 @@ def merge_enrichment(target: dict, event: dict) -> None:
         glpi_asset = next(
             (
                 item for item in asset_candidates
-                if any(item.get(k) is not None for k in (
+                if any(item.get(k) not in (None, "") for k in (
                     "name", "ip", "owner", "serial_number", "operating_system", "status"
                 ))
             ),
-            asset_candidates[0] if asset_candidates else None,
+            None,
         )
         if glpi_asset:
             asset = target.get("asset")

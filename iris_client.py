@@ -131,17 +131,22 @@ class IrisClient:
         what = _md_escape(ev.get("action") or ev.get("category") or "event", 80)
         who = _md_escape(src.get("ip") or asset.get("name") or "unknown", 80)
         verdict = analysis.get("verdict", "no-ai")
+        is_glpi_asset = asset.get("inventory_source") == "GLPI"
+        glpi_name = asset.get("name") if is_glpi_asset else None
+        glpi_ip = asset.get("ip") if is_glpi_asset else None
         asset_info = [
-            f"--- GLPI Asset Info (IP: {_md_escape(asset.get('ip') or src.get('ip') or 'Tidak tersedia', 80)}) ---",
-            f"Name: {_md_escape(asset.get('name') or 'Tidak tersedia', 160)}",
-            f"IP address: {_md_escape(asset.get('ip') or src.get('ip') or 'Tidak tersedia', 80)}",
-            f"User / pemilik: {_md_escape(asset.get('owner') or 'Tidak tersedia', 160)}",
-            f"Serial number: {_md_escape(asset.get('serial_number') or 'Tidak tersedia', 160)}",
-            f"Operating system: {_md_escape(asset.get('operating_system') or 'Tidak tersedia', 160)}",
-            f"Status: {_md_escape(asset.get('status') or 'Tidak tersedia', 80)}",
+            f"--- GLPI Asset Info (IP: {_md_escape(glpi_ip or src.get('ip') or 'Tidak tersedia', 80)}) ---",
+            f"Name: {_md_escape(glpi_name or 'Tidak ditemukan di GLPI', 160)}",
+            f"IP address: {_md_escape(glpi_ip or src.get('ip') or 'Tidak tersedia', 80)}",
+            f"User / pemilik: {_md_escape((asset.get('owner') if is_glpi_asset else None) or 'Tidak tersedia', 160)}",
+            f"Serial number: {_md_escape((asset.get('serial_number') if is_glpi_asset else None) or 'Tidak tersedia', 160)}",
+            f"Operating system: {_md_escape((asset.get('operating_system') if is_glpi_asset else None) or 'Tidak tersedia', 160)}",
+            f"Status: {_md_escape((asset.get('status') if is_glpi_asset else None) or 'Tidak tersedia', 80)}",
         ]
-        if asset.get("agent_name"):
-            asset_info.append(f"Agent / hostname Wazuh: {_md_escape(asset['agent_name'], 160)}")
+        host = _d(doc.get("host"))
+        agent_name = asset.get("agent_name") or host.get("name")
+        if agent_name:
+            asset_info.append(f"Agent / hostname Wazuh: {_md_escape(agent_name, 160)}")
 
         lines = []
         if analysis:
