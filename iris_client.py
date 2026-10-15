@@ -278,8 +278,7 @@ class IrisClient:
         """Eskalasi alert menjadi case baru."""
         p = self.build_payload(doc, ai)
         body = {"iocs_import_list": [], "assets_import_list": [], "import_as_event": False,
-                "note": ("Dieskalasi otomatis oleh Analisis-Log-AI (risk tinggi).\n\n"
-                         + p["alert_description"])[:8000],
+                "note": "Dieskalasi otomatis oleh Analisis-Log-AI (risk tinggi).",
                 "case_title": p["alert_title"][:250], "case_tags": p["alert_tags"]}
         d = await self._post(self.paths["escalate"].format(id=alert_id), body)
         return d.get("case_id") or d.get("id")
