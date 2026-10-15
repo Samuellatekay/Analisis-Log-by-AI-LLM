@@ -305,6 +305,8 @@ class IrisClient:
             directories_path = self.paths["case_note_directories"].format(id=case_id)
             response = await self._get(directories_path, {"per_page": 100, "page": 1})
             directories = response.get("data")
+            if isinstance(directories, dict):
+                directories = directories.get("data")
             if not isinstance(directories, list):
                 raise IrisError("IRIS tidak mengembalikan daftar direktori catatan case")
             valid_directories = [
@@ -316,7 +318,14 @@ class IrisClient:
                 valid_directories[0] if valid_directories else None,
             )
             if directory is None:
-                raise IrisError(f"Case IRIS {case_id} tidak memiliki direktori catatan")
+                created = await self._post(directories_path, {
+                    "name": "Analisis-Log-AI Updates",
+                })
+                directory = created.get("data", created)
+                if not isinstance(directory, dict) or not isinstance(directory.get("id"), int):
+                    raise IrisError(
+                        f"IRIS gagal membuat direktori catatan untuk case {case_id}"
+                    )
             directory_id = directory["id"]
         else:
             directory_id = None
