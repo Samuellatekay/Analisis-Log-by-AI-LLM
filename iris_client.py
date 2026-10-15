@@ -131,6 +131,17 @@ class IrisClient:
         what = _md_escape(ev.get("action") or ev.get("category") or "event", 80)
         who = _md_escape(src.get("ip") or asset.get("name") or "unknown", 80)
         verdict = analysis.get("verdict", "no-ai")
+        asset_info = [
+            f"--- GLPI Asset Info (IP: {_md_escape(asset.get('ip') or src.get('ip') or 'Tidak tersedia', 80)}) ---",
+            f"Name: {_md_escape(asset.get('name') or 'Tidak tersedia', 160)}",
+            f"IP address: {_md_escape(asset.get('ip') or src.get('ip') or 'Tidak tersedia', 80)}",
+            f"User / pemilik: {_md_escape(asset.get('owner') or 'Tidak tersedia', 160)}",
+            f"Serial number: {_md_escape(asset.get('serial_number') or 'Tidak tersedia', 160)}",
+            f"Operating system: {_md_escape(asset.get('operating_system') or 'Tidak tersedia', 160)}",
+            f"Status: {_md_escape(asset.get('status') or 'Tidak tersedia', 80)}",
+        ]
+        if asset.get("agent_name"):
+            asset_info.append(f"Agent / hostname Wazuh: {_md_escape(asset['agent_name'], 160)}")
 
         lines = []
         if analysis:
@@ -149,7 +160,8 @@ class IrisClient:
             "## Konteks",
             f"- **Event:** {what} / outcome {_md_escape(ev.get('outcome'), 40)}",
             f"- **Source:** {who}",
-            f"- **Asset (GLPI):** {_md_escape(asset, 700)}",
+            "**Asset (GLPI)**",
+            *asset_info,
             f"- **Reputation (OpenCTI/feeds):** {_md_escape(doc.get('reputation'), 700)}",
             f"- **Geolocation:** {_md_escape(doc.get('geolocation'), 500)}",
             f"- **Domain:** {_md_escape(doc.get('domain'), 500)}", ""]
