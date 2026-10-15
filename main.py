@@ -1103,6 +1103,8 @@ class App:
 
     # ---- DFIR-IRIS
     def _to_iris(self, r: Record, ai: dict | None) -> None:
+        if r.doc.get("data_source") in {"opencti", "glpi"}:
+            return  # threat-intel and collector feedback enrich alerts; they are not alerts
         if not self.iris or r.risk_score < self.s.iris_min_risk or not self.iris.allows(r.doc):
             return
         try:

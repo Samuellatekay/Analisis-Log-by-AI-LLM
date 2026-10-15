@@ -27,6 +27,11 @@ membuat objek Asset/IOC native baru di IRIS. Jika alert belum datang, enrichment
 sementara di Redis dan digabungkan saat alert yang cocok diproses. Data korelasi mengikuti
 masa retensi database (`RETENTION_MINUTES`); cache Redis bertahan setidaknya 24 jam.
 
+Record dari `opencti-events` dan `glpi-logs` tidak dikirim sebagai alert IRIS mandiri.
+OpenCTI adalah sumber intelijen ancaman dan GLPI berisi umpan balik tiket collector;
+keduanya tetap bisa dipakai sebagai konteks, sedangkan alert deteksi Wazuh yang dikorelasikan
+yang dikirim ke IRIS.
+
 Alert IRIS dikirim segera setelah lolos filter risiko dan level Wazuh, tanpa menunggu LLM
 atau jendela agregasi AI. Status awal menyatakan bahwa analisis sedang berjalan. Saat LLM selesai,
 alert yang sama diperbarui dengan hasilnya; jika alert sudah menjadi case, case juga menerima
