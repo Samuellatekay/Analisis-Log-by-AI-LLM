@@ -187,6 +187,56 @@ ALTER TABLE log_events ADD COLUMN IF NOT EXISTS iris_case_id INTEGER;
 
 
 def merge_enrichment(target: dict, event: dict) -> None:
+    entity_type = str(event.get("entity_type") or "").lower()
+    value = event.get("value")
+
+    if entity_type in {"ipv4-addr", "ipv6-addr"}:
+        reputation = event.get("reputation")
+        if isinstance(reputation, dict):
+            current = target.get("reputation")
+            current = dict(current) if isinstance(current, dict) else {}
+            current.update(reputation)
+            if reputation.get("opencti_score") is not None:
+                current["ioc_match"] = True
+            target["reputation"] = current
+
+        geolocation = event.get("geolocation")
+        if isinstance(geolocation, dict):
+            target["geolocation"] = geolocation
+
+        asset_result = event.get("asset")
+        items = asset_result.get("items") if isinstance(asset_result, dict) else None
+        if isinstance(items, list):
+            glpi_asset = next((item for item in items if isinstance(item, dict)), None)
+            if glpi_asset:
+                asset = target.get("asset")
+                asset = dict(asset) if isinstance(asset, dict) else {}
+                host = target.get("host")
+                host_name = host.get("name") if isinstance(host, dict) else None
+                if host_name and host_name != glpi_asset.get("name"):
+                    asset["agent_name"] = host_name
+                for source, destination in (
+                    ("name", "name"),
+                    ("ip", "ip"),
+                    ("owner", "owner"),
+                    ("serial_number", "serial_number"),
+                    ("operating_system", "operating_system"),
+                    ("status", "status"),
+                ):
+                    if glpi_asset.get(source) is not None:
+                        asset[destination] = glpi_asset[source]
+                asset["inventory_source"] = "GLPI"
+                target["asset"] = asset
+
+    elif entity_type == "domain-name" and value:
+        domain = target.get("domain")
+        domain = dict(domain) if isinstance(domain, dict) else {}
+        domain["name"] = value
+        age = event.get("domain_age")
+        if isinstance(age, dict):
+            domain.update(age)
+        target["domain"] = domain
+
     section = target.setdefault("enrichment", {})
     observables = section.setdefault("observables", [])
     entry = {
@@ -1039,6 +1089,22 @@ class App:
             if got_lock:
                 await self.redis.delete(lock)
 
+    async def _add_case_enrichment_note(
+        self, case_id: int, r: Record, ai: dict | None, observables: list[dict]
+    ) -> None:
+        note_hash = hashlib.sha256(
+            orjson.dumps(observables, option=orjson.OPT_SORT_KEYS)
+        ).hexdigest()
+        note_key = f"iris:enrichment-note:{case_id}:{note_hash}"
+        if not await self.redis.set(note_key, "1", nx=True, ex=86400):
+            return
+        try:
+            await self.iris.add_case_note(case_id, r.doc, ai)
+        except Exception:
+            await self.redis.delete(note_key)
+            raise
+        log.info("IRIS case %s menerima catatan enrichment log=%s", case_id, r.log_uuid)
+
     async def _iris_worker(self) -> None:
         s = self.s
         while True:
@@ -1052,22 +1118,17 @@ class App:
                         await self.iris.update_alert(int(alert_id), r.doc, ai)
                         log.info("IRIS alert %s diperbarui dengan enrichment log=%s",
                                  alert_id, r.log_uuid)
+                        if case_id is not None:
+                            await self._add_case_enrichment_note(
+                                int(case_id), r, ai, observables
+                            )
                     continue
-                if case_id is not None and s.iris_mode == "case":
+                if case_id is not None:
                     observables = (r.doc.get("enrichment") or {}).get("observables")
                     if observables:
-                        note_hash = hashlib.sha256(
-                            orjson.dumps(observables, option=orjson.OPT_SORT_KEYS)
-                        ).hexdigest()
-                        note_key = f"iris:enrichment-note:{case_id}:{note_hash}"
-                        if await self.redis.set(note_key, "1", nx=True, ex=86400):
-                            try:
-                                await self.iris.add_case_note(int(case_id), r.doc, ai)
-                            except Exception:
-                                await self.redis.delete(note_key)
-                                raise
-                            log.info("IRIS case %s menerima catatan enrichment log=%s",
-                                     case_id, r.log_uuid)
+                        await self._add_case_enrichment_note(
+                            int(case_id), r, ai, observables
+                        )
                     continue
                 verdict = ((ai or {}).get("analysis") or {}).get("verdict")
                 if verdict in ("false_positive", "benign"):

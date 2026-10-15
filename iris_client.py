@@ -147,10 +147,10 @@ class IrisClient:
             "## Konteks",
             f"- **Event:** {what} / outcome {_md_escape(ev.get('outcome'), 40)}",
             f"- **Source:** {who}",
-            f"- **Asset:** {_md_escape(asset, 200)}",
-            f"- **Reputation:** {_md_escape(doc.get('reputation'), 200)}",
-            f"- **Geolocation:** {_md_escape(doc.get('geolocation'), 200)}",
-            f"- **Domain:** {_md_escape(doc.get('domain'), 200)}", ""]
+            f"- **Asset (GLPI):** {_md_escape(asset, 700)}",
+            f"- **Reputation (OpenCTI/feeds):** {_md_escape(doc.get('reputation'), 700)}",
+            f"- **Geolocation:** {_md_escape(doc.get('geolocation'), 500)}",
+            f"- **Domain:** {_md_escape(doc.get('domain'), 500)}", ""]
         observables = _d(doc.get("enrichment")).get("observables")
         if isinstance(observables, list) and observables:
             lines += ["## IOC enrichment (OpenCTI / GLPI)"]
@@ -276,7 +276,8 @@ class IrisClient:
         """Eskalasi alert menjadi case baru."""
         p = self.build_payload(doc, ai)
         body = {"iocs_import_list": [], "assets_import_list": [], "import_as_event": False,
-                "note": "Dieskalasi otomatis oleh Analisis-Log-AI (risk tinggi).",
+                "note": ("Dieskalasi otomatis oleh Analisis-Log-AI (risk tinggi).\n\n"
+                         + p["alert_description"])[:8000],
                 "case_title": p["alert_title"][:250], "case_tags": p["alert_tags"]}
         d = await self._post(self.paths["escalate"].format(id=alert_id), body)
         return d.get("case_id") or d.get("id")
