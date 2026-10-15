@@ -28,7 +28,9 @@ PATHS = {
     "v2": {"alert": "/api/v2/alerts", "alert_update": "/api/v2/alerts/{id}",
            "escalate": "/api/v2/alerts/escalate/{id}",
            "merge": "/api/v2/alerts/merge/{id}", "case": "/api/v2/cases",
-           "case_note": "/api/v2/cases/{id}/notes", "probe": "/api/v2/cases",
+           "case_note": "/api/v2/cases/{id}/notes",
+           "case_note_directories": "/api/v2/cases/{id}/notes-directories",
+           "probe": "/api/v2/cases",
            "severity_list": ["/api/v2/manage/severities"],
            "status_list": ["/api/v2/manage/alert-statuses", "/api/v2/manage/alert-status"]},
 }
@@ -253,6 +255,21 @@ class IrisClient:
             return self._parse(r, path)
         return {}
 
+    async def _get(self, path: str, params: dict | None = None) -> dict:
+        for attempt in range(3):
+            try:
+                r = await self._client.get(path, params=params)
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(1 + attempt)
+                continue
+            if r.status_code in RETRY_STATUS and attempt < 2:
+                await asyncio.sleep(1 + attempt)
+                continue
+            return self._parse(r, path)
+        return {}
+
     async def create_alert(self, doc: dict, ai: dict | None) -> int | None:
         await self._ensure_ids()
         d = await self._post(self.paths["alert"], self.build_payload(doc, ai))
@@ -284,10 +301,31 @@ class IrisClient:
     async def add_case_note(self, case_id: int, doc: dict, ai: dict | None) -> None:
         """Add newly correlated enrichment to an existing IRIS case."""
         payload = self.build_payload(doc, ai)
-        body = {
+        if self.api_version == "v2":
+            directories_path = self.paths["case_note_directories"].format(id=case_id)
+            response = await self._get(directories_path, {"per_page": 100, "page": 1})
+            directories = response.get("data")
+            if not isinstance(directories, list):
+                raise IrisError("IRIS tidak mengembalikan daftar direktori catatan case")
+            valid_directories = [
+                directory for directory in directories
+                if isinstance(directory, dict) and isinstance(directory.get("id"), int)
+            ]
+            directory = next(
+                (item for item in valid_directories if item.get("parent_id") is None),
+                valid_directories[0] if valid_directories else None,
+            )
+            if directory is None:
+                raise IrisError(f"Case IRIS {case_id} tidak memiliki direktori catatan")
+            directory_id = directory["id"]
+        else:
+            directory_id = None
+        body: dict[str, Any] = {
             "note_title": f"Enrichment update - {doc.get('log_uuid')}"[:154],
             "note_content": payload["alert_description"],
         }
+        if directory_id is not None:
+            body["directory_id"] = directory_id
         path = self.paths["case_note"].format(id=case_id)
         await self._post(path, body)
 
