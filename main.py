@@ -255,8 +255,14 @@ def merge_enrichment(target: dict, event: dict) -> None:
             domain.update(age)
         target["domain"] = domain
 
-    section = target.setdefault("enrichment", {})
-    observables = section.setdefault("observables", [])
+    section = target.get("enrichment")
+    if not isinstance(section, dict):
+        section = {}
+        target["enrichment"] = section
+    observables = section.get("observables")
+    if not isinstance(observables, list):
+        observables = []
+        section["observables"] = observables
     entry = {
         key: event[key]
         for key in (
@@ -267,7 +273,9 @@ def merge_enrichment(target: dict, event: dict) -> None:
     }
     identity = (entry.get("entity_type"), entry.get("value"))
     for index, existing in enumerate(observables):
-        if (existing.get("entity_type"), existing.get("value")) == identity:
+        if isinstance(existing, dict) and (
+            existing.get("entity_type"), existing.get("value")
+        ) == identity:
             observables[index] = entry
             return
     observables.append(entry)
