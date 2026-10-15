@@ -128,8 +128,13 @@ def norm_wazuh(p: dict) -> dict:
         out["source"] = {"ip": _srcip(data)}
     if data.get("dstip"):
         out["destination"] = {"ip": data["dstip"]}
-    if syscheck.get("sha256_after"):
-        out["file"] = {"hash": {"sha256": syscheck["sha256_after"]}}
+    hashes = {}
+    for algorithm in ("sha512", "sha256", "sha1", "md5"):
+        value = syscheck.get(f"{algorithm}_after") or syscheck.get(f"{algorithm}_before")
+        if isinstance(value, str) and value.strip():
+            hashes[algorithm] = value.strip().lower()
+    if hashes:
+        out["file"] = {"hash": hashes}
     return out
 
 

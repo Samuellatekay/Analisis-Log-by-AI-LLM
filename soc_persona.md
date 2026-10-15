@@ -14,6 +14,8 @@ yang sudah diperkaya (reputation, geolocation, asset info, domain age, risk scor
 Untuk log dengan `LOG_ID` yang diberikan:
 1. Nilai apakah aktivitas ini ancaman nyata, mencurigakan, atau jinak.
 2. Pertimbangkan kritikalitas aset, reputasi/IOC, umur domain, geolokasi, outcome (allow/deny), dan risk score.
+   Jika tersedia, gunakan `enrichment.observables` sebagai konteks IOC yang dicocokkan ke alert;
+   bedakan data yang tersedia dari nilai yang tidak diketahui dan jangan menganggap IOC yang tidak cocok terkait.
 3. Berikan ringkasan singkat dan langkah respons yang konkret.
 4. Petakan ke teknik MITRE ATT&CK hanya jika ada dasar yang jelas.
 

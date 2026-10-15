@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import itertools
 import logging
 import os
@@ -185,6 +186,39 @@ ALTER TABLE log_events ADD COLUMN IF NOT EXISTS iris_case_id INTEGER;
 """
 
 
+def merge_enrichment(target: dict, event: dict) -> None:
+    section = target.setdefault("enrichment", {})
+    observables = section.setdefault("observables", [])
+    entry = {
+        key: event[key]
+        for key in (
+            "entity_type", "value", "file_hash", "reputation",
+            "geolocation", "asset", "domain_age", "opencti",
+        )
+        if event.get(key) is not None
+    }
+    identity = (entry.get("entity_type"), entry.get("value"))
+    for index, existing in enumerate(observables):
+        if (existing.get("entity_type"), existing.get("value")) == identity:
+            observables[index] = entry
+            return
+    observables.append(entry)
+
+
+def normalize_ioc_value(entity_type: str, value: str) -> str:
+    normalized = value.strip()
+    kind = entity_type.lower()
+    if kind in {"ipv4-addr", "ipv6-addr"}:
+        address = ipaddress.ip_address(normalized)
+        expected_version = 4 if kind == "ipv4-addr" else 6
+        if address.version != expected_version:
+            raise ValueError(f"{entity_type} has an address of the wrong IP version")
+        return str(address)
+    if kind == "stixfile":
+        return normalized.lower()
+    return normalized
+
+
 # -------------------------------------------------------------------- Database
 class Database:
     def __init__(self, s: Settings):
@@ -228,6 +262,75 @@ class Database:
                     failed.append(r)
             return failed
 
+    async def attach_enrichment(self, event: dict, retention_minutes: int) -> list[Record]:
+        """Attach one IOC enrichment event to matching recent Wazuh alerts and return them for AI."""
+        entity_type = str(event.get("entity_type") or "").lower()
+        value = normalize_ioc_value(entity_type, str(event.get("value") or ""))
+        if not value:
+            return []
+
+        ip_value = value if entity_type in {"ipv4-addr", "ipv6-addr"} else None
+        file_hash = event.get("file_hash") if isinstance(event.get("file_hash"), dict) else {}
+        hash_value = str(file_hash.get("value") or value).strip().lower() if entity_type == "stixfile" else None
+        query = """
+            SELECT log_uuid, received_at, risk_score, payload
+            FROM log_events
+            WHERE received_at >= now() - make_interval(mins => $5)
+              AND payload->>'data_source' = 'wazuh'
+              AND (
+                ($1::text IS NOT NULL AND payload #>> '{source,ip}' = $1)
+                OR ($2::text IS NOT NULL AND payload #>> '{file,hash,md5}' = $2)
+                OR ($3::text IS NOT NULL AND payload #>> '{file,hash,sha1}' = $3)
+                OR ($4::text IS NOT NULL AND (
+                    payload #>> '{file,hash,sha256}' = $4
+                    OR payload #>> '{file,hash,sha512}' = $4
+                ))
+              )
+            ORDER BY received_at DESC
+            LIMIT 500
+            FOR UPDATE
+        """
+        hash_args = [None, None, None]
+        if hash_value:
+            algorithm = str(file_hash.get("algorithm") or "").lower().replace("-", "")
+            hash_indexes = {"md5": 0, "sha1": 1, "sha256": 2, "sha512": 2}
+            if algorithm in hash_indexes:
+                hash_args[hash_indexes[algorithm]] = hash_value
+
+        records: list[Record] = []
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    query, ip_value, hash_args[0], hash_args[1], hash_args[2], retention_minutes
+                )
+                for row in rows:
+                    payload = row["payload"]
+                    if isinstance(payload, str):
+                        payload = orjson.loads(payload)
+                    if not isinstance(payload, dict):
+                        continue
+
+                    merge_enrichment(payload, event)
+
+                    payload["ai"] = {"status": "pending"}
+                    encoded = orjson.dumps(payload).decode().replace("\\u0000", "")
+                    await conn.execute(
+                        "UPDATE log_events SET payload=$2::jsonb, ai_status='pending', "
+                        "ai_result=NULL, ai_updated_at=NULL WHERE log_uuid=$1",
+                        row["log_uuid"], encoded,
+                    )
+                    log_day = payload.get("log_day") or row["received_at"].strftime("%Y.%m.%d")
+                    records.append(Record(
+                        msg_id=f"enrichment:{event.get('id') or value}:{row['log_uuid']}",
+                        log_uuid=row["log_uuid"],
+                        received_at=row["received_at"],
+                        log_day=log_day,
+                        risk_score=float(row["risk_score"]),
+                        ai_status="pending",
+                        doc=payload,
+                    ))
+        return records
+
     async def update_ai(self, log_uuid: uuid.UUID, status: str, result: dict | None = None) -> None:
         async with self.pool.acquire() as conn:
             await conn.execute(
@@ -251,6 +354,14 @@ class Database:
                 "UPDATE log_events SET iris_alert_id=COALESCE($2::int, iris_alert_id), "
                 "iris_case_id=COALESCE($3::int, iris_case_id) WHERE log_uuid=$1",
                 log_uuid, alert_id, case_id)
+
+    async def get_iris_ids(self, log_uuid: uuid.UUID) -> tuple[int | None, int | None]:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT iris_alert_id, iris_case_id FROM log_events WHERE log_uuid=$1",
+                log_uuid,
+            )
+        return (row["iris_alert_id"], row["iris_case_id"]) if row else (None, None)
 
     async def mark_many(self, ids: list[uuid.UUID], status: str) -> None:
         async with self.pool.acquire() as conn:
@@ -397,7 +508,9 @@ class App:
 
     # ---- ingestion
     def _sources(self) -> list[str]:
-        return list(self.s.redis_lists) if self.s.redis_mode == "list" else [self.s.stream_key]
+        if self.s.redis_mode != "list":
+            return [self.s.stream_key]
+        return list(dict.fromkeys((*self.s.redis_lists, "enrichment-events")))
 
     async def _consumer_loop(self, name: str, src: str) -> None:
         s, backoff = self.s, 0.5
@@ -480,7 +593,7 @@ class App:
                 log.exception("Reclaim error")
 
     async def _reclaim_lists(self) -> None:
-        for src in self.s.redis_lists:
+        for src in self._sources():
             async for key in self.redis.scan_iter(match=f"{src}:processing:*", count=100):
                 name = key.rsplit(":", 1)[1]
                 if await self.redis.exists(f"{src}:lease:{name}"):
@@ -505,6 +618,10 @@ class App:
                 break
 
     async def _handle_batch(self, items: list[Item], ack: Callable[[], Awaitable]) -> None:
+        if items and all(item.source == "enrichment-events" for item in items):
+            await self._handle_enrichment_batch(items, ack)
+            return
+
         s, t0 = self.s, time.perf_counter()
         parsed: list[tuple[Item, dict]] = []
         dlq: list[tuple[str, str, str]] = []  # (msg_id, reason, payload)
@@ -522,6 +639,7 @@ class App:
         records_ok: list[Record] = []
         sent_s = 0.0
         if parsed:
+            await self._apply_cached_enrichment(parsed)
             extras = await self._enrich([d for _, d in parsed])
             now = datetime.now(timezone.utc)
             records = [self._build_record(it.msg_id, data, repeat, crit, now)
@@ -550,6 +668,96 @@ class App:
             level = logging.WARNING if sent_s > LATENCY_BUDGET_S else logging.DEBUG
             log.log(level, "batch=%d proses+kirim=%.3fs%s ai_queue=%d",
                     len(records_ok), sent_s, e2e, self.ai_queue.qsize())
+
+    @staticmethod
+    def _enrichment_cache_key(entity_type: str, value: str) -> str:
+        normalized_type = entity_type.lower()
+        normalized_value = normalize_ioc_value(normalized_type, value)
+        identity = f"{normalized_type}\0{normalized_value}"
+        return f"analysis:enrichment:{hashlib.sha256(identity.encode()).hexdigest()}"
+
+    async def _handle_enrichment_batch(
+        self, items: list[Item], ack: Callable[[], Awaitable]
+    ) -> None:
+        parsed: list[tuple[Item, dict]] = []
+        dlq: list[tuple[str, str, str]] = []
+        for item in items:
+            try:
+                if item.raw is None:
+                    raise ValueError("payload kosong")
+                event = orjson.loads(item.raw)
+                if not isinstance(event, dict):
+                    raise ValueError("payload bukan objek")
+                entity_type = event.get("entity_type")
+                value = event.get("value")
+                if not entity_type or not value:
+                    raise ValueError("enrichment harus memiliki entity_type dan value")
+                event["value"] = normalize_ioc_value(str(entity_type), str(value))
+                parsed.append((item, event))
+            except Exception as exc:
+                dlq.append((item.msg_id, f"enrichment_parse_error:{type(exc).__name__}",
+                            (item.raw or "")[:20000]))
+
+        matched: dict[uuid.UUID, Record] = {}
+        for _, event in parsed:
+            cache_key = self._enrichment_cache_key(event["entity_type"], str(event["value"]))
+            await self.redis.set(
+                cache_key,
+                orjson.dumps(event).decode(),
+                ex=max(86400, self.s.retention_minutes * 60),
+            )
+            for record in await self.db.attach_enrichment(event, self.s.retention_minutes):
+                matched[record.log_uuid] = record
+
+        records = list(matched.values())
+        if records:
+            if not await self.logstash.send([record.doc for record in records]):
+                raise RuntimeError("Logstash menolak alert yang diperbarui dengan enrichment")
+            await self._enqueue_ai(records)
+            log.info("Enrichment dicocokkan ke %d alert; analisis AI dijadwalkan", len(records))
+        elif parsed:
+            log.info("Enrichment disimpan untuk pencocokan; alert terkait belum ditemukan")
+
+        if dlq:
+            await self._send_dlq(dlq)
+        await ack()
+
+    @staticmethod
+    def _alert_iocs(data: dict) -> list[tuple[str, str]]:
+        iocs: set[tuple[str, str]] = set()
+        source = data.get("source") if isinstance(data.get("source"), dict) else {}
+        source_ip = source.get("ip")
+        if isinstance(source_ip, str):
+            try:
+                parsed_ip = ipaddress.ip_address(source_ip)
+                entity_type = "IPv4-Addr" if parsed_ip.version == 4 else "IPv6-Addr"
+                iocs.add((entity_type, str(parsed_ip)))
+            except ValueError:
+                pass
+
+        file_data = data.get("file") if isinstance(data.get("file"), dict) else {}
+        hashes = file_data.get("hash") if isinstance(file_data.get("hash"), dict) else {}
+        for value in hashes.values():
+            if isinstance(value, str) and value.strip():
+                iocs.add(("StixFile", value.strip().lower()))
+        return sorted(iocs)
+
+    async def _apply_cached_enrichment(self, parsed: list[tuple[Item, dict]]) -> None:
+        lookups: list[tuple[dict, str]] = []
+        pipe = self.redis.pipeline(transaction=False)
+        for _, data in parsed:
+            if data.get("data_source") != "wazuh":
+                continue
+            for entity_type, value in self._alert_iocs(data):
+                key = self._enrichment_cache_key(entity_type, value)
+                lookups.append((data, key))
+                pipe.get(key)
+        if not lookups:
+            return
+        cached_events = await pipe.execute()
+        for (data, _), raw_event in zip(lookups, cached_events):
+            if raw_event:
+                merge_enrichment(data, orjson.loads(raw_event))
 
     async def _enrich(self, events: list[dict]) -> list[tuple[int, float | None]]:
         """1 pipeline Redis per batch: counter pengulangan (+ fallback asset criticality)."""
@@ -608,6 +816,7 @@ class App:
             "geolocation": data.get("geolocation"),
             "asset": data.get("asset"),
             "domain": data.get("domain"),
+            "enrichment": data.get("enrichment"),
             "risk": {**risk.as_dict(), "repeat_count": repeat},
             "ai": {"status": ai_status},
         }
@@ -772,7 +981,8 @@ class App:
         if not self.iris or r.risk_score < self.s.iris_min_risk or not self.iris.allows(r.doc):
             return
         verdict = ((ai or {}).get("analysis") or {}).get("verdict")
-        if verdict in ("false_positive", "benign"):
+        has_enrichment = bool((r.doc.get("enrichment") or {}).get("observables"))
+        if verdict in ("false_positive", "benign") and not has_enrichment:
             return
         try:
             self.iris_queue.put_nowait((r, ai))
@@ -829,6 +1039,33 @@ class App:
             r, ai = await self.iris_queue.get()
             key = self._dedup_key(r.doc)
             try:
+                alert_id, case_id = await self.db.get_iris_ids(r.log_uuid)
+                if alert_id is not None:
+                    observables = (r.doc.get("enrichment") or {}).get("observables")
+                    if observables:
+                        await self.iris.update_alert(int(alert_id), r.doc, ai)
+                        log.info("IRIS alert %s diperbarui dengan enrichment log=%s",
+                                 alert_id, r.log_uuid)
+                    continue
+                if case_id is not None and s.iris_mode == "case":
+                    observables = (r.doc.get("enrichment") or {}).get("observables")
+                    if observables:
+                        note_hash = hashlib.sha256(
+                            orjson.dumps(observables, option=orjson.OPT_SORT_KEYS)
+                        ).hexdigest()
+                        note_key = f"iris:enrichment-note:{case_id}:{note_hash}"
+                        if await self.redis.set(note_key, "1", nx=True, ex=86400):
+                            try:
+                                await self.iris.add_case_note(int(case_id), r.doc, ai)
+                            except Exception:
+                                await self.redis.delete(note_key)
+                                raise
+                            log.info("IRIS case %s menerima catatan enrichment log=%s",
+                                     case_id, r.log_uuid)
+                    continue
+                verdict = ((ai or {}).get("analysis") or {}).get("verdict")
+                if verdict in ("false_positive", "benign"):
+                    continue
                 # cegah banjir: 1 item / (source, action) / window
                 if not await self.redis.set(key, "1", nx=True, ex=s.iris_dedup_s):
                     continue

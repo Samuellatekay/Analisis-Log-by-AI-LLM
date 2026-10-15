@@ -20,11 +20,15 @@ RETRY_STATUS = {429, 500, 502, 503, 504}
 
 # IRIS v2.4.x memakai path legacy; IRIS v3 hanya melayani /api/v2 (path legacy -> HTML frontend)
 PATHS = {
-    "legacy": {"alert": "/alerts/add", "escalate": "/alerts/escalate/{id}", "merge": "/alerts/merge/{id}",
-               "case": "/manage/cases/add", "probe": "/manage/cases/list",
+    "legacy": {"alert": "/alerts/add", "alert_update": "/alerts/update/{id}",
+               "escalate": "/alerts/escalate/{id}", "merge": "/alerts/merge/{id}",
+               "case": "/manage/cases/add", "case_note": "/case/notes/add",
+               "probe": "/manage/cases/list",
                "severity_list": ["/manage/severities/list"], "status_list": ["/manage/alert-status/list"]},
-    "v2": {"alert": "/api/v2/alerts", "escalate": "/api/v2/alerts/escalate/{id}",
-           "merge": "/api/v2/alerts/merge/{id}", "case": "/api/v2/cases", "probe": "/api/v2/cases",
+    "v2": {"alert": "/api/v2/alerts", "alert_update": "/api/v2/alerts/{id}",
+           "escalate": "/api/v2/alerts/escalate/{id}",
+           "merge": "/api/v2/alerts/merge/{id}", "case": "/api/v2/cases",
+           "case_note": "/api/v2/cases/{id}/notes", "probe": "/api/v2/cases",
            "severity_list": ["/api/v2/manage/severities"],
            "status_list": ["/api/v2/manage/alert-statuses", "/api/v2/manage/alert-status"]},
 }
@@ -147,6 +151,22 @@ class IrisClient:
             f"- **Reputation:** {_md_escape(doc.get('reputation'), 200)}",
             f"- **Geolocation:** {_md_escape(doc.get('geolocation'), 200)}",
             f"- **Domain:** {_md_escape(doc.get('domain'), 200)}", ""]
+        observables = _d(doc.get("enrichment")).get("observables")
+        if isinstance(observables, list) and observables:
+            lines += ["## IOC enrichment (OpenCTI / GLPI)"]
+            for observable in observables[:20]:
+                if not isinstance(observable, dict):
+                    continue
+                lines.append(
+                    f"- **{_md_escape(observable.get('entity_type'), 40)}** "
+                    f"`{_md_escape(observable.get('value'), 180)}`"
+                )
+                for field in ("reputation", "geolocation", "asset", "domain_age", "opencti"):
+                    if observable.get(field) is not None:
+                        lines.append(f"  - **{field}:** {_md_escape(observable[field], 900)}")
+            if len(observables) > 20:
+                lines.append(f"- _{len(observables) - 20} observable lainnya ada di alert source content._")
+            lines.append("")
         if analysis.get("recommended_actions"):
             lines += ["## Rekomendasi tindakan"] + [f"- {_md_escape(a)}" for a in analysis["recommended_actions"]] + [""]
         if analysis.get("mitre_techniques"):
@@ -199,10 +219,40 @@ class IrisClient:
             return self._parse(r, path)
         return {}
 
+    async def _put(self, path: str, body: dict) -> dict:
+        for attempt in range(3):
+            try:
+                r = await self._client.put(path, json=body)
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(1 + attempt)
+                continue
+            if r.status_code in RETRY_STATUS and attempt < 2:
+                await asyncio.sleep(1 + attempt)
+                continue
+            return self._parse(r, path)
+        return {}
+
     async def create_alert(self, doc: dict, ai: dict | None) -> int | None:
         await self._ensure_ids()
         d = await self._post(self.paths["alert"], self.build_payload(doc, ai))
         return d.get("alert_id") or d.get("id")
+
+    async def update_alert(self, alert_id: int, doc: dict, ai: dict | None) -> None:
+        payload = self.build_payload(doc, ai)
+        update = {
+            key: payload[key]
+            for key in (
+                "alert_title", "alert_description", "alert_source_content",
+                "alert_severity_id", "alert_tags",
+            )
+        }
+        path = self.paths["alert_update"].format(id=alert_id)
+        if self.api_version == "legacy":
+            await self._post(path, update)
+        else:
+            await self._put(path, update)
 
     async def create_case(self, doc: dict, ai: dict | None) -> int | None:
         """Buat case langsung, tanpa alert."""
@@ -211,6 +261,16 @@ class IrisClient:
                 "case_customer": self.customer_id, "case_soc_id": str(doc.get("log_uuid"))}
         d = await self._post(self.paths["case"], body)
         return d.get("case_id") or d.get("id")
+
+    async def add_case_note(self, case_id: int, doc: dict, ai: dict | None) -> None:
+        """Add newly correlated enrichment to an existing IRIS case."""
+        payload = self.build_payload(doc, ai)
+        body = {
+            "note_title": f"Enrichment update - {doc.get('log_uuid')}"[:154],
+            "note_content": payload["alert_description"],
+        }
+        path = self.paths["case_note"].format(id=case_id)
+        await self._post(path, body)
 
     async def escalate_alert(self, alert_id: int, doc: dict, ai: dict | None) -> int | None:
         """Eskalasi alert menjadi case baru."""
