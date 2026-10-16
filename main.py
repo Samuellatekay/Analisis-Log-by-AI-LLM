@@ -877,7 +877,7 @@ class App:
                 merge_enrichment(data, orjson.loads(raw_event))
 
     async def _queue_glpi_asset_lookups(self, events: list[dict]) -> None:
-        """Ask GLPI to look up both Wazuh source and destination IPs."""
+        """Queue GLPI and OpenCTI lookups for Wazuh source and destination IPs."""
         for event in events:
             if event.get("data_source") != "wazuh":
                 continue
@@ -903,19 +903,32 @@ class App:
                     except orjson.JSONDecodeError:
                         cached_event = {}
                     asset = cached_event.get("asset") if isinstance(cached_event, dict) else None
-                    if isinstance(asset, dict) and asset.get("found") and asset.get("items"):
-                        continue
+                    asset_cached = isinstance(asset, dict) and asset.get("found") and asset.get("items")
+                else:
+                    asset_cached = False
 
-                lookup_key = f"analysis:glpi-lookup:{ip}"
-                if not await self.redis.set(lookup_key, "1", nx=True, ex=300):
-                    continue
-                request = {"action": "lookup_asset", "ip": ip, "entity_type": entity_type}
-                try:
-                    await self.redis.rpush("outbound-glpi", orjson.dumps(request).decode())
-                    log.info("GLPI asset lookup queued ip=%s", ip)
-                except Exception:
-                    await self.redis.delete(lookup_key)
-                    log.exception("Gagal mengantrekan pencarian aset GLPI untuk IP %s", ip)
+                if not asset_cached:
+                    lookup_key = f"analysis:glpi-lookup:{ip}"
+                    if await self.redis.set(lookup_key, "1", nx=True, ex=300):
+                        request = {"action": "lookup_asset", "ip": ip,
+                                   "entity_type": entity_type}
+                        try:
+                            await self.redis.rpush("outbound-glpi", orjson.dumps(request).decode())
+                            log.info("GLPI asset lookup queued ip=%s", ip)
+                        except Exception:
+                            await self.redis.delete(lookup_key)
+                            log.exception("Gagal mengantrekan pencarian aset GLPI untuk IP %s", ip)
+
+                opencti_key = f"analysis:opencti-enrichment:{ip}"
+                if await self.redis.set(opencti_key, "1", nx=True, ex=300):
+                    request = {"action": "lookup_enrichment", "ip": ip,
+                               "entity_type": entity_type}
+                    try:
+                        await self.redis.rpush("outbound-opencti", orjson.dumps(request).decode())
+                        log.info("OpenCTI connector lookup queued ip=%s", ip)
+                    except Exception:
+                        await self.redis.delete(opencti_key)
+                        log.exception("Gagal mengantrekan lookup connector OpenCTI untuk IP %s", ip)
 
     async def _enrich(self, events: list[dict]) -> list[tuple[int, float | None]]:
         """1 pipeline Redis per batch: counter pengulangan (+ fallback asset criticality)."""

@@ -23,17 +23,18 @@ IRIS menampilkan metadata enrichment sebagai ringkasan berlabel pada deskripsi a
 (reputasi, geolokasi, aset, dan IOC), bukan sebagai JSON mentah berulang. Payload lengkap
 tetap tersedia di `alert_source_content` untuk pemeriksaan detail. Untuk alert Wazuh,
 IRIS juga mencantumkan nama, ID, IP agent, dan manager dari payload Wazuh. Sumber
-intel/connector OpenCTI hanya dapat ditampilkan jika collector mengirim metadata
-`opencti.sources`, `created_by`, `connector`, atau `external_references`; jika metadata
-itu tidak ada, IRIS menyatakannya secara eksplisit dan tidak menebak nama connector.
+Untuk setiap IP sumber/tujuan, collector memanggil semua connector OpenCTI bertipe
+`INTERNAL_ENRICHMENT` yang aktif dan memiliki scope cocok, lalu mencantumkan status tiap
+job di IRIS. Connector `EXTERNAL_IMPORT` dicari melalui indicator/external reference yang
+sudah tersimpan di OpenCTI; feed tidak dijalankan sebagai API lookup per IP. Hasil yang
+sudah diketahui OpenCTI ditampilkan beserta nama sumber jika tersedia. Connector aktif
+saja tidak menjamin feed sudah selesai sinkronisasi atau punya data untuk IOC tersebut.
 
-Nilai AbuseIPDB/VirusTotal berasal dari lookup API collector, bukan otomatis dari daftar
-connector yang terlihat di UI OpenCTI. Bila hasilnya kosong, pastikan `ABUSEIPDB_KEY`
-dan `VT_API_KEY` di `.env` collector terisi, collector sudah direstart, IP IOC bersifat
-publik, dan log collector tidak menunjukkan error/rate limit. Event enrichment saat ini
-tidak membedakan key belum diisi, IOC tidak ditemukan, dan kegagalan API; IRIS akan
-menampilkan bahwa lookup result tidak disertakan, bukan menyebut IOC bersih. IP private
-seperti `192.168.x.x` memang tidak punya reputasi publik AbuseIPDB yang bermakna.
+AbuseIPDB/VirusTotal direct API dari collector juga menjelaskan statusnya: key belum
+dikonfigurasi, IP tidak didukung, data ditemukan, atau tidak ada record/API gagal (cek log
+collector). `ABUSEIPDB_KEY` dan `VT_API_KEY` di `.env` collector berbeda dari connector
+OpenCTI dan harus diatur terpisah. IP private seperti `192.168.x.x` tidak memiliki
+reputasi AbuseIPDB publik yang bermakna.
 Jika alert/case IRIS sudah pernah dibuat, alert diperbarui dan case terkait menerima catatan
 enrichment (dideduplikasi). Saat alert baru langsung dieskalasi, catatan case juga menyertakan
 ringkasan alert beserta enrichment. Pengayaan ini merupakan konteks pada alert/catatan; belum

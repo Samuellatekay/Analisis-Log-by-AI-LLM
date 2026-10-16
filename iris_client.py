@@ -145,15 +145,65 @@ def _format_reputation(value: Any) -> list[str]:
 
 
 def _format_intel_sources(doc: dict, observables: list) -> list[str]:
-    candidates = []
     contexts = [_d(doc.get("opencti"))]
     contexts.extend(
         _d(item.get("opencti")) for item in observables if isinstance(item, dict)
     )
     reputation = _d(doc.get("reputation"))
-    candidates.extend(reputation.get("sources", []) if isinstance(reputation.get("sources"), list) else [])
+    candidates = reputation.get("sources", []) if isinstance(reputation.get("sources"), list) else []
+    connector_lines = []
+    external_match_count = 0
+    lookup_statuses = []
 
     for context in contexts:
+        try:
+            match_count = int(context.get("external_import_match_count") or 0)
+        except (TypeError, ValueError):
+            log.warning("Invalid OpenCTI external indicator match count: %r",
+                        context.get("external_import_match_count"))
+            match_count = 0
+        external_match_count = max(external_match_count, match_count)
+        lookup_status = _display(context.get("lookup_status"), 80)
+        if lookup_status:
+            lookup_statuses.append(lookup_status)
+        connectors = context.get("connectors")
+        if isinstance(connectors, list):
+            for connector in connectors:
+                if not isinstance(connector, dict):
+                    continue
+                name = _display(connector.get("name"), 120) or "Connector tanpa nama"
+                kind = str(connector.get("type") or "").upper()
+                status = str(connector.get("status") or "unknown").lower()
+                details = _display(connector.get("details"), 180)
+                if kind == "INTERNAL_ENRICHMENT":
+                    descriptions = {
+                        "completed": "lookup selesai; hasil OpenCTI diperiksa pada ringkasan intel di atas",
+                        "failed": f"lookup gagal{': ' + details if details else ''}",
+                        "error": f"lookup error{': ' + details if details else ''}",
+                        "timeout": f"lookup belum selesai{': ' + details if details else ''}",
+                        "queued": "lookup masuk antrean OpenCTI",
+                        "inactive": "connector tidak aktif; tidak dijalankan",
+                        "out_of_scope": "tidak dijalankan karena scope IOC tidak sesuai",
+                    }
+                    description = descriptions.get(status, details or f"status {status}")
+                    if connector.get("cached"):
+                        description += " (status dari cache)"
+                    connector_lines.append(f"- **{name} (Internal Enrichment):** {description}.")
+                elif kind == "EXTERNAL_IMPORT":
+                    if status == "indexed_lookup":
+                        description = (
+                            "feed aktif; IOC match ditemukan pada data OpenCTI terindeks (sumber per-feed tidak dapat ditentukan)"
+                            if external_match_count else
+                            "feed aktif; tidak ada indicator match pada data OpenCTI terindeks"
+                        )
+                    else:
+                        description = details or f"status {status}"
+                    connector_lines.append(f"- **{name} (External Import):** {description}.")
+                elif status in {"error", "failed", "timeout"}:
+                    connector_lines.append(
+                        f"- **{name}:** {details or status}."
+                    )
+
         sources = context.get("sources")
         if isinstance(sources, list):
             candidates.extend(sources)
@@ -174,11 +224,12 @@ def _format_intel_sources(doc: dict, observables: list) -> list[str]:
             name = indicator.get("name")
             if source or name:
                 candidates.append({"source": source, "name": name})
-            for reference in indicator.get("external_references", []) or []:
+            references = indicator.get("external_references") or indicator.get("externalReferences") or []
+            for reference in references:
                 if isinstance(reference, dict) and reference.get("source_name"):
                     candidates.append(reference["source_name"])
 
-    values = []
+    evidence = []
     for candidate in candidates:
         if isinstance(candidate, dict):
             name = (candidate.get("connector") or candidate.get("agent") or
@@ -190,12 +241,19 @@ def _format_intel_sources(doc: dict, observables: list) -> list[str]:
         else:
             value = candidate
         value = _display(value, 160)
-        if value and value not in values:
-            values.append(value)
+        if value and value not in evidence:
+            evidence.append(value)
 
-    if not values:
-        return ["- Sumber OpenCTI spesifik tidak disertakan oleh collector."]
-    return [f"- {value}" for value in values[:12]]
+    lines = list(dict.fromkeys(connector_lines))
+    if not lines:
+        lines.append("- API OpenCTI tidak melaporkan connector Internal Enrichment atau External Import untuk lookup.")
+    if lookup_statuses and "observable_not_found" in lookup_statuses:
+        lines.append("- Observable belum ada di OpenCTI; feed eksternal diperiksa melalui pencarian indicator.")
+    if evidence:
+        lines.append("- **Sumber intel yang tercatat pada indicator:** " + "; ".join(evidence[:12]) + ".")
+    else:
+        lines.append("- Tidak ada nama sumber spesifik pada indicator yang cocok di OpenCTI.")
+    return lines
 
 
 def _format_geolocation(value: Any) -> list[str]:
