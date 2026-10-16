@@ -21,7 +21,19 @@ di `payload.enrichment.observables`.
 
 IRIS menampilkan metadata enrichment sebagai ringkasan berlabel pada deskripsi alert
 (reputasi, geolokasi, aset, dan IOC), bukan sebagai JSON mentah berulang. Payload lengkap
-tetap tersedia di `alert_source_content` untuk pemeriksaan detail.
+tetap tersedia di `alert_source_content` untuk pemeriksaan detail. Untuk alert Wazuh,
+IRIS juga mencantumkan nama, ID, IP agent, dan manager dari payload Wazuh. Sumber
+intel/connector OpenCTI hanya dapat ditampilkan jika collector mengirim metadata
+`opencti.sources`, `created_by`, `connector`, atau `external_references`; jika metadata
+itu tidak ada, IRIS menyatakannya secara eksplisit dan tidak menebak nama connector.
+
+Nilai AbuseIPDB/VirusTotal berasal dari lookup API collector, bukan otomatis dari daftar
+connector yang terlihat di UI OpenCTI. Bila hasilnya kosong, pastikan `ABUSEIPDB_KEY`
+dan `VT_API_KEY` di `.env` collector terisi, collector sudah direstart, IP IOC bersifat
+publik, dan log collector tidak menunjukkan error/rate limit. Event enrichment saat ini
+tidak membedakan key belum diisi, IOC tidak ditemukan, dan kegagalan API; IRIS akan
+menampilkan bahwa lookup result tidak disertakan, bukan menyebut IOC bersih. IP private
+seperti `192.168.x.x` memang tidak punya reputasi publik AbuseIPDB yang bermakna.
 Jika alert/case IRIS sudah pernah dibuat, alert diperbarui dan case terkait menerima catatan
 enrichment (dideduplikasi). Saat alert baru langsung dieskalasi, catatan case juga menyertakan
 ringkasan alert beserta enrichment. Pengayaan ini merupakan konteks pada alert/catatan; belum

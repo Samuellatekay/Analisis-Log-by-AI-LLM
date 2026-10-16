@@ -933,6 +933,8 @@ class App:
             "event": {k: ev.get(k) for k in ("action", "category", "severity", "outcome", "wazuh_level", "rule_id") if k in ev},
             "data_source": data.get("data_source"),
             "source": data.get("source"),
+            "agent": data.get("agent"),
+            "host": data.get("host"),
             "original": data.get("original"),
             "reputation": data.get("reputation"),
             "geolocation": data.get("geolocation"),

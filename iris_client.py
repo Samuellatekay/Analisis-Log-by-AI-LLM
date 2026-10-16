@@ -102,33 +102,100 @@ def _format_reputation(value: Any) -> list[str]:
         if shown:
             lines.append(f"- Label: {', '.join(shown)}{suffix}.")
 
+    provider_status = _d(reputation.get("provider_status"))
     abuse = reputation.get("abuseipdb")
     if isinstance(abuse, dict):
         confidence = _display(abuse.get("confidence_score"), 20)
         reports = _display(abuse.get("total_reports"), 20)
-        if confidence or reports:
-            details = []
-            if confidence:
-                details.append(f"confidence {confidence}%")
-            if reports:
-                details.append(f"{reports} laporan")
-            lines.append(f"- AbuseIPDB: {', '.join(details)}.")
+        details = []
+        if confidence:
+            details.append(f"confidence {confidence}%")
+        if reports:
+            details.append(f"{reports} laporan")
+        provider = _display(abuse.get("source"), 100) or "AbuseIPDB"
+        status = _display(abuse.get("status"), 80)
+        suffix = f"; status {status}" if status else ""
+        if details:
+            lines.append(f"- **AbuseIPDB:** {', '.join(details)} (sumber: {provider}{suffix}).")
+        else:
+            lines.append(f"- **AbuseIPDB:** tidak ada temuan{suffix} (sumber: {provider}).")
     elif "abuseipdb" in reputation:
-        lines.append("- AbuseIPDB: tidak ada data.")
+        status = _display(provider_status.get("abuseipdb"), 120)
+        detail = status or "hasil lookup tidak disertakan pada event enrichment"
+        lines.append(f"- **AbuseIPDB:** {detail}; perlu cek konfigurasi key dan log collector.")
 
     vt = reputation.get("virustotal")
     if isinstance(vt, dict):
-        stats = _d(vt.get("stats"))
+        stats = _d(vt.get("stats") or vt.get("last_analysis_stats"))
         counts = [f"{key} {stats[key]}" for key in ("malicious", "suspicious", "harmless")
                   if stats.get(key) is not None]
+        provider = _display(vt.get("source"), 100) or "VirusTotal"
+        status = _display(vt.get("status"), 80)
+        suffix = f"; status {status}" if status else ""
         if counts:
-            lines.append(f"- VirusTotal: {', '.join(counts)}.")
+            lines.append(f"- **VirusTotal:** {', '.join(counts)} (sumber: {provider}{suffix}).")
         elif vt:
-            lines.append("- VirusTotal: data tersedia, ringkasan deteksi tidak tersedia.")
+            lines.append(f"- **VirusTotal:** data tersedia, ringkasan deteksi tidak tersedia (sumber: {provider}{suffix}).")
     elif "virustotal" in reputation:
-        lines.append("- VirusTotal: tidak ada data.")
+        status = _display(provider_status.get("virustotal"), 120)
+        detail = status or "hasil lookup tidak disertakan pada event enrichment"
+        lines.append(f"- **VirusTotal:** {detail}; perlu cek konfigurasi key dan log collector.")
 
     return lines or ["- Data reputasi belum tersedia."]
+
+
+def _format_intel_sources(doc: dict, observables: list) -> list[str]:
+    candidates = []
+    contexts = [_d(doc.get("opencti"))]
+    contexts.extend(
+        _d(item.get("opencti")) for item in observables if isinstance(item, dict)
+    )
+    reputation = _d(doc.get("reputation"))
+    candidates.extend(reputation.get("sources", []) if isinstance(reputation.get("sources"), list) else [])
+
+    for context in contexts:
+        sources = context.get("sources")
+        if isinstance(sources, list):
+            candidates.extend(sources)
+        indicators = context.get("indicators")
+        if not isinstance(indicators, list):
+            continue
+        for indicator in indicators:
+            if not isinstance(indicator, dict):
+                continue
+            creator = indicator.get("created_by") or indicator.get("createdBy") or indicator.get("creator")
+            if isinstance(creator, dict):
+                creator = creator.get("name") or creator.get("id")
+            source = indicator.get("connector") or creator or indicator.get("source")
+            if isinstance(source, str) and source.lower() == "opencti":
+                source = "OpenCTI (connector tidak dicantumkan)"
+            elif isinstance(source, str) and source.lower() == "collector":
+                source = "Collector (indicator internal)"
+            name = indicator.get("name")
+            if source or name:
+                candidates.append({"source": source, "name": name})
+            for reference in indicator.get("external_references", []) or []:
+                if isinstance(reference, dict) and reference.get("source_name"):
+                    candidates.append(reference["source_name"])
+
+    values = []
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            name = (candidate.get("connector") or candidate.get("agent") or
+                    candidate.get("created_by") or candidate.get("source") or candidate.get("name"))
+            if isinstance(name, dict):
+                name = name.get("name") or name.get("id")
+            detail = candidate.get("name")
+            value = f"{name}: {detail}" if name and detail and name != detail else name or detail
+        else:
+            value = candidate
+        value = _display(value, 160)
+        if value and value not in values:
+            values.append(value)
+
+    if not values:
+        return ["- Sumber OpenCTI spesifik tidak disertakan oleh collector."]
+    return [f"- {value}" for value in values[:12]]
 
 
 def _format_geolocation(value: Any) -> list[str]:
@@ -246,7 +313,8 @@ class IrisClient:
         who = _md_escape(src.get("ip") or asset.get("name") or "unknown", 80)
         verdict = analysis.get("verdict", "no-ai")
         host = _d(doc.get("host"))
-        agent_name = asset.get("agent_name") or host.get("name")
+        agent = _d(doc.get("agent"))
+        agent_name = agent.get("name") or asset.get("agent_name") or host.get("name")
 
         lines = []
         if analysis:
@@ -272,8 +340,17 @@ class IrisClient:
             "## Aset",
             *_format_asset(asset, src.get("ip"), agent_name),
             "",
+            "## Agent Wazuh",
+            f"- **Nama:** {_display(agent_name, 160) or 'Tidak tersedia'}",
+            f"- **ID:** {_display(agent.get('id'), 80) or 'Tidak tersedia'}",
+            f"- **IP agent:** {_display(agent.get('ip'), 80) or 'Tidak tersedia'}",
+            f"- **Manager:** {_display(agent.get('manager'), 160) or 'Tidak tersedia'}",
+            "",
             "## Intelijen ancaman",
             *_format_reputation(doc.get("reputation")),
+            "",
+            "## Sumber intel / connector OpenCTI",
+            *_format_intel_sources(doc, _d(doc.get("enrichment")).get("observables") or []),
             "",
             "## Geolokasi",
             *_format_geolocation(doc.get("geolocation")),

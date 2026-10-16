@@ -108,6 +108,15 @@ def norm_wazuh(p: dict) -> dict:
         level = 0
     groups = [str(g).lower() for g in rule["groups"]] if isinstance(rule.get("groups"), list) else []
     host = agent.get("name") or _dict(p.get("host")).get("name")
+    manager = _dict(p.get("manager"))
+    agent_info = {
+        key: value for key, value in {
+            "id": agent.get("id"),
+            "name": host,
+            "ip": agent.get("ip"),
+            "manager": manager.get("name"),
+        }.items() if value not in (None, "")
+    }
 
     out: dict[str, Any] = {
         "@timestamp": p.get("@timestamp") or p.get("timestamp"),
@@ -116,11 +125,12 @@ def norm_wazuh(p: dict) -> dict:
                   "action": str(rule.get("description", "Wazuh alert"))[:200],
                   "wazuh_level": level, "rule_id": rule.get("id")},
         "host": {"name": host}, "asset": {"name": host},  # criticality dicari di Redis asset:<nama>
+        "agent": agent_info,
         "data_source": "wazuh",
         # Disimpan sebagai STRING (bukan objek) agar tidak merusak mapping Elasticsearch
         "original": orjson.dumps({
             "rule": {"id": rule.get("id"), "level": level, "description": rule.get("description"), "groups": groups},
-            "agent": {"name": host}, "decoder": _dict(p.get("decoder")).get("name"),
+            "agent": agent_info, "decoder": _dict(p.get("decoder")).get("name"),
             "location": p.get("location"), "full_log": str(p.get("full_log", ""))[:1500], "data": data,
         }, default=str).decode()[:MAX_ORIGINAL_CHARS],
     }
