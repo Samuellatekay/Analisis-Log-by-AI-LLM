@@ -6,7 +6,7 @@ Dalam mode Redis `list`, aplikasi mengonsumsi `enrichment-events` otomatis selai
 list yang tercantum pada `REDIS_LISTS`. Event dicocokkan ke alert Wazuh yang masih ada
 di PostgreSQL berdasarkan IP sumber atau hash file MD5/SHA-1/SHA-256/SHA-512.
 
-Untuk setiap alert Wazuh dengan IP sumber, aplikasi meminta lookup aset melalui Redis
+Untuk setiap alert Wazuh dengan IP sumber dan/atau tujuan, aplikasi meminta lookup aset melalui Redis
 `outbound-glpi` (aksi `lookup_asset`). Collector yang memiliki kredensial GLPI mencari
 Computer berdasarkan IP dan menerbitkan hasilnya ke `enrichment-events`. Pastikan collector
 mendukung aksi tersebut dan memakai Redis DB yang sama. Lookup dibatasi satu kali per IP

@@ -220,7 +220,13 @@ def _format_geolocation(value: Any) -> list[str]:
 
 
 def _format_asset(asset: dict, source_ip: Any, host_name: Any) -> list[str]:
-    is_glpi_asset = asset.get("inventory_source") == "GLPI" or asset.get("found") is True
+    glpi_fields = ("owner", "user", "serial_number", "operating_system", "status", "location", "type")
+    has_glpi_details = any(_display(asset.get(field), 180) for field in glpi_fields)
+    is_glpi_asset = (
+        asset.get("inventory_source") == "GLPI"
+        or asset.get("found") is True
+        or has_glpi_details
+    )
     if not is_glpi_asset:
         message = ("Aset tidak ditemukan di GLPI." if asset.get("found") is False
                    else "Data aset GLPI belum tersedia.")
@@ -325,6 +331,9 @@ class IrisClient:
             lines += ["_Analisis AI sedang berjalan; hasilnya akan ditambahkan ke alert ini._", ""]
         else:
             lines += [f"_Analisis AI tidak tersedia (status: {_md_escape(_d(ai).get('status', 'not_run'), 30)})._", ""]
+        destination = _d(doc.get("destination"))
+        source_asset = _d(src.get("asset")) or asset
+        destination_asset = _d(destination.get("asset"))
         lines += [
             "## Risiko",
             f"- **Skor:** {risk.get('score')} ({level})",
@@ -335,12 +344,16 @@ class IrisClient:
             "## Event",
             f"- **Deteksi:** {what}",
             f"- **Hasil:** {_display(ev.get('outcome'), 60) or 'Tidak tersedia'}",
-            f"- **Sumber:** {who}",
+            f"- **IP sumber (kemungkinan penyerang):** {who}",
+            f"- **IP tujuan (host yang diserang):** {_display(destination.get('ip'), 80) or 'Tidak tersedia di event'}",
             "",
-            "## Aset",
-            *_format_asset(asset, src.get("ip"), agent_name),
+            "## Aset sumber / penyerang",
+            *_format_asset(source_asset, src.get("ip"), None),
             "",
-            "## Agent Wazuh",
+            "## Aset tujuan / penerima serangan",
+            *_format_asset(destination_asset, destination.get("ip"), None),
+            "",
+            "## Agent Wazuh (sensor yang melaporkan event)",
             f"- **Nama:** {_display(agent_name, 160) or 'Tidak tersedia'}",
             f"- **ID:** {_display(agent.get('id'), 80) or 'Tidak tersedia'}",
             f"- **IP agent:** {_display(agent.get('ip'), 80) or 'Tidak tersedia'}",

@@ -226,23 +226,50 @@ def merge_enrichment(target: dict, event: dict) -> None:
             ),
             None,
         )
+        side_ips = {}
+        for side_name in ("source", "destination"):
+            side = target.get(side_name)
+            side = side if isinstance(side, dict) else {}
+            side_ip = side.get("ip")
+            if isinstance(side_ip, str):
+                try:
+                    side_ips[side_name] = str(ipaddress.ip_address(side_ip))
+                except ValueError:
+                    pass
+
+        matched_sides = [side for side, side_ip in side_ips.items() if side_ip == value]
+        if not matched_sides and not side_ips and isinstance(value, str):
+            matched_sides = ["source"]
+
         if glpi_asset:
+            glpi_details = {
+                key: glpi_asset[key]
+                for key in ("name", "ip", "owner", "user", "serial_number",
+                            "operating_system", "status", "location", "type")
+                if glpi_asset.get(key) not in (None, "")
+            }
+            side_asset = {"found": True, "inventory_source": "GLPI", **glpi_details}
+        elif isinstance(asset_result, dict) and asset_result.get("found") is False:
+            side_asset = {"found": False, "error": asset_result.get("error")}
+        else:
+            side_asset = None
+
+        for side_name in matched_sides:
+            side = target.get(side_name)
+            side = dict(side) if isinstance(side, dict) else {}
+            side["ip"] = value
+            if side_asset is not None:
+                side["asset"] = side_asset
+            target[side_name] = side
+
+        if glpi_asset and "source" in matched_sides:
             asset = target.get("asset")
             asset = dict(asset) if isinstance(asset, dict) else {}
             host = target.get("host")
             host_name = host.get("name") if isinstance(host, dict) else None
             if host_name and host_name != glpi_asset.get("name"):
                 asset["agent_name"] = host_name
-            for source, destination in (
-                ("name", "name"),
-                ("ip", "ip"),
-                ("owner", "owner"),
-                ("serial_number", "serial_number"),
-                ("operating_system", "operating_system"),
-                ("status", "status"),
-            ):
-                if glpi_asset.get(source) is not None:
-                    asset[destination] = glpi_asset[source]
+            asset.update(glpi_details)
             asset["inventory_source"] = "GLPI"
             target["asset"] = asset
 
@@ -354,7 +381,10 @@ class Database:
             WHERE received_at >= now() - make_interval(mins => $5)
               AND payload->>'data_source' = 'wazuh'
               AND (
-                ($1::text IS NOT NULL AND payload #>> '{source,ip}' = $1)
+                ($1::text IS NOT NULL AND (
+                    payload #>> '{source,ip}' = $1
+                    OR payload #>> '{destination,ip}' = $6
+                ))
                 OR ($2::text IS NOT NULL AND payload #>> '{file,hash,md5}' = $2)
                 OR ($3::text IS NOT NULL AND payload #>> '{file,hash,sha1}' = $3)
                 OR ($4::text IS NOT NULL AND (
@@ -377,7 +407,8 @@ class Database:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 rows = await conn.fetch(
-                    query, ip_value, hash_args[0], hash_args[1], hash_args[2], retention_minutes
+                    query, ip_value, hash_args[0], hash_args[1], hash_args[2],
+                    retention_minutes, ip_value
                 )
                 for row in rows:
                     payload = row["payload"]
@@ -810,15 +841,16 @@ class App:
     @staticmethod
     def _alert_iocs(data: dict) -> list[tuple[str, str]]:
         iocs: set[tuple[str, str]] = set()
-        source = data.get("source") if isinstance(data.get("source"), dict) else {}
-        source_ip = source.get("ip")
-        if isinstance(source_ip, str):
-            try:
-                parsed_ip = ipaddress.ip_address(source_ip)
-                entity_type = "IPv4-Addr" if parsed_ip.version == 4 else "IPv6-Addr"
-                iocs.add((entity_type, str(parsed_ip)))
-            except ValueError:
-                pass
+        for side_name in ("source", "destination"):
+            side = data.get(side_name) if isinstance(data.get(side_name), dict) else {}
+            side_ip = side.get("ip")
+            if isinstance(side_ip, str):
+                try:
+                    parsed_ip = ipaddress.ip_address(side_ip)
+                    entity_type = "IPv4-Addr" if parsed_ip.version == 4 else "IPv6-Addr"
+                    iocs.add((entity_type, str(parsed_ip)))
+                except ValueError:
+                    pass
 
         file_data = data.get("file") if isinstance(data.get("file"), dict) else {}
         hashes = file_data.get("hash") if isinstance(file_data.get("hash"), dict) else {}
@@ -845,41 +877,45 @@ class App:
                 merge_enrichment(data, orjson.loads(raw_event))
 
     async def _queue_glpi_asset_lookups(self, events: list[dict]) -> None:
-        """Ask the GLPI collector to enrich Wazuh source IPs, using its configured GLPI credentials."""
+        """Ask GLPI to look up both Wazuh source and destination IPs."""
         for event in events:
             if event.get("data_source") != "wazuh":
                 continue
-            source = event.get("source") if isinstance(event.get("source"), dict) else {}
-            value = source.get("ip")
-            if not isinstance(value, str):
-                continue
-            try:
-                address = ipaddress.ip_address(value)
-            except ValueError:
-                continue
-            ip = str(address)
-            entity_type = "IPv4-Addr" if address.version == 4 else "IPv6-Addr"
-            cache_key = self._enrichment_cache_key(entity_type, ip)
-            cached = await self.redis.get(cache_key)
-            if cached:
+            addresses = set()
+            for side_name in ("source", "destination"):
+                side = event.get(side_name) if isinstance(event.get(side_name), dict) else {}
+                value = side.get("ip")
+                if not isinstance(value, str):
+                    continue
                 try:
-                    cached_event = orjson.loads(cached)
-                except orjson.JSONDecodeError:
-                    cached_event = {}
-                asset = cached_event.get("asset") if isinstance(cached_event, dict) else None
-                if isinstance(asset, dict) and asset.get("found") and asset.get("items"):
+                    addresses.add(ipaddress.ip_address(value))
+                except ValueError:
                     continue
 
-            lookup_key = f"analysis:glpi-lookup:{ip}"
-            if not await self.redis.set(lookup_key, "1", nx=True, ex=300):
-                continue
-            request = {"action": "lookup_asset", "ip": ip, "entity_type": entity_type}
-            try:
-                await self.redis.rpush("outbound-glpi", orjson.dumps(request).decode())
-                log.info("GLPI asset lookup queued ip=%s", ip)
-            except Exception:
-                await self.redis.delete(lookup_key)
-                log.exception("Gagal mengantrekan pencarian aset GLPI untuk IP %s", ip)
+            for address in sorted(addresses, key=lambda item: (item.version, int(item))):
+                ip = str(address)
+                entity_type = "IPv4-Addr" if address.version == 4 else "IPv6-Addr"
+                cache_key = self._enrichment_cache_key(entity_type, ip)
+                cached = await self.redis.get(cache_key)
+                if cached:
+                    try:
+                        cached_event = orjson.loads(cached)
+                    except orjson.JSONDecodeError:
+                        cached_event = {}
+                    asset = cached_event.get("asset") if isinstance(cached_event, dict) else None
+                    if isinstance(asset, dict) and asset.get("found") and asset.get("items"):
+                        continue
+
+                lookup_key = f"analysis:glpi-lookup:{ip}"
+                if not await self.redis.set(lookup_key, "1", nx=True, ex=300):
+                    continue
+                request = {"action": "lookup_asset", "ip": ip, "entity_type": entity_type}
+                try:
+                    await self.redis.rpush("outbound-glpi", orjson.dumps(request).decode())
+                    log.info("GLPI asset lookup queued ip=%s", ip)
+                except Exception:
+                    await self.redis.delete(lookup_key)
+                    log.exception("Gagal mengantrekan pencarian aset GLPI untuk IP %s", ip)
 
     async def _enrich(self, events: list[dict]) -> list[tuple[int, float | None]]:
         """1 pipeline Redis per batch: counter pengulangan (+ fallback asset criticality)."""
