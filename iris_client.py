@@ -67,6 +67,118 @@ def _md_escape(v: Any, n: int = 300) -> str:
     return s.replace("\n", " ")
 
 
+def _display(v: Any, n: int = 300) -> str | None:
+    if v is None or v == "" or v == [] or v == {}:
+        return None
+    text = str(v).strip()
+    if text.lower() in {
+        "none", "null", "n/a", "not available", "tidak tersedia",
+        "belum tersedia", "tidak ditemukan di glpi",
+    }:
+        return None
+    return _md_escape(text, n)
+
+
+def _format_reputation(value: Any) -> list[str]:
+    reputation = _d(value)
+    if not reputation:
+        return ["- Data reputasi belum tersedia."]
+
+    lines = []
+    score = _display(reputation.get("opencti_score"), 30)
+    verdict = _display(reputation.get("verdict"), 40)
+    if score or verdict:
+        summary = " - ".join(part for part in (
+            f"Skor OpenCTI: {score}/100" if score else None,
+            f"Verdict: {verdict}" if verdict else None,
+        ) if part)
+        lines.append(f"- {summary}.")
+
+    labels = reputation.get("labels")
+    if isinstance(labels, list) and labels:
+        shown = [_display(label, 80) for label in labels[:8]]
+        shown = [label for label in shown if label]
+        suffix = f"; +{len(labels) - 8} label lainnya" if len(labels) > 8 else ""
+        if shown:
+            lines.append(f"- Label: {', '.join(shown)}{suffix}.")
+
+    abuse = reputation.get("abuseipdb")
+    if isinstance(abuse, dict):
+        confidence = _display(abuse.get("confidence_score"), 20)
+        reports = _display(abuse.get("total_reports"), 20)
+        if confidence or reports:
+            details = []
+            if confidence:
+                details.append(f"confidence {confidence}%")
+            if reports:
+                details.append(f"{reports} laporan")
+            lines.append(f"- AbuseIPDB: {', '.join(details)}.")
+    elif "abuseipdb" in reputation:
+        lines.append("- AbuseIPDB: tidak ada data.")
+
+    vt = reputation.get("virustotal")
+    if isinstance(vt, dict):
+        stats = _d(vt.get("stats"))
+        counts = [f"{key} {stats[key]}" for key in ("malicious", "suspicious", "harmless")
+                  if stats.get(key) is not None]
+        if counts:
+            lines.append(f"- VirusTotal: {', '.join(counts)}.")
+        elif vt:
+            lines.append("- VirusTotal: data tersedia, ringkasan deteksi tidak tersedia.")
+    elif "virustotal" in reputation:
+        lines.append("- VirusTotal: tidak ada data.")
+
+    return lines or ["- Data reputasi belum tersedia."]
+
+
+def _format_geolocation(value: Any) -> list[str]:
+    geo = _d(value)
+    if not geo or geo.get("available") is False:
+        return ["- Data geolokasi belum tersedia."]
+
+    fields = (
+        ("Lokasi", ", ".join(str(part) for part in
+                              (geo.get("city"), geo.get("region"),
+                               geo.get("country_name") or geo.get("country")) if part)),
+        ("ISP", geo.get("isp") or geo.get("org")),
+        ("ASN", geo.get("asn")),
+        ("Hosting", "Ya" if geo.get("hosting") is True else
+         "Tidak" if geo.get("hosting") is False else None),
+        ("Proxy", "Ya" if geo.get("proxy") is True else
+         "Tidak" if geo.get("proxy") is False else None),
+    )
+    lines = [f"- **{label}:** {_md_escape(value, 180)}"
+             for label, value in fields if _display(value, 180)]
+    return lines or ["- Data geolokasi tersedia, tetapi rinciannya kosong."]
+
+
+def _format_asset(asset: dict, source_ip: Any, host_name: Any) -> list[str]:
+    is_glpi_asset = asset.get("inventory_source") == "GLPI" or asset.get("found") is True
+    if not is_glpi_asset:
+        message = ("Aset tidak ditemukan di GLPI." if asset.get("found") is False
+                   else "Data aset GLPI belum tersedia.")
+        lines = [f"- {message}"]
+    else:
+        fields = (
+            ("Nama", asset.get("name")),
+            ("IP", asset.get("ip") or source_ip),
+            ("Pemilik", asset.get("owner") or asset.get("user")),
+            ("Serial", asset.get("serial_number")),
+            ("Sistem operasi", asset.get("operating_system")),
+            ("Status", asset.get("status")),
+            ("Lokasi", asset.get("location")),
+            ("Tipe", asset.get("type")),
+        )
+        lines = [f"- **{label}:** {_md_escape(value, 180)}"
+                 for label, value in fields if _display(value, 180)]
+        if not lines:
+            lines = ["- Data aset ditemukan, tetapi detailnya kosong."]
+
+    if host_name and _display(host_name, 160):
+        lines.append(f"- **Hostname Wazuh:** {_md_escape(host_name, 160)}")
+    return lines
+
+
 class IrisClient:
     def __init__(self, url: str, api_key: str, customer_id: int, verify: bool | ssl.SSLContext,
                  timeout_s: float, severity_map: dict[str, int], status_id: int | None,
@@ -133,22 +245,8 @@ class IrisClient:
         what = _md_escape(ev.get("action") or ev.get("category") or "event", 80)
         who = _md_escape(src.get("ip") or asset.get("name") or "unknown", 80)
         verdict = analysis.get("verdict", "no-ai")
-        is_glpi_asset = asset.get("inventory_source") == "GLPI"
-        glpi_name = asset.get("name") if is_glpi_asset else None
-        glpi_ip = asset.get("ip") if is_glpi_asset else None
-        asset_info = [
-            f"--- GLPI Asset Info (IP: {_md_escape(glpi_ip or src.get('ip') or 'Tidak tersedia', 80)}) ---",
-            f"Name: {_md_escape(glpi_name or 'Tidak ditemukan di GLPI', 160)}",
-            f"IP address: {_md_escape(glpi_ip or src.get('ip') or 'Tidak tersedia', 80)}",
-            f"User / pemilik: {_md_escape((asset.get('owner') if is_glpi_asset else None) or 'Tidak tersedia', 160)}",
-            f"Serial number: {_md_escape((asset.get('serial_number') if is_glpi_asset else None) or 'Tidak tersedia', 160)}",
-            f"Operating system: {_md_escape((asset.get('operating_system') if is_glpi_asset else None) or 'Tidak tersedia', 160)}",
-            f"Status: {_md_escape((asset.get('status') if is_glpi_asset else None) or 'Tidak tersedia', 80)}",
-        ]
         host = _d(doc.get("host"))
         agent_name = asset.get("agent_name") or host.get("name")
-        if agent_name:
-            asset_info.append(f"Agent / hostname Wazuh: {_md_escape(agent_name, 160)}")
 
         lines = []
         if analysis:
@@ -160,39 +258,60 @@ class IrisClient:
         else:
             lines += [f"_Analisis AI tidak tersedia (status: {_md_escape(_d(ai).get('status', 'not_run'), 30)})._", ""]
         lines += [
-            "## Risk",
-            f"- **Score:** {risk.get('score')} ({level}) - asset {risk.get('asset_criticality')}, "
+            "## Risiko",
+            f"- **Skor:** {risk.get('score')} ({level})",
+            f"- **Faktor:** kritikalitas aset {risk.get('asset_criticality')}, "
             f"severity {risk.get('event_severity')}, outcome {risk.get('event_outcome')}, "
-            f"threat {risk.get('threat_weight')}, repeat {risk.get('repeat_count')}",
-            "## Konteks",
-            f"- **Event:** {what} / outcome {_md_escape(ev.get('outcome'), 40)}",
-            f"- **Source:** {who}",
-            "**Asset (GLPI)**",
-            *asset_info,
-            f"- **Reputation (OpenCTI/feeds):** {_md_escape(doc.get('reputation'), 700)}",
-            f"- **Geolocation:** {_md_escape(doc.get('geolocation'), 500)}",
-            f"- **Domain:** {_md_escape(doc.get('domain'), 500)}", ""]
+            f"ancaman {risk.get('threat_weight')}, pengulangan {risk.get('repeat_count')}",
+            "",
+            "## Event",
+            f"- **Deteksi:** {what}",
+            f"- **Hasil:** {_display(ev.get('outcome'), 60) or 'Tidak tersedia'}",
+            f"- **Sumber:** {who}",
+            "",
+            "## Aset",
+            *_format_asset(asset, src.get("ip"), agent_name),
+            "",
+            "## Intelijen ancaman",
+            *_format_reputation(doc.get("reputation")),
+            "",
+            "## Geolokasi",
+            *_format_geolocation(doc.get("geolocation")),
+        ]
+        domain = _d(doc.get("domain"))
+        domain_name = _display(domain.get("name"), 180)
+        if domain_name:
+            lines += ["", "## Domain", f"- **Nama:** {domain_name}"]
+            age_days = _display(domain.get("age_days"), 40)
+            if age_days:
+                lines.append(f"- **Usia:** {age_days} hari")
+        elif not domain:
+            domain_name = _display(doc.get("domain"), 180)
+            if domain_name:
+                lines += ["", "## Domain", f"- {domain_name}"]
+
         observables = _d(doc.get("enrichment")).get("observables")
         if isinstance(observables, list) and observables:
-            lines += ["## IOC enrichment (OpenCTI / GLPI)"]
+            lines += ["", "## IOC terkait"]
+            shown = 0
             for observable in observables[:20]:
                 if not isinstance(observable, dict):
                     continue
-                lines.append(
-                    f"- **{_md_escape(observable.get('entity_type'), 40)}** "
-                    f"`{_md_escape(observable.get('value'), 180)}`"
-                )
-                for field in ("reputation", "geolocation", "asset", "domain_age", "opencti"):
-                    if observable.get(field) is not None:
-                        lines.append(f"  - **{field}:** {_md_escape(observable[field], 900)}")
+                entity_type = _display(observable.get("entity_type"), 40)
+                value = _display(observable.get("value"), 180)
+                if not entity_type or not value:
+                    continue
+                lines.append(f"- **{entity_type}:** `{value}`")
+                shown += 1
             if len(observables) > 20:
-                lines.append(f"- _{len(observables) - 20} observable lainnya ada di alert source content._")
-            lines.append("")
+                lines.append(f"- {len(observables) - 20} IOC lainnya tersedia pada konten sumber alert.")
+            if shown == 0:
+                lines.append("- Detail IOC tidak tersedia.")
         if analysis.get("recommended_actions"):
             lines += ["## Rekomendasi tindakan"] + [f"- {_md_escape(a)}" for a in analysis["recommended_actions"]] + [""]
         if analysis.get("mitre_techniques"):
             lines += ["## MITRE ATT&CK"] + [f"- {_md_escape(t, 100)}" for t in analysis["mitre_techniques"]] + [""]
-        lines.append(f"`log_uuid: {doc.get('log_uuid')}`")
+        lines += ["", f"`log_uuid: {doc.get('log_uuid')}`"]
 
         tags = ["ai-log-analyzer", f"risk:{level}", f"verdict:{verdict}"]
         tags += [f"mitre:{str(t).split(' ')[0]}" for t in analysis.get("mitre_techniques", [])[:5]]

@@ -19,7 +19,9 @@ serial, OS, dan status) diproyeksikan ke `asset`; skor/verdict OpenCTI dan data 
 diproyeksikan ke `reputation`, dan geolokasi ke `geolocation`. IOC lengkap tetap disimpan
 di `payload.enrichment.observables`.
 
-IRIS menampilkan metadata tersebut pada deskripsi alert dan `alert_source_content`.
+IRIS menampilkan metadata enrichment sebagai ringkasan berlabel pada deskripsi alert
+(reputasi, geolokasi, aset, dan IOC), bukan sebagai JSON mentah berulang. Payload lengkap
+tetap tersedia di `alert_source_content` untuk pemeriksaan detail.
 Jika alert/case IRIS sudah pernah dibuat, alert diperbarui dan case terkait menerima catatan
 enrichment (dideduplikasi). Saat alert baru langsung dieskalasi, catatan case juga menyertakan
 ringkasan alert beserta enrichment. Pengayaan ini merupakan konteks pada alert/catatan; belum
