@@ -93,6 +93,22 @@ def _srcip(data: dict) -> str | None:
     return next((ip for ip in (_valid_ip(c) for c in cand if c) if ip), None)
 
 
+def _dstip(payload: dict, data: dict) -> str | None:
+    data_destination = _dict(data.get("destination"))
+    data_network = _dict(data.get("network"))
+    eventdata = _dict(_dict(data.get("win")).get("eventdata"))
+    destination = _dict(payload.get("destination"))
+    network = _dict(payload.get("network"))
+    candidates = (
+        data.get("dstip"), data.get("dst_ip"), data.get("destination_ip"), data.get("dest_ip"),
+        data_destination.get("ip"), _dict(data_network.get("destination")).get("ip"),
+        eventdata.get("destinationIp"), eventdata.get("destination_ip"),
+        payload.get("dstip"), payload.get("dst_ip"), payload.get("destination_ip"),
+        destination.get("ip"), _dict(network.get("destination")).get("ip"),
+    )
+    return next((ip for ip in (_valid_ip(candidate) for candidate in candidates if candidate) if ip), None)
+
+
 def is_wazuh(p: dict) -> bool:
     return isinstance(p.get("rule"), dict) and (
         "agent" in p or "manager" in p or _dict(p.get("event")).get("dataset") == "wazuh.alerts")
@@ -108,13 +124,30 @@ def norm_wazuh(p: dict) -> dict:
         level = 0
     groups = [str(g).lower() for g in rule["groups"]] if isinstance(rule.get("groups"), list) else []
     host = agent.get("name") or _dict(p.get("host")).get("name")
-    manager = _dict(p.get("manager"))
+    raw_manager = p.get("manager")
+    manager = _dict(raw_manager)
+    manager_name = manager.get("name") or (
+        raw_manager if isinstance(raw_manager, str) else p.get("manager_name")
+    )
+    manager_ip = next(
+        (
+            ip for ip in (
+                _valid_ip(candidate) for candidate in (
+                    manager.get("ip"), manager.get("ip_address"), manager.get("address"),
+                    p.get("manager_ip"), p.get("wazuh_manager_ip"),
+                    os.environ.get("WAZUH_MANAGER_IP"),
+                ) if candidate
+            ) if ip
+        ),
+        None,
+    )
     agent_info = {
         key: value for key, value in {
             "id": agent.get("id"),
             "name": host,
-            "ip": agent.get("ip"),
-            "manager": manager.get("name"),
+            "ip": _valid_ip(agent.get("ip") or p.get("agent_ip")),
+            "manager": manager_name,
+            "manager_ip": manager_ip,
         }.items() if value not in (None, "")
     }
 
@@ -136,8 +169,9 @@ def norm_wazuh(p: dict) -> dict:
     }
     if _srcip(data):
         out["source"] = {"ip": _srcip(data)}
-    if data.get("dstip"):
-        out["destination"] = {"ip": data["dstip"]}
+    destination_ip = _dstip(p, data)
+    if destination_ip:
+        out["destination"] = {"ip": destination_ip}
     hashes = {}
     for algorithm in ("sha512", "sha256", "sha1", "md5"):
         value = syscheck.get(f"{algorithm}_after") or syscheck.get(f"{algorithm}_before")

@@ -121,8 +121,8 @@ def _format_reputation(value: Any) -> list[str]:
             lines.append(f"- **AbuseIPDB:** tidak ada temuan{suffix} (sumber: {provider}).")
     elif "abuseipdb" in reputation:
         status = _display(provider_status.get("abuseipdb"), 120)
-        detail = status or "hasil lookup tidak disertakan pada event enrichment"
-        lines.append(f"- **AbuseIPDB:** {detail}; perlu cek konfigurasi key dan log collector.")
+        if status and "hasil lookup tidak disertakan" not in status.lower():
+            lines.append(f"- **AbuseIPDB:** {status}.")
 
     vt = reputation.get("virustotal")
     if isinstance(vt, dict):
@@ -138,8 +138,8 @@ def _format_reputation(value: Any) -> list[str]:
             lines.append(f"- **VirusTotal:** data tersedia, ringkasan deteksi tidak tersedia (sumber: {provider}{suffix}).")
     elif "virustotal" in reputation:
         status = _display(provider_status.get("virustotal"), 120)
-        detail = status or "hasil lookup tidak disertakan pada event enrichment"
-        lines.append(f"- **VirusTotal:** {detail}; perlu cek konfigurasi key dan log collector.")
+        if status and "hasil lookup tidak disertakan" not in status.lower():
+            lines.append(f"- **VirusTotal:** {status}.")
 
     return lines or ["- Data reputasi belum tersedia."]
 
@@ -392,6 +392,12 @@ class IrisClient:
         destination = _d(doc.get("destination"))
         source_asset = _d(src.get("asset")) or asset
         destination_asset = _d(destination.get("asset"))
+        is_wazuh = doc.get("data_source") == "wazuh" or "wazuh_level" in ev
+        destination_ip = _display(destination.get("ip"), 80)
+        destination_label = (
+            "Tidak ditemukan di field alert Wazuh"
+            if is_wazuh else "Tidak tersedia di event"
+        )
         lines += [
             "## Risiko",
             f"- **Skor:** {risk.get('score')} ({level})",
@@ -403,7 +409,9 @@ class IrisClient:
             f"- **Deteksi:** {what}",
             f"- **Hasil:** {_display(ev.get('outcome'), 60) or 'Tidak tersedia'}",
             f"- **IP sumber (kemungkinan penyerang):** {who}",
-            f"- **IP tujuan (host yang diserang):** {_display(destination.get('ip'), 80) or 'Tidak tersedia di event'}",
+            *([f"- **Wazuh Level:** {_display(ev.get('wazuh_level'), 30) or 'Tidak tersedia di event'}"]
+              if is_wazuh else []),
+            f"- **IP tujuan (host yang diserang):** {destination_ip or destination_label}",
             "",
             "## Aset sumber / penyerang",
             *_format_asset(source_asset, src.get("ip"), None),
@@ -414,8 +422,9 @@ class IrisClient:
             "## Agent Wazuh (sensor yang melaporkan event)",
             f"- **Nama:** {_display(agent_name, 160) or 'Tidak tersedia'}",
             f"- **ID:** {_display(agent.get('id'), 80) or 'Tidak tersedia'}",
-            f"- **IP agent:** {_display(agent.get('ip'), 80) or 'Tidak tersedia'}",
+            f"- **IP agent:** {_display(agent.get('ip'), 80) or ('Tidak dikirim di event Wazuh' if is_wazuh else 'Tidak tersedia')}",
             f"- **Manager:** {_display(agent.get('manager'), 160) or 'Tidak tersedia'}",
+            f"- **IP manager:** {_display(agent.get('manager_ip'), 80) or ('Tidak dikirim di event Wazuh' if is_wazuh else 'Tidak tersedia')}",
             "",
             "## Intelijen ancaman",
             *_format_reputation(doc.get("reputation")),

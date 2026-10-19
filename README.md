@@ -22,7 +22,12 @@ di `payload.enrichment.observables`.
 IRIS menampilkan metadata enrichment sebagai ringkasan berlabel pada deskripsi alert
 (reputasi, geolokasi, aset, dan IOC), bukan sebagai JSON mentah berulang. Payload lengkap
 tetap tersedia di `alert_source_content` untuk pemeriksaan detail. Untuk alert Wazuh,
-IRIS juga mencantumkan nama, ID, IP agent, dan manager dari payload Wazuh. Sumber
+IRIS juga mencantumkan level Wazuh (`rule.level`), nama/ID/IP agent, dan nama/IP manager
+jika ada di payload. Wazuh umumnya menyertakan `agent.ip` tetapi hanya `manager.name`;
+untuk menampilkan IP manager, isi `WAZUH_MANAGER_IP` pada `.env` aplikasi. IP tujuan
+ditampilkan bila alert memuat `data.dstip`, `data.dst_ip`, `destination.ip`, atau field
+tujuan umum yang didukung. Tidak semua jenis alert Wazuh memiliki IP tujuan (misalnya
+alert file-integrity atau uji sintetis tanpa field tujuan). Sumber
 Untuk setiap IP sumber/tujuan, collector memanggil semua connector OpenCTI bertipe
 `INTERNAL_ENRICHMENT` yang aktif dan memiliki scope cocok, lalu mencantumkan status tiap
 job di IRIS. Connector `EXTERNAL_IMPORT` dicari melalui indicator/external reference yang
