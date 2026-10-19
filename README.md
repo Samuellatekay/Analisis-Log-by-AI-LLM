@@ -22,6 +22,8 @@ di `payload.enrichment.observables`.
 IRIS menampilkan metadata enrichment sebagai ringkasan berlabel pada deskripsi alert
 (reputasi, geolokasi, aset, dan IOC), bukan sebagai JSON mentah berulang. Payload lengkap
 tetap tersedia di `alert_source_content` untuk pemeriksaan detail. Untuk alert Wazuh,
+bagian intelijen ancaman mencantumkan Author dari `createdBy` indicator OpenCTI jika ada;
+jika OpenCTI tidak mengirim metadata itu, IRIS menyebutkannya tanpa menebak author.
 IRIS juga mencantumkan level Wazuh (`rule.level`), nama/ID/IP agent, dan nama/IP manager
 jika ada di payload. Wazuh umumnya menyertakan `agent.ip` tetapi hanya `manager.name`;
 untuk menampilkan IP manager, isi `WAZUH_MANAGER_IP` pada `.env` aplikasi. IP tujuan

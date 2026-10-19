@@ -79,7 +79,7 @@ def _display(v: Any, n: int = 300) -> str | None:
     return _md_escape(text, n)
 
 
-def _format_reputation(value: Any) -> list[str]:
+def _format_reputation(value: Any, observables: list | None = None) -> list[str]:
     reputation = _d(value)
     if not reputation:
         return ["- Data reputasi belum tersedia."]
@@ -101,6 +101,34 @@ def _format_reputation(value: Any) -> list[str]:
         suffix = f"; +{len(labels) - 8} label lainnya" if len(labels) > 8 else ""
         if shown:
             lines.append(f"- Label: {', '.join(shown)}{suffix}.")
+
+    authors = []
+    for observable in observables or []:
+        if not isinstance(observable, dict):
+            continue
+        opencti = _d(observable.get("opencti"))
+        indicators = opencti.get("indicators")
+        if not isinstance(indicators, list):
+            continue
+        for indicator in indicators:
+            if not isinstance(indicator, dict):
+                continue
+            author = (
+                indicator.get("created_by")
+                or indicator.get("createdBy")
+                or indicator.get("creator")
+                or indicator.get("author")
+            )
+            if isinstance(author, dict):
+                author = author.get("name") or author.get("id")
+            author = _display(author, 160)
+            if author and author not in authors:
+                authors.append(author)
+    lines.append(
+        "- Author: " + "; ".join(authors[:12]) + "."
+        if authors else
+        "- Author: Tidak dicantumkan pada indicator OpenCTI."
+    )
 
     provider_status = _d(reputation.get("provider_status"))
     abuse = reputation.get("abuseipdb")
@@ -392,6 +420,7 @@ class IrisClient:
         destination = _d(doc.get("destination"))
         source_asset = _d(src.get("asset")) or asset
         destination_asset = _d(destination.get("asset"))
+        observables = _d(doc.get("enrichment")).get("observables") or []
         is_wazuh = doc.get("data_source") == "wazuh" or "wazuh_level" in ev
         destination_ip = _display(destination.get("ip"), 80)
         destination_label = (
@@ -427,7 +456,7 @@ class IrisClient:
             f"- **IP manager:** {_display(agent.get('manager_ip'), 80) or ('Tidak dikirim di event Wazuh' if is_wazuh else 'Tidak tersedia')}",
             "",
             "## Intelijen ancaman",
-            *_format_reputation(doc.get("reputation")),
+            *_format_reputation(doc.get("reputation"), observables),
             "",
             "## Sumber intel / connector OpenCTI",
             *_format_intel_sources(doc, _d(doc.get("enrichment")).get("observables") or []),
@@ -447,7 +476,6 @@ class IrisClient:
             if domain_name:
                 lines += ["", "## Domain", f"- {domain_name}"]
 
-        observables = _d(doc.get("enrichment")).get("observables")
         if isinstance(observables, list) and observables:
             lines += ["", "## IOC terkait"]
             shown = 0
