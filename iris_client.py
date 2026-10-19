@@ -103,27 +103,44 @@ def _format_reputation(value: Any, observables: list | None = None) -> list[str]
             lines.append(f"- Label: {', '.join(shown)}{suffix}.")
 
     authors = []
+
+    def add_authors(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                add_authors(item)
+            return
+        if isinstance(value, dict):
+            author = value.get("name") or value.get("id")
+            if author is None:
+                for key in ("edges", "nodes", "items", "data"):
+                    if key in value:
+                        add_authors(value[key])
+                        return
+        else:
+            author = value
+        author = _display(author, 160)
+        if author and author not in authors:
+            authors.append(author)
+
     for observable in observables or []:
         if not isinstance(observable, dict):
             continue
         opencti = _d(observable.get("opencti"))
         indicators = opencti.get("indicators")
-        if not isinstance(indicators, list):
-            continue
-        for indicator in indicators:
-            if not isinstance(indicator, dict):
-                continue
-            author = (
-                indicator.get("created_by")
-                or indicator.get("createdBy")
-                or indicator.get("creator")
-                or indicator.get("author")
-            )
-            if isinstance(author, dict):
-                author = author.get("name") or author.get("id")
-            author = _display(author, 160)
-            if author and author not in authors:
-                authors.append(author)
+        if isinstance(indicators, list):
+            for indicator in indicators:
+                if isinstance(indicator, dict):
+                    add_authors(
+                        indicator.get("created_by")
+                        or indicator.get("createdBy")
+                        or indicator.get("creator")
+                        or indicator.get("author")
+                    )
+        sources = opencti.get("sources")
+        if isinstance(sources, list):
+            for source in sources:
+                if isinstance(source, dict):
+                    add_authors(source)
     lines.append(
         "- Author: " + "; ".join(authors[:12]) + "."
         if authors else
