@@ -356,11 +356,15 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any) -> list[str]:
             message = f"Pencarian aset GLPI gagal: {error}."
         elif asset.get("found") is False:
             searched_ip = _display(asset.get("ip"), 80)
-            message = (
-                f"Tidak ada aset GLPI yang cocok dengan IP {searched_ip}."
-                if searched_ip else
-                "Tidak ada aset GLPI yang cocok dengan IP ini."
-            )
+            searched_host = _display(asset.get("host_name"), 160)
+            if searched_host:
+                message = f"Tidak ada aset GLPI yang cocok dengan nama host {searched_host}."
+            else:
+                message = (
+                    f"Tidak ada aset GLPI yang cocok dengan IP {searched_ip}."
+                    if searched_ip else
+                    "Tidak ada aset GLPI yang cocok dengan IP ini."
+                )
         else:
             message = "Data aset GLPI belum tersedia."
         lines = [f"- {message}"]
@@ -455,11 +459,17 @@ class IrisClient:
 
         lines = []
         destination = _d(doc.get("destination"))
-        source_asset = _d(src.get("asset")) or asset
+        source_asset = _d(src.get("asset")) or (asset if src.get("ip") else {})
         destination_asset = _d(destination.get("asset"))
         observables = _d(doc.get("enrichment")).get("observables") or []
         is_wazuh = doc.get("data_source") == "wazuh" or "wazuh_level" in ev
         destination_ip = _display(destination.get("ip"), 80)
+        source_ip = _display(src.get("ip"), 80)
+        reporting_host = _display(agent_name or host.get("name"), 160)
+        source_label = source_ip or (
+            f"Tidak tersedia di event (aktivitas dilaporkan oleh host {reporting_host})"
+            if reporting_host else "Tidak tersedia di event"
+        )
         destination_label = (
             "Tidak ditemukan di field alert Wazuh"
             if is_wazuh else "Tidak tersedia di event"
@@ -474,13 +484,17 @@ class IrisClient:
             "## Event",
             f"- **Deteksi:** {what}",
             f"- **Hasil:** {_display(ev.get('outcome'), 60) or 'Tidak tersedia'}",
-            f"- **IP sumber (kemungkinan penyerang):** {who}",
+            f"- **IP sumber (kemungkinan penyerang):** {source_label}",
             *([f"- **Wazuh Level:** {_display(ev.get('wazuh_level'), 30) or 'Tidak tersedia di event'}"]
               if is_wazuh else []),
             f"- **IP tujuan (host yang diserang):** {destination_ip or destination_label}",
             "",
             "## Aset sumber / penyerang",
-            *_format_asset(source_asset, src.get("ip"), None),
+            *(
+                ["- Event tidak memuat IP sumber; aset penyerang tidak dapat ditentukan dari event."]
+                if is_wazuh and not source_ip else
+                _format_asset(source_asset, src.get("ip"), None)
+            ),
             "",
             "## Aset tujuan / penerima serangan",
             *_format_asset(destination_asset, destination.get("ip"), None),

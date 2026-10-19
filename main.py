@@ -249,6 +249,64 @@ def merge_enrichment(target: dict, event: dict) -> None:
             asset["inventory_source"] = "GLPI"
             target["asset"] = asset
 
+    elif entity_type == "host-name" and value:
+        asset_result = event.get("asset")
+        candidates = (
+            asset_result.get("items", [])
+            if isinstance(asset_result, dict) and isinstance(asset_result.get("items"), list)
+            else [asset_result] if isinstance(asset_result, dict) else []
+        )
+        expected_name = str(value).strip().casefold()
+        glpi_asset = next(
+            (
+                item for item in candidates
+                if isinstance(item, dict)
+                and str(item.get("name") or "").strip().casefold() == expected_name
+                and any(item.get(key) not in (None, "") for key in (
+                    "id", "owner", "user", "serial_number", "operating_system",
+                    "status", "location", "type",
+                ))
+            ),
+            None,
+        )
+        host = target.get("host")
+        host = host if isinstance(host, dict) else {}
+        agent = target.get("agent")
+        agent = agent if isinstance(agent, dict) else {}
+        names = {
+            str(host.get("name") or "").strip().casefold(),
+            str(agent.get("name") or "").strip().casefold(),
+        }
+        if expected_name in names:
+            destination = target.get("destination")
+            destination = dict(destination) if isinstance(destination, dict) else {}
+            destination_ip = destination.get("ip")
+            agent_ip = agent.get("ip")
+            source = target.get("source")
+            source = source if isinstance(source, dict) else {}
+            if not source.get("ip") and (
+                not destination_ip or (agent_ip and destination_ip == agent_ip)
+            ):
+                if glpi_asset:
+                    details = {
+                        key: glpi_asset[key]
+                        for key in ("name", "ip", "owner", "user", "serial_number",
+                                    "operating_system", "status", "location", "type")
+                        if glpi_asset.get(key) not in (None, "")
+                    }
+                    destination["asset"] = {
+                        "found": True,
+                        "inventory_source": "GLPI",
+                        **details,
+                    }
+                elif isinstance(asset_result, dict) and asset_result.get("found") is False:
+                    destination["asset"] = {
+                        "found": False,
+                        "host_name": value,
+                        "error": asset_result.get("error"),
+                    }
+                target["destination"] = destination
+
     elif entity_type == "domain-name" and value:
         domain = target.get("domain")
         domain = dict(domain) if isinstance(domain, dict) else {}
@@ -293,6 +351,8 @@ def normalize_ioc_value(entity_type: str, value: str) -> str:
         if address.version != expected_version:
             raise ValueError(f"{entity_type} has an address of the wrong IP version")
         return str(address)
+    if kind == "host-name":
+        return normalized.casefold()
     if kind == "stixfile":
         return normalized.lower()
     return normalized
@@ -348,6 +408,7 @@ class Database:
             return []
 
         ip_value = value if entity_type in {"ipv4-addr", "ipv6-addr"} else None
+        host_name = value if entity_type == "host-name" else None
         file_hash = event.get("file_hash") if isinstance(event.get("file_hash"), dict) else {}
         hash_value = str(file_hash.get("value") or value).strip().lower() if entity_type == "stixfile" else None
         query = """
@@ -366,6 +427,10 @@ class Database:
                     payload #>> '{file,hash,sha256}' = $4
                     OR payload #>> '{file,hash,sha512}' = $4
                 ))
+                OR ($7::text IS NOT NULL AND (
+                    lower(payload #>> '{host,name}') = $7
+                    OR lower(payload #>> '{agent,name}') = $7
+                ))
               )
             ORDER BY received_at DESC
             LIMIT 500
@@ -383,7 +448,7 @@ class Database:
             async with conn.transaction():
                 rows = await conn.fetch(
                     query, ip_value, hash_args[0], hash_args[1], hash_args[2],
-                    retention_minutes, ip_value
+                    retention_minutes, ip_value, host_name
                 )
                 for row in rows:
                     payload = row["payload"]
@@ -774,6 +839,7 @@ class App:
     @staticmethod
     def _alert_iocs(data: dict) -> list[tuple[str, str]]:
         iocs: set[tuple[str, str]] = set()
+        has_source_ip = False
         for side_name in ("source", "destination"):
             side = data.get(side_name) if isinstance(data.get(side_name), dict) else {}
             side_ip = side.get("ip")
@@ -782,8 +848,17 @@ class App:
                     parsed_ip = ipaddress.ip_address(side_ip)
                     entity_type = "IPv4-Addr" if parsed_ip.version == 4 else "IPv6-Addr"
                     iocs.add((entity_type, str(parsed_ip)))
+                    if side_name == "source":
+                        has_source_ip = True
                 except ValueError:
                     pass
+
+        if not has_source_ip:
+            host = data.get("host") if isinstance(data.get("host"), dict) else {}
+            agent = data.get("agent") if isinstance(data.get("agent"), dict) else {}
+            host_name = host.get("name") or agent.get("name")
+            if isinstance(host_name, str) and host_name.strip():
+                iocs.add(("Host-Name", host_name.strip()))
 
         file_data = data.get("file") if isinstance(data.get("file"), dict) else {}
         hashes = file_data.get("hash") if isinstance(file_data.get("hash"), dict) else {}
@@ -862,6 +937,42 @@ class App:
                     except Exception:
                         await self.redis.delete(opencti_key)
                         log.exception("Gagal mengantrekan lookup connector OpenCTI untuk IP %s", ip)
+
+            source = event.get("source") if isinstance(event.get("source"), dict) else {}
+            if source.get("ip"):
+                continue
+            host = event.get("host") if isinstance(event.get("host"), dict) else {}
+            agent = event.get("agent") if isinstance(event.get("agent"), dict) else {}
+            host_name = host.get("name") or agent.get("name")
+            if not isinstance(host_name, str) or not host_name.strip():
+                continue
+            host_name = host_name.strip()
+            entity_type = "Host-Name"
+            cache_key = self._enrichment_cache_key(entity_type, host_name)
+            cached = await self.redis.get(cache_key)
+            if cached:
+                try:
+                    cached_event = orjson.loads(cached)
+                except orjson.JSONDecodeError:
+                    cached_event = {}
+                asset = cached_event.get("asset") if isinstance(cached_event, dict) else None
+                if isinstance(asset, dict) and asset.get("found") and asset.get("items"):
+                    continue
+
+            lookup_key = f"analysis:glpi-host-lookup:{host_name.casefold()}"
+            if await self.redis.set(lookup_key, "1", nx=True, ex=300):
+                request = {
+                    "action": "lookup_asset_by_name",
+                    "host_name": host_name,
+                    "entity_type": entity_type,
+                }
+                try:
+                    await self.redis.rpush("outbound-glpi", orjson.dumps(request).decode())
+                    log.info("GLPI asset hostname lookup queued host=%s", host_name)
+                except Exception:
+                    await self.redis.delete(lookup_key)
+                    log.exception("Gagal mengantrekan pencarian aset GLPI untuk host %s",
+                                  host_name)
 
     async def _enrich(self, events: list[dict]) -> list[tuple[int, float | None]]:
         """1 pipeline Redis per batch: counter pengulangan (+ fallback asset criticality)."""

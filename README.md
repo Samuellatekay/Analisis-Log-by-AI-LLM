@@ -12,8 +12,10 @@ ke Logstash, dan mengirim alert berisiko ke DFIR-IRIS.
    `risk_calculator.py`.
 3. Dokumen disimpan di PostgreSQL, diteruskan ke Logstash, dan diproses untuk
    pengiriman ke IRIS sesuai ambang risiko dan level Wazuh.
-4. Alert Wazuh yang memiliki IP sumber atau tujuan meminta lookup GLPI melalui
-   `outbound-glpi`. Collector menerbitkan hasilnya ke `enrichment-events`.
+4. Alert Wazuh meminta lookup GLPI melalui `outbound-glpi` berdasarkan IP sumber
+   dan tujuan. Jika IP sumber tidak tersedia, nama host/agent dipakai sebagai
+   fallback untuk mencari aset sensor yang melaporkan event. Collector menerbitkan
+   hasilnya ke `enrichment-events`.
 5. Data enrichment yang datang kemudian digabung ke record PostgreSQL dan
    Logstash. Alert atau case IRIS yang sudah ada diperbarui dengan konteks baru.
 
@@ -23,10 +25,12 @@ list tersebut.
 
 ## GLPI dan OpenCTI
 
-Lookup aset dijadwalkan untuk IP sumber dan tujuan pada event Wazuh. Collector
-mencari aset GLPI berdasarkan IP di Computer atau NetworkPort, lalu menerbitkan
-hasil pencarian ke Redis. Informasi aset yang tersedia dapat mencakup nama,
-pemilik, serial, sistem operasi, status, dan lokasi.
+Lookup aset dijadwalkan untuk IP sumber dan tujuan pada event Wazuh. Jika IP
+sumber tidak ada, collector mencoba pencarian Computer GLPI dengan nama host
+yang sama persis dan hanya menerima hasil yang unik. Hasilnya dipasangkan ke
+aset host/agent yang melaporkan event, bukan dianggap sebagai IP penyerang.
+Informasi aset yang tersedia dapat mencakup nama, pemilik, serial, sistem operasi,
+status, dan lokasi.
 
 Lookup OpenCTI juga dijadwalkan untuk IP sumber dan tujuan. Hasil reputasi,
 geolokasi, indikator, dan status connector yang tersedia disimpan sebagai konteks
