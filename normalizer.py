@@ -106,7 +106,13 @@ def _dstip(payload: dict, data: dict) -> str | None:
         payload.get("dstip"), payload.get("dst_ip"), payload.get("destination_ip"),
         destination.get("ip"), _dict(network.get("destination")).get("ip"),
     )
-    return next((ip for ip in (_valid_ip(candidate) for candidate in candidates if candidate) if ip), None)
+    explicit_destination = next(
+        (ip for ip in (_valid_ip(candidate) for candidate in candidates if candidate) if ip),
+        None,
+    )
+    if explicit_destination:
+        return explicit_destination
+    return _valid_ip(_dict(payload.get("agent")).get("ip") or payload.get("agent_ip"))
 
 
 def is_wazuh(p: dict) -> bool:
