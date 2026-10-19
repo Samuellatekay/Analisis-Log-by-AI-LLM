@@ -188,6 +188,8 @@ def _format_intel_sources(doc: dict, observables: list) -> list[str]:
     connector_lines = []
     external_match_count = 0
     lookup_statuses = []
+    connector_inventory_included = False
+    lookup_connector_reported = False
 
     for context in contexts:
         try:
@@ -202,11 +204,14 @@ def _format_intel_sources(doc: dict, observables: list) -> list[str]:
             lookup_statuses.append(lookup_status)
         connectors = context.get("connectors")
         if isinstance(connectors, list):
+            connector_inventory_included = True
             for connector in connectors:
                 if not isinstance(connector, dict):
                     continue
                 name = _display(connector.get("name"), 120) or "Connector tanpa nama"
                 kind = str(connector.get("type") or "").upper()
+                if kind in {"INTERNAL_ENRICHMENT", "EXTERNAL_IMPORT"}:
+                    lookup_connector_reported = True
                 status = str(connector.get("status") or "unknown").lower()
                 details = _display(connector.get("details"), 180)
                 if kind == "INTERNAL_ENRICHMENT":
@@ -280,7 +285,16 @@ def _format_intel_sources(doc: dict, observables: list) -> list[str]:
 
     lines = list(dict.fromkeys(connector_lines))
     if not lines:
-        lines.append("- API OpenCTI tidak melaporkan connector Internal Enrichment atau External Import untuk lookup.")
+        if not connector_inventory_included:
+            lines.append(
+                "- Status connector tidak disertakan pada data enrichment event ini; "
+                "ini bukan bukti bahwa connector tidak tersedia di OpenCTI."
+            )
+        elif not lookup_connector_reported:
+            lines.append(
+                "- Inventory connector yang disertakan tidak memuat tipe "
+                "Internal Enrichment atau External Import."
+            )
     if lookup_statuses and "observable_not_found" in lookup_statuses:
         lines.append("- Observable belum ada di OpenCTI; feed eksternal diperiksa melalui pencarian indicator.")
     if evidence:
