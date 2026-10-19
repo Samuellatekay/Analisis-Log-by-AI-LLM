@@ -1,16 +1,13 @@
 """
-main.py - Orchestrator "Analisis Log by AI/LLM"
+main.py - Orchestrator Analisis_Log
 
-Redis Stream (consumer group) -> hitung risk -> PostgreSQL (temp) -> Logstash (log awal, 1 POST/batch)
-                                                   `-> antrean prioritas -> worker Ollama (background)
-                                                          -> Logstash (hasil AI, UUID sama) + update PostgreSQL
+Redis Stream/list -> hitung risk -> PostgreSQL (temp) -> Logstash -> DFIR-IRIS
 
 Ketahanan terhadap burst:
 - Redis Streams + consumer group (at-least-once, bisa scale horizontal, XAUTOCLAIM untuk pesan nyangkut)
 - Pemrosesan per-batch (1 pipeline Redis, 1 executemany DB, 1 POST Logstash)
 - Connection pool (asyncpg, httpx, redis)
 - UUID deterministik (uuid5 dari ID pesan stream) => redelivery idempoten
-- Antrean AI terbatas + prioritas risk tertinggi; kelebihan beban => status 'skipped_overload'
 - Dead-letter stream untuk pesan rusak / gagal kirim ke Logstash
 """
 from __future__ import annotations
@@ -18,14 +15,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
-import itertools
 import logging
 import os
 import signal
 import socket
 import time
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Awaitable, Callable
 from datetime import datetime, timezone
 
@@ -36,9 +32,7 @@ import redis.asyncio as aioredis
 from redis.exceptions import ResponseError
 
 from iris_client import IrisClient
-from llm_analyzer import build_analyzer, describe_error
 from normalizer import normalize
-from optimalisasi import aggregate_event, attack_aggregation_key
 from risk_calculator import assess_event
 
 try:
@@ -46,9 +40,18 @@ try:
 except ImportError:  # opsional
     uvloop = None
 
-log = logging.getLogger("log-analyzer")
+log = logging.getLogger("analisis-log")
 UUID_NS = uuid.UUID("6f1c2f0e-8c1e-4e0a-9d52-3b1f7a5e9c11")
 LATENCY_BUDGET_S = 1.0
+
+
+def _error_label(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP{exc.response.status_code}"
+    public_message = getattr(exc, "public_message", None)
+    if public_message:
+        return str(public_message)[:200]
+    return type(exc).__name__
 
 
 # ----------------------------------------------------------------- Konfigurasi
@@ -78,15 +81,6 @@ class Settings:
     logstash_user: str
     logstash_password: str
     logstash_timeout_s: float
-    ollama_url: str
-    ollama_model: str
-    ollama_timeout_s: float
-    persona_path: str
-    ai_workers: int
-    ai_queue_max: int
-    ai_min_risk: float
-    ai_aggregation_threshold: int
-    ai_aggregation_window_s: int
     iris_min_risk: float
     iris_dedup_s: int
     iris_workers: int
@@ -120,15 +114,6 @@ class Settings:
             logstash_user=_e("LOGSTASH_USER", ""),
             logstash_password=_e("LOGSTASH_PASSWORD", ""),
             logstash_timeout_s=float(_e("LOGSTASH_TIMEOUT_S", "5")),
-            ollama_url=_e("OLLAMA_URL", "http://localhost:11434"),
-            ollama_model=_e("OLLAMA_MODEL", "llama3.1:8b"),
-            ollama_timeout_s=float(_e("OLLAMA_TIMEOUT_S", "600")),
-            persona_path=_e("PERSONA_PATH", "soc_persona.md"),
-            ai_workers=int(_e("AI_WORKERS", "2")),
-            ai_queue_max=int(_e("AI_QUEUE_MAX", "1000")),
-            ai_min_risk=float(_e("AI_MIN_RISK", "40")),
-            ai_aggregation_threshold=int(_e("AI_AGGREGATION_THRESHOLD", "10")),
-            ai_aggregation_window_s=int(_e("AI_AGGREGATION_WINDOW_S", "60")),
             iris_min_risk=float(_e("IRIS_MIN_RISK", "60")),
             iris_dedup_s=int(_e("IRIS_DEDUP_WINDOW_S", "300")),
             iris_workers=int(_e("IRIS_WORKERS", "1")),
@@ -149,17 +134,7 @@ class Record:
     received_at: datetime
     log_day: str
     risk_score: float
-    ai_status: str
     doc: dict
-
-
-@dataclass(slots=True)
-class AIJob:
-    representative: Record
-    records: list[Record]
-    doc: dict
-    aggregated: bool = False
-    aggregate_record: Record | None = None
 
 
 @dataclass(slots=True)
@@ -175,10 +150,7 @@ CREATE UNLOGGED TABLE IF NOT EXISTS log_events (
     log_uuid      UUID PRIMARY KEY,
     received_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     risk_score    REAL NOT NULL,
-    payload       JSONB NOT NULL,
-    ai_status     TEXT NOT NULL DEFAULT 'pending',
-    ai_result     JSONB,
-    ai_updated_at TIMESTAMPTZ
+    payload       JSONB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_log_events_received_at ON log_events (received_at);
 ALTER TABLE log_events ADD COLUMN IF NOT EXISTS iris_alert_id INTEGER;
@@ -350,11 +322,10 @@ class Database:
     async def insert_many(self, records: list[Record]) -> list[Record]:
         """Insert batch. Baris yang ditolak PostgreSQL (DataError) dikembalikan -> DLQ,
         agar satu payload aneh tidak membuat seluruh batch gagal selamanya."""
-        sql = ("INSERT INTO log_events (log_uuid, received_at, risk_score, payload, ai_status) "
-               "VALUES ($1,$2,$3,$4::jsonb,$5) ON CONFLICT (log_uuid) DO NOTHING")
+        sql = ("INSERT INTO log_events (log_uuid, received_at, risk_score, payload) "
+               "VALUES ($1,$2,$3,$4::jsonb) ON CONFLICT (log_uuid) DO NOTHING")
         rows = [(r.log_uuid, r.received_at, r.risk_score,
-                 orjson.dumps(r.doc).decode().replace("\\u0000", ""),  # JSONB menolak NUL
-                 r.ai_status) for r in records]
+                 orjson.dumps(r.doc).decode().replace("\\u0000", "")) for r in records]
         async with self.pool.acquire() as conn:
             try:
                 await conn.executemany(sql, rows)
@@ -370,7 +341,7 @@ class Database:
             return failed
 
     async def attach_enrichment(self, event: dict, retention_minutes: int) -> list[Record]:
-        """Attach one IOC enrichment event to matching recent Wazuh alerts and return them for AI."""
+        """Attach one IOC enrichment event to matching recent Wazuh alerts."""
         entity_type = str(event.get("entity_type") or "").lower()
         value = normalize_ioc_value(entity_type, str(event.get("value") or ""))
         if not value:
@@ -422,12 +393,9 @@ class Database:
                         continue
 
                     merge_enrichment(payload, event)
-
-                    payload["ai"] = {"status": "pending"}
                     encoded = orjson.dumps(payload).decode().replace("\\u0000", "")
                     await conn.execute(
-                        "UPDATE log_events SET payload=$2::jsonb, ai_status='pending', "
-                        "ai_result=NULL, ai_updated_at=NULL WHERE log_uuid=$1",
+                        "UPDATE log_events SET payload=$2::jsonb WHERE log_uuid=$1",
                         row["log_uuid"], encoded,
                     )
                     log_day = payload.get("log_day") or row["received_at"].strftime("%Y.%m.%d")
@@ -437,27 +405,9 @@ class Database:
                         received_at=row["received_at"],
                         log_day=log_day,
                         risk_score=float(row["risk_score"]),
-                        ai_status="pending",
                         doc=payload,
                     ))
         return records
-
-    async def update_ai(self, log_uuid: uuid.UUID, status: str, result: dict | None = None) -> None:
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE log_events SET ai_status=$2, ai_result=$3::jsonb, ai_updated_at=now() "
-                "WHERE log_uuid=$1",
-                log_uuid, status, orjson.dumps(result).decode() if result is not None else None)
-
-    async def update_ai_many(self, log_uuids: list[uuid.UUID], status: str,
-                             result: dict | None = None) -> None:
-        if not log_uuids:
-            return
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE log_events SET ai_status=$2, ai_result=$3::jsonb, ai_updated_at=now() "
-                "WHERE log_uuid = ANY($1::uuid[])",
-                log_uuids, status, orjson.dumps(result).decode() if result is not None else None)
 
     async def set_iris(self, log_uuid: uuid.UUID, alert_id: int | None, case_id: int | None) -> None:
         async with self.pool.acquire() as conn:
@@ -473,12 +423,6 @@ class Database:
                 log_uuid,
             )
         return (row["iris_alert_id"], row["iris_case_id"]) if row else (None, None)
-
-    async def mark_many(self, ids: list[uuid.UUID], status: str) -> None:
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE log_events SET ai_status=$2, ai_updated_at=now() WHERE log_uuid = ANY($1::uuid[])",
-                ids, status)
 
     async def purge_old(self, minutes: int) -> int:
         """Retensi: hapus log yang umurnya > N menit (default 60)."""
@@ -530,7 +474,6 @@ class App:
         self.stop = asyncio.Event()
         self.db = Database(s)
         self.logstash = LogstashClient(s)
-        self.llm = build_analyzer(os.environ, s.persona_path)  # ollama/openai/anthropic/gemini + fallback
         self.redis = aioredis.from_url(s.redis_url, decode_responses=True, max_connections=50,
                                        health_check_interval=30, socket_keepalive=True,
                                        socket_connect_timeout=5)
@@ -538,9 +481,6 @@ class App:
             raise ValueError("IRIS_MODE harus: alert | alert_case | case")
         self.iris = IrisClient.from_env(os.environ)  # None jika IRIS_ENABLED!=true
         self.iris_queue: asyncio.Queue = asyncio.Queue(maxsize=s.iris_queue_max)
-        self.ai_queue: asyncio.PriorityQueue = asyncio.PriorityQueue(maxsize=s.ai_queue_max)
-        self._ai_buckets: dict[tuple[str, str], tuple[datetime, list[Record]]] = {}
-        self._seq = itertools.count()
         self._host = socket.gethostname()
 
     # ---- lifecycle
@@ -558,28 +498,17 @@ class App:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self.stop.set)
 
-        ai_tasks = [asyncio.create_task(self._ai_worker(i)) for i in range(s.ai_workers)]
         iris_tasks = [asyncio.create_task(self._iris_worker()) for _ in range(s.iris_workers if self.iris else 0)]
         loops = [asyncio.create_task(self._consumer_loop(f"{self._host}-{os.getpid()}-{i}", src))
                  for src in self._sources() for i in range(s.consumer_workers)]
         loops += [asyncio.create_task(self._reclaim_loop()), asyncio.create_task(self._retention_loop())]
-        aggregation_task = asyncio.create_task(self._ai_aggregation_loop())
-        log.info("Started: mode=%s sources=%s, %d worker/sumber, %d AI worker, providers=%s",
-                 s.redis_mode, self._sources(), s.consumer_workers, s.ai_workers, self.llm.label)
+        log.info("Started: mode=%s sources=%s, %d worker/sumber, %d worker IRIS",
+                 s.redis_mode, self._sources(), s.consumer_workers,
+                 s.iris_workers if self.iris else 0)
 
         await self.stop.wait()
         log.info("Shutdown: menghentikan consumer...")
         await asyncio.gather(*loops, return_exceptions=True)
-        aggregation_task.cancel()
-        await asyncio.gather(aggregation_task, return_exceptions=True)
-        await self._flush_ai_buckets(force=True)
-        try:
-            await asyncio.wait_for(self.ai_queue.join(), s.shutdown_grace_s)
-        except asyncio.TimeoutError:
-            log.warning("Antrean AI belum kosong (%d); sisa dibuang", self.ai_queue.qsize())
-        for t in ai_tasks:
-            t.cancel()
-        await asyncio.gather(*ai_tasks, return_exceptions=True)
         try:
             await asyncio.wait_for(self.iris_queue.join(), s.shutdown_grace_s)
         except asyncio.TimeoutError:
@@ -587,7 +516,7 @@ class App:
         for t in iris_tasks:
             t.cancel()
         await asyncio.gather(*iris_tasks, return_exceptions=True)
-        await asyncio.gather(self.llm.aclose(), self.logstash.aclose(), self.db.close(),
+        await asyncio.gather(self.logstash.aclose(), self.db.close(),
                              *([self.iris.aclose()] if self.iris else []),
                              self.redis.aclose(), return_exceptions=True)
 
@@ -769,7 +698,7 @@ class App:
             if not ok:
                 for r in records:
                     dlq.append((r.msg_id, "logstash_failed", orjson.dumps(r.doc).decode()))
-                log.error("Logstash tidak tersedia; %d alert tetap diteruskan ke antrean AI",
+                log.error("Logstash tidak tersedia; %d alert tetap diteruskan ke antrean IRIS",
                           len(records))
             records_ok = records
 
@@ -778,12 +707,12 @@ class App:
         await ack()
 
         if records_ok:
-            await self._enqueue_ai(records_ok)
+            self._enqueue_iris(records_ok)
             ts = [i.ts_ms for i in items if i.ts_ms]
             e2e = f" e2e_max={(time.time() * 1000 - min(ts)) / 1000:.3f}s" if ts else ""
             level = logging.WARNING if sent_s > LATENCY_BUDGET_S else logging.DEBUG
-            log.log(level, "batch=%d proses+kirim=%.3fs%s ai_queue=%d",
-                    len(records_ok), sent_s, e2e, self.ai_queue.qsize())
+            log.log(level, "batch=%d proses+kirim=%.3fs%s iris_queue=%d",
+                    len(records_ok), sent_s, e2e, self.iris_queue.qsize())
 
     @staticmethod
     def _enrichment_cache_key(entity_type: str, value: str) -> str:
@@ -832,9 +761,9 @@ class App:
                     dlq.append((record.msg_id, "logstash_enrichment_failed",
                                 orjson.dumps(record.doc).decode()))
                 log.error("Logstash tidak tersedia; %d alert hasil enrichment tetap "
-                          "diteruskan ke antrean AI", len(records))
-            await self._enqueue_ai(records)
-            log.info("Enrichment dicocokkan ke %d alert; analisis AI dijadwalkan", len(records))
+                          "diteruskan ke antrean IRIS", len(records))
+            self._enqueue_iris(records)
+            log.info("Enrichment dicocokkan ke %d alert", len(records))
         elif parsed:
             log.info("Enrichment disimpan untuk pencocokan; alert terkait belum ditemukan")
 
@@ -976,7 +905,6 @@ class App:
         risk = assess_event(data, repeat, crit, self.s.risk_normalize)
         log_uuid = uuid.uuid5(UUID_NS, msg_id)  # deterministik => idempoten
         ev = data.get("event") if isinstance(data.get("event"), dict) else {}
-        ai_status = "pending" if risk.score >= self.s.ai_min_risk else "skipped_low_risk"
         log_day = now.strftime("%Y.%m.%d")
         doc = {
             "event_type": "raw",
@@ -995,12 +923,11 @@ class App:
             "domain": data.get("domain"),
             "enrichment": data.get("enrichment"),
             "risk": {**risk.as_dict(), "repeat_count": repeat},
-            "ai": {"status": ai_status},
         }
         for k in ("destination", "file"):  # opsional dari normalizer (mis. Wazuh dstip / hash syscheck)
             if data.get(k):
                 doc[k] = data[k]
-        return Record(msg_id, log_uuid, now, log_day, risk.score, ai_status, doc)
+        return Record(msg_id, log_uuid, now, log_day, risk.score, doc)
 
     async def _send_dlq(self, items: list[tuple[str, str, str]]) -> None:
         pipe = self.redis.pipeline(transaction=False)
@@ -1010,160 +937,18 @@ class App:
         await pipe.execute()
         log.error("%d pesan dikirim ke DLQ (%s)", len(items), self.s.dlq_key)
 
-    # ---- background AI
-    @staticmethod
-    def _ai_aggregation_key(r: Record) -> tuple[str, str] | None:
-        return attack_aggregation_key(r.doc)
-
-    async def _build_ai_jobs(self, records: list[Record]) -> list[AIJob]:
-        representative = max(records, key=lambda r: r.risk_score)
-        if len(records) <= self.s.ai_aggregation_threshold:
-            return [AIJob(r, [r], r.doc) for r in records]
-
-        ordered = sorted(records, key=lambda r: r.received_at)
-        first, last = ordered[0].received_at, ordered[-1].received_at
-        doc, aggregate_uuid = aggregate_event(
-            ordered,
-            self.s.ai_aggregation_threshold,
-            self.s.ai_aggregation_window_s,
-            representative=representative,
-        )
-        aggregate_record = Record(
-            msg_id=f"aggregate:{aggregate_uuid}",
-            log_uuid=aggregate_uuid,
-            received_at=last,
-            log_day=representative.log_day,
-            risk_score=representative.risk_score,
-            ai_status="pending",
-            doc=doc,
-        )
-        rejected = await self.db.insert_many([aggregate_record])
-        if rejected:
-            raise RuntimeError(f"Database menolak record agregat {aggregate_uuid}")
-        return [AIJob(aggregate_record, records, doc, aggregated=True, aggregate_record=aggregate_record)]
-
-    async def _enqueue_ai(self, records: list[Record]) -> None:
-        ready: list[AIJob] = []
-        now = datetime.now(timezone.utc)
-        for r in records:
-            if r.ai_status != "pending":
-                self._to_iris(r, None)  # AI tidak jalan, tapi risk tinggi tetap dieskalasi
-                continue
-            self._to_iris(r, {"status": "running"})
-            key = self._ai_aggregation_key(r)
-            if key is None:
-                ready.extend(await self._build_ai_jobs([r]))
-                continue
-            bucket = self._ai_buckets.get(key)
-            if bucket and (now - bucket[0]).total_seconds() >= self.s.ai_aggregation_window_s:
-                jobs = await self._build_ai_jobs(bucket[1])
-                await self._enqueue_ai_jobs(jobs)
-                del self._ai_buckets[key]
-                bucket = None
-            if bucket is None:
-                self._ai_buckets[key] = (now, [r])
-            else:
-                bucket[1].append(r)
-        if ready:
-            await self._enqueue_ai_jobs(ready)
-
-    async def _ai_aggregation_loop(self) -> None:
-        while not self.stop.is_set():
-            await asyncio.sleep(1)
-            try:
-                await self._flush_ai_buckets()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("Gagal memproses jendela agregasi AI; akan dicoba lagi")
-
-    async def _flush_ai_buckets(self, force: bool = False) -> None:
-        now = datetime.now(timezone.utc)
-        for key, (started, records) in list(self._ai_buckets.items()):
-            if force or (now - started).total_seconds() >= self.s.ai_aggregation_window_s:
-                jobs = await self._build_ai_jobs(records)
-                await self._enqueue_ai_jobs(jobs)
-                del self._ai_buckets[key]
-
-    async def _enqueue_ai_jobs(self, jobs: list[AIJob]) -> None:
-        skipped: list[AIJob] = []
-        for job in jobs:
-            try:  # prioritas: risk tertinggi diproses lebih dulu
-                self.ai_queue.put_nowait((-job.representative.risk_score, next(self._seq), job))
-            except asyncio.QueueFull:
-                skipped.append(job)
-        if skipped:
-            skipped_records = [r for job in skipped for r in job.records]
-            skipped_ids = [r.log_uuid for r in skipped_records]
-            skipped_ids.extend(job.aggregate_record.log_uuid for job in skipped if job.aggregate_record)
-            log.warning("Antrean AI penuh: %d log di-skip (overload)", len(skipped_records))
-            for job in skipped:
-                for record in job.records:
-                    self._to_iris(record, {"status": "skipped_overload"})
-            try:
-                await self.db.mark_many(skipped_ids, "skipped_overload")
-                await self._send_ai_updates(skipped_records, {"status": "skipped_overload"})
-            except Exception:
-                log.exception("Gagal mencatat skipped_overload")
-
-    async def _send_ai_updates(self, records: list[Record], ai: dict) -> None:
-        for offset in range(0, len(records), 200):
-            docs = [self._ai_doc(r, ai) for r in records[offset:offset + 200]]
-            if not await self.logstash.send(docs, attempts=5):
-                log.error("Gagal mengirim hasil AI untuk %d log ke Logstash", len(docs))
-
-    @staticmethod
-    def _ai_doc(r: Record, ai: dict) -> dict:
-        return {"event_type": "ai_analysis", "log_uuid": str(r.log_uuid),
-                "log_day": r.log_day, "ai": ai}
-
-    async def _ai_worker(self, n: int) -> None:
-        while True:
-            _, _, job = await self.ai_queue.get()
-            r = job.representative
-            log_uuids = [item.log_uuid for item in job.records]
-            if job.aggregate_record:
-                log_uuids.append(job.aggregate_record.log_uuid)
-            t0 = time.perf_counter()
-            try:
-                await self.db.update_ai_many(log_uuids, "running")
-                result, provider, model = await self.llm.analyze(str(r.log_uuid), job.doc)
-                ai = {"status": "done", "analysis": result, "provider": provider, "model": model,
-                      "duration_s": round(time.perf_counter() - t0, 2),
-                      "completed_at": datetime.now(timezone.utc).isoformat()}
-                if job.aggregated:
-                    ai["aggregation"] = {
-                        "count": len(job.records),
-                        "representative_log_uuid": str(r.log_uuid),
-                        "aggregate_log_uuid": str(job.aggregate_record.log_uuid) if job.aggregate_record else None,
-                        "related_log_uuids": [str(item.log_uuid) for item in job.records[:100]],
-                    }
-                await self.db.update_ai_many(log_uuids, "done", result)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                log.warning("AI gagal untuk %s: %s", r.log_uuid, type(exc).__name__)
-                ai = {"status": "failed", "error": type(exc).__name__, "providers": self.llm.label}
-                try:
-                    await self.db.update_ai_many(log_uuids, "failed")
-                except Exception:
-                    pass
-            try:
-                # Attach one shared analysis result to every original log document.
-                await self._send_ai_updates(job.records, ai)
-                for record in job.records:
-                    self._to_iris(record, ai)
-            finally:
-                self.ai_queue.task_done()
-
     # ---- DFIR-IRIS
-    def _to_iris(self, r: Record, ai: dict | None) -> None:
+    def _enqueue_iris(self, records: list[Record]) -> None:
+        for record in records:
+            self._to_iris(record)
+
+    def _to_iris(self, r: Record) -> None:
         if r.doc.get("data_source") in {"opencti", "glpi"}:
             return  # threat-intel and collector feedback enrich alerts; they are not alerts
         if not self.iris or r.risk_score < self.s.iris_min_risk or not self.iris.allows(r.doc):
             return
         try:
-            self.iris_queue.put_nowait((r, ai))
+            self.iris_queue.put_nowait(r)
         except asyncio.QueueFull:
             log.warning("Antrean IRIS penuh; alert %s tidak dikirim", r.log_uuid)
 
@@ -1179,7 +964,7 @@ class App:
         what = str(ev.get("action") or ev.get("category") or "unknown")[:80]
         return f"iris:dedup:{cls._who(doc)}:{what}"
 
-    async def _case_for(self, r: Record, ai: dict | None, alert_id: int) -> int | None:
+    async def _case_for(self, r: Record, alert_id: int) -> int | None:
         """Alert risk tinggi -> case. Alert dari sumber yang sama dalam jendela waktu digabung
         ke case yang sudah ada (bukan membuat case baru tiap alert)."""
         who = self._who(r.doc)
@@ -1196,7 +981,7 @@ class App:
                     return int(existing)
                 except httpx.HTTPStatusError:  # mis. case sudah ditutup -> buat case baru
                     await self.redis.delete(case_key)
-            case_id = await self.iris.escalate_alert(alert_id, r.doc, ai)
+            case_id = await self.iris.escalate_alert(alert_id, r.doc)
             if case_id is not None:
                 await self.redis.set(case_key, case_id, ex=self.s.iris_case_window_s)
             else:
@@ -1205,27 +990,20 @@ class App:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.error("Gagal eskalasi alert %s ke case: %s", alert_id, describe_error(exc))
+            log.error("Gagal eskalasi alert %s ke case: %s", alert_id, _error_label(exc))
             return None  # alert tetap ada, analis bisa eskalasi manual
         finally:
             if got_lock:
                 await self.redis.delete(lock)
 
-    async def _add_case_update_note(
-        self, case_id: int, r: Record, ai: dict | None
-    ) -> None:
+    async def _add_case_update_note(self, case_id: int, r: Record) -> None:
         observables = (r.doc.get("enrichment") or {}).get("observables") or []
-        note_hash = hashlib.sha256(
-            orjson.dumps(
-                {"observables": observables, "ai": ai},
-                option=orjson.OPT_SORT_KEYS,
-            )
-        ).hexdigest()
+        note_hash = hashlib.sha256(orjson.dumps(observables, option=orjson.OPT_SORT_KEYS)).hexdigest()
         note_key = f"iris:update-note:{case_id}:{note_hash}"
         if not await self.redis.set(note_key, "1", nx=True, ex=86400):
             return
         try:
-            await self.iris.add_case_note(case_id, r.doc, ai)
+            await self.iris.add_case_note(case_id, r.doc)
         except Exception:
             await self.redis.delete(note_key)
             raise
@@ -1234,25 +1012,19 @@ class App:
     async def _iris_worker(self) -> None:
         s = self.s
         while True:
-            r, ai = await self.iris_queue.get()
+            r = await self.iris_queue.get()
             key = self._dedup_key(r.doc)
             try:
                 alert_id, case_id = await self.db.get_iris_ids(r.log_uuid)
                 if alert_id is not None:
-                    await self.iris.update_alert(int(alert_id), r.doc, ai)
+                    await self.iris.update_alert(int(alert_id), r.doc)
                     log.info("IRIS alert %s diperbarui log=%s", alert_id, r.log_uuid)
-                    if case_id is not None and (
-                        (r.doc.get("enrichment") or {}).get("observables")
-                        or (ai and ai.get("status") != "running")
-                    ):
-                        await self._add_case_update_note(int(case_id), r, ai)
+                    if case_id is not None and (r.doc.get("enrichment") or {}).get("observables"):
+                        await self._add_case_update_note(int(case_id), r)
                     continue
                 if case_id is not None:
-                    if (
-                        (r.doc.get("enrichment") or {}).get("observables")
-                        or (ai and ai.get("status") != "running")
-                    ):
-                        await self._add_case_update_note(int(case_id), r, ai)
+                    if (r.doc.get("enrichment") or {}).get("observables"):
+                        await self._add_case_update_note(int(case_id), r)
                     continue
                 # cegah banjir: 1 item / (source, action) / window
                 if not await self.redis.set(key, "1", nx=True, ex=s.iris_dedup_s):
@@ -1260,18 +1032,18 @@ class App:
                 alert_id = case_id = None
                 try:
                     if s.iris_mode == "case":
-                        case_id = await self.iris.create_case(r.doc, ai)
+                        case_id = await self.iris.create_case(r.doc)
                     else:
-                        alert_id = await self.iris.create_alert(r.doc, ai)
+                        alert_id = await self.iris.create_alert(r.doc)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     await self.redis.delete(key)  # izinkan retry oleh event berikutnya
                     log.error("Gagal membuat %s IRIS %s: %s", "case" if s.iris_mode == "case" else "alert",
-                              r.log_uuid, describe_error(exc))
+                              r.log_uuid, _error_label(exc))
                     continue
                 if s.iris_mode == "alert_case" and alert_id and r.risk_score >= s.iris_case_min_risk:
-                    case_id = await self._case_for(r, ai, int(alert_id))
+                    case_id = await self._case_for(r, int(alert_id))
                 if alert_id is not None or case_id is not None:
                     await self.db.set_iris(r.log_uuid, int(alert_id) if alert_id else None,
                                            int(case_id) if case_id else None)

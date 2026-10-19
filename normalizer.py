@@ -1,7 +1,7 @@
 """
 normalizer.py - Adaptor skema per sumber -> skema internal.
 
-Skema internal (dibaca risk_calculator, iris_client, llm):
+Skema internal (dibaca risk_calculator dan iris_client):
   event.{severity,outcome,category,action}, source.ip, host.name, asset.{criticality,name},
   reputation.{score,ioc_match}, geolocation, domain.{name,age_days}, threat.base_weight
 
@@ -314,7 +314,7 @@ def normalize(source: str, payload: dict) -> dict:
         fn = norm_wazuh
     data = fn(payload) if fn else dict(payload)
     data.setdefault("data_source", source)
-    # Skema tidak dikenali: sertakan payload asli agar tetap terlihat di Logstash/AI/IRIS
+    # Skema tidak dikenali: sertakan payload asli agar tetap terlihat di Logstash/IRIS
     if "original" not in data and not any(k in data for k in KNOWN_KEYS):
         data["original"] = orjson.dumps(payload, default=str).decode()[:MAX_ORIGINAL_CHARS]
     return data

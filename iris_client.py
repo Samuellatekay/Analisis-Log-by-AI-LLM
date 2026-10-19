@@ -1,8 +1,8 @@
 """
 iris_client.py - Integrasi DFIR-IRIS (REST API: POST {IRIS_URL}/alerts/add, auth Bearer API key).
 
-Alert dibuat dari log berisiko tinggi, diperkaya hasil analisis AI. Severity IRIS ditentukan
-dari risk score (deterministik), BUKAN dari output AI. AI hanya memberi konteks untuk analis.
+Alert dibuat dari log berisiko tinggi dan konteks enrichment. Severity IRIS ditentukan
+secara deterministik dari risk score.
 """
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ def _short(v: Any, n: int = 300) -> str:
 
 
 def _md_escape(v: Any, n: int = 300) -> str:
-    """Teks dari log/AI tidak tepercaya: netralkan karakter markdown/HTML."""
+    """Teks dari log tidak tepercaya: netralkan karakter markdown/HTML."""
     s = _short(v, n)
     for ch in ("<", ">", "`", "|"):
         s = s.replace(ch, " ")
@@ -444,26 +444,16 @@ class IrisClient:
         return not (self.max_wazuh_level and lvl > self.max_wazuh_level)
 
     # ------------------------------------------------------------ payload
-    def build_payload(self, doc: dict, ai: dict | None) -> dict:
+    def build_payload(self, doc: dict) -> dict:
         risk, ev, src, asset = _d(doc.get("risk")), _d(doc.get("event")), _d(doc.get("source")), _d(doc.get("asset"))
         level = str(risk.get("level", "medium")).lower()
-        analysis = _d(_d(ai).get("analysis")) if ai and ai.get("status") == "done" else {}
         what = _md_escape(ev.get("action") or ev.get("category") or "event", 80)
         who = _md_escape(src.get("ip") or asset.get("name") or "unknown", 80)
-        verdict = analysis.get("verdict", "no-ai")
         host = _d(doc.get("host"))
         agent = _d(doc.get("agent"))
         agent_name = agent.get("name") or asset.get("agent_name") or host.get("name")
 
         lines = []
-        if analysis:
-            lines += ["## Ringkasan AI", _md_escape(analysis.get("summary", ""), 1500), "",
-                      f"**Verdict:** {verdict} (confidence {analysis.get('confidence', 0)})  "
-                      f"| **Model:** {_md_escape(_d(ai).get('provider', ''), 30)}/{_md_escape(_d(ai).get('model', ''), 60)}", ""]
-        elif _d(ai).get("status") in ("running", "pending"):
-            lines += ["_Analisis AI sedang berjalan; hasilnya akan ditambahkan ke alert ini._", ""]
-        else:
-            lines += [f"_Analisis AI tidak tersedia (status: {_md_escape(_d(ai).get('status', 'not_run'), 30)})._", ""]
         destination = _d(doc.get("destination"))
         source_asset = _d(src.get("asset")) or asset
         destination_asset = _d(destination.get("asset"))
@@ -539,18 +529,13 @@ class IrisClient:
                 lines.append(f"- {len(observables) - 20} IOC lainnya tersedia pada konten sumber alert.")
             if shown == 0:
                 lines.append("- Detail IOC tidak tersedia.")
-        if analysis.get("recommended_actions"):
-            lines += ["## Rekomendasi tindakan"] + [f"- {_md_escape(a)}" for a in analysis["recommended_actions"]] + [""]
-        if analysis.get("mitre_techniques"):
-            lines += ["## MITRE ATT&CK"] + [f"- {_md_escape(t, 100)}" for t in analysis["mitre_techniques"]] + [""]
         lines += ["", f"`log_uuid: {doc.get('log_uuid')}`"]
 
-        tags = ["ai-log-analyzer", f"risk:{level}", f"verdict:{verdict}"]
-        tags += [f"mitre:{str(t).split(' ')[0]}" for t in analysis.get("mitre_techniques", [])[:5]]
+        tags = ["analisis_log", f"risk:{level}"]
         payload: dict[str, Any] = {
             "alert_title": f"[{level.upper()}] {what} - {who}"[:250],
             "alert_description": "\n".join(lines)[:8000],
-            "alert_source": "Analisis-Log-AI",
+            "alert_source": "Analisis_Log",
             "alert_source_ref": str(doc.get("log_uuid")),
             "alert_source_content": doc,
             "alert_severity_id": self.severity_map.get(level, 4),
@@ -621,13 +606,13 @@ class IrisClient:
             return self._parse(r, path)
         return {}
 
-    async def create_alert(self, doc: dict, ai: dict | None) -> int | None:
+    async def create_alert(self, doc: dict) -> int | None:
         await self._ensure_ids()
-        d = await self._post(self.paths["alert"], self.build_payload(doc, ai))
+        d = await self._post(self.paths["alert"], self.build_payload(doc))
         return d.get("alert_id") or d.get("id")
 
-    async def update_alert(self, alert_id: int, doc: dict, ai: dict | None) -> None:
-        payload = self.build_payload(doc, ai)
+    async def update_alert(self, alert_id: int, doc: dict) -> None:
+        payload = self.build_payload(doc)
         update = {
             key: payload[key]
             for key in (
@@ -641,17 +626,17 @@ class IrisClient:
         else:
             await self._put(path, update)
 
-    async def create_case(self, doc: dict, ai: dict | None) -> int | None:
+    async def create_case(self, doc: dict) -> int | None:
         """Buat case langsung, tanpa alert."""
-        p = self.build_payload(doc, ai)
+        p = self.build_payload(doc)
         body = {"case_name": p["alert_title"][:250], "case_description": p["alert_description"],
                 "case_customer": self.customer_id, "case_soc_id": str(doc.get("log_uuid"))}
         d = await self._post(self.paths["case"], body)
         return d.get("case_id") or d.get("id")
 
-    async def add_case_note(self, case_id: int, doc: dict, ai: dict | None) -> None:
+    async def add_case_note(self, case_id: int, doc: dict) -> None:
         """Add newly correlated enrichment to an existing IRIS case."""
-        payload = self.build_payload(doc, ai)
+        payload = self.build_payload(doc)
         if self.api_version == "v2":
             directories_path = self.paths["case_note_directories"].format(id=case_id)
             response = await self._get(directories_path, {"per_page": 100, "page": 1})
@@ -670,7 +655,7 @@ class IrisClient:
             )
             if directory is None:
                 created = await self._post(directories_path, {
-                    "name": "Analisis-Log-AI Updates",
+                    "name": "Analisis_Log Updates",
                 })
                 directory = created.get("data", created)
                 if not isinstance(directory, dict) or not isinstance(directory.get("id"), int):
@@ -689,11 +674,11 @@ class IrisClient:
         path = self.paths["case_note"].format(id=case_id)
         await self._post(path, body)
 
-    async def escalate_alert(self, alert_id: int, doc: dict, ai: dict | None) -> int | None:
+    async def escalate_alert(self, alert_id: int, doc: dict) -> int | None:
         """Eskalasi alert menjadi case baru."""
-        p = self.build_payload(doc, ai)
+        p = self.build_payload(doc)
         body = {"iocs_import_list": [], "assets_import_list": [], "import_as_event": False,
-                "note": "Dieskalasi otomatis oleh Analisis-Log-AI (risk tinggi).",
+                "note": "Dieskalasi otomatis oleh Analisis_Log (risk tinggi).",
                 "case_title": p["alert_title"][:250], "case_tags": p["alert_tags"]}
         d = await self._post(self.paths["escalate"].format(id=alert_id), body)
         return d.get("case_id") or d.get("id")

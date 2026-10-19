@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""
-Cek semua koneksi dari DALAM container (jaringan yang sama dengan aplikasi):
-  docker compose run --rm app python check_connections.py          # cek cepat (tanpa biaya)
-  docker compose run --rm app python check_connections.py --live   # + uji analisis AI sungguhan
-
-Tidak mengirim data ke Logstash/Elasticsearch/IRIS (hanya GET) dan tidak mencetak password/API key.
-Exit code 0 = semua OK, 1 = ada yang GAGAL.
-"""
+"""Check application dependencies from inside the Docker network."""
 import argparse
 import asyncio
 import os
@@ -52,7 +45,6 @@ def explain(exc: Exception) -> str:
     return f"{n}: {hint}"
 
 
-# ------------------------------------------------------------------ pengecekan
 async def check_redis():
     url = E("REDIS_URL", "")
     if not url:
@@ -64,7 +56,7 @@ async def check_redis():
         await r.ping()
         ms = (time.perf_counter() - t) * 1000
         ver = (await r.info("server")).get("redis_version", "0")
-        k = f"healthcheck:{uuid.uuid4().hex[:8]}"  # uji izin untuk perintah yang dipakai aplikasi
+        k = f"healthcheck:{uuid.uuid4().hex[:8]}"
         await r.rpush(f"{k}:src", "a")
         await r.lmove(f"{k}:src", f"{k}:proc", "LEFT", "RIGHT")
         await r.set(f"{k}:s", "1", ex=30)
@@ -72,13 +64,12 @@ async def check_redis():
         await r.expire(f"{k}:n", 30)
         await r.delete(f"{k}:src", f"{k}:proc", f"{k}:s", f"{k}:n")
         lists = [x.strip() for x in E("REDIS_LISTS", "analysis-in").split(",") if x.strip()]
-        parts = []
-        for x in lists:
-            parts.append(f"{x}={await r.llen(x)}")
-        lens = ", ".join(parts)
+        lens = ", ".join(f"{name}={await r.llen(name)}" for name in lists)
         old = tuple(int(x) for x in ver.split(".")[:2]) < (6, 2)
-        return (WARN if old else OK), "Redis", tgt, \
-            f"v{ver}, {ms:.0f}ms, izin perintah OK, isi list: {lens}" + (" | BUTUH >= 6.2 (BLMOVE)" if old else "")
+        detail = f"v{ver}, {ms:.0f}ms, izin perintah OK, isi list: {lens}"
+        if old:
+            detail += " | BUTUH >= 6.2 (BLMOVE)"
+        return (WARN if old else OK), "Redis", tgt, detail
     except Exception as exc:
         return FAIL, "Redis", tgt, explain(exc)
     finally:
@@ -112,65 +103,17 @@ async def check_logstash():
         return FAIL, "Logstash", "-", "LOGSTASH_URL kosong"
     auth = (E("LOGSTASH_USER", ""), E("LOGSTASH_PASSWORD", "")) if E("LOGSTASH_USER") else None
     try:
-        async with httpx.AsyncClient(auth=auth, timeout=5) as c:
+        async with httpx.AsyncClient(auth=auth, timeout=5) as client:
             t = time.perf_counter()
-            r = await c.get(url)
+            response = await client.get(url)
         ms = (time.perf_counter() - t) * 1000
-        if r.status_code in (401, 403):
-            return FAIL, "Logstash", hostport(url), f"HTTP {r.status_code}: LOGSTASH_USER/PASSWORD salah"
-        if r.status_code < 500:
-            return OK, "Logstash", hostport(url), f"terjangkau (HTTP {r.status_code}, {ms:.0f}ms); tidak ada data dikirim"
-        return WARN, "Logstash", hostport(url), f"HTTP {r.status_code}"
+        if response.status_code in (401, 403):
+            return FAIL, "Logstash", hostport(url), f"HTTP {response.status_code}: LOGSTASH_USER/PASSWORD salah"
+        if response.status_code < 500:
+            return OK, "Logstash", hostport(url), f"terjangkau (HTTP {response.status_code}, {ms:.0f}ms); tidak ada data dikirim"
+        return WARN, "Logstash", hostport(url), f"HTTP {response.status_code}"
     except Exception as exc:
         return FAIL, "Logstash", hostport(url), explain(exc)
-
-
-async def _get(url, headers=None, timeout=10):
-    async with httpx.AsyncClient(timeout=timeout) as c:
-        return await c.get(url, headers=headers)
-
-
-async def check_llm(name: str):
-    n = name.lower()
-    try:
-        if n == "ollama":
-            base, model = E("OLLAMA_URL", "http://localhost:11434").rstrip("/"), E("OLLAMA_MODEL", "llama3.1:8b")
-            r = await _get(f"{base}/api/tags")
-            r.raise_for_status()
-            names = [m.get("name", "") for m in r.json().get("models", [])]
-            ok = model in names or f"{model}:latest" in names
-            return (OK if ok else FAIL), "AI: Ollama", hostport(base), \
-                f"model {model} " + ("tersedia" if ok else f"TIDAK ADA -> jalankan: ollama pull {model}")
-        if n in ("gemini", "google"):
-            key, model = E("GEMINI_API_KEY", ""), E("GEMINI_MODEL", "gemini-2.0-flash")
-            if not key:
-                return FAIL, "AI: Gemini", "-", "GEMINI_API_KEY kosong"
-            base = E("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
-            r = await _get(f"{base}/models/{model}", {"x-goog-api-key": key})
-        elif n == "openai":
-            key, model = E("OPENAI_API_KEY", ""), E("OPENAI_MODEL", "gpt-4o-mini")
-            if not key:
-                return FAIL, "AI: OpenAI", "-", "OPENAI_API_KEY kosong"
-            base = E("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-            r = await _get(f"{base}/models/{model}", {"Authorization": f"Bearer {key}"})
-        elif n in ("anthropic", "claude"):
-            key, model = E("ANTHROPIC_API_KEY", ""), E("ANTHROPIC_MODEL", "claude-haiku-5-5")
-            if not key:
-                return FAIL, "AI: Claude", "-", "ANTHROPIC_API_KEY kosong"
-            base = "https://api.anthropic.com"
-            r = await _get(f"{base}/v1/models/{model}", {"x-api-key": key, "anthropic-version": "2023-06-01"})
-        else:
-            return FAIL, f"AI: {name}", "-", "provider tidak dikenal"
-        label = {"google": "Gemini", "gemini": "Gemini", "openai": "OpenAI", "anthropic": "Claude", "claude": "Claude"}[n]
-        if r.status_code == 200:
-            return OK, f"AI: {label}", hostport(base), f"API key valid, model {model} tersedia"
-        if r.status_code in (400, 401, 403):
-            return FAIL, f"AI: {label}", hostport(base), f"HTTP {r.status_code}: API key salah / tidak punya akses"
-        if r.status_code == 404:
-            return FAIL, f"AI: {label}", hostport(base), f"model '{model}' tidak ditemukan -> cek nama model"
-        return WARN, f"AI: {label}", hostport(base), f"HTTP {r.status_code}"
-    except Exception as exc:
-        return FAIL, f"AI: {name}", "-", explain(exc)
 
 
 async def check_iris():
@@ -179,121 +122,106 @@ async def check_iris():
     tgt = hostport(E("IRIS_URL", ""))
     try:
         from iris_client import IrisClient
-        c = IrisClient.from_env(os.environ)
+        client = IrisClient.from_env(os.environ)
         try:
             t = time.perf_counter()
-            st, detail = await c.check()
+            status, detail = await client.check()
             ms = (time.perf_counter() - t) * 1000
         finally:
-            await c.aclose()
-        status = {"OK": OK, "GAGAL": FAIL}.get(st, WARN)
-        return status, "DFIR-IRIS", tgt, f"{detail} ({ms:.0f}ms), mode={E('IRIS_MODE', 'alert')}"
+            await client.aclose()
+        mapped = {"OK": OK, "GAGAL": FAIL}.get(status, WARN)
+        return mapped, "DFIR-IRIS", tgt, f"{detail} ({ms:.0f}ms), mode={E('IRIS_MODE', 'alert')}"
     except Exception as exc:
         return FAIL, "DFIR-IRIS", tgt, explain(exc)
 
 
 async def iris_ids():
-    """Tampilkan ID severity & status alert di IRIS agar IRIS_STATUS_ID / IRIS_SEVERITY_MAP bisa diisi."""
+    """Show IRIS severity and alert-status IDs."""
     try:
         from iris_client import IrisClient
-        c = IrisClient.from_env(os.environ)
-        if c is None:
+        client = IrisClient.from_env(os.environ)
+        if client is None:
             return SKIP, "IRIS ID", "-", "IRIS_ENABLED=false"
         try:
-            sev, sts = await c.list_ids()
+            severities, statuses = await client.list_ids()
         finally:
-            await c.aclose()
-        f = lambda xs: ", ".join(f"{i}={n}" for i, n in xs) or "tidak terbaca otomatis (lihat UI IRIS: Advanced)"
-        return OK, "IRIS ID", "-", f"severity: {f(sev)} | status alert: {f(sts)}"
+            await client.aclose()
+        fmt = lambda values: ", ".join(f"{i}={name}" for i, name in values) or "tidak terbaca otomatis (lihat UI IRIS: Advanced)"
+        return OK, "IRIS ID", "-", f"severity: {fmt(severities)} | status alert: {fmt(statuses)}"
     except Exception as exc:
         return FAIL, "IRIS ID", "-", explain(exc)
 
 
 async def iris_selftest(with_case: bool):
-    """MEMBUAT objek uji sungguhan di IRIS (1 alert, + 1 case jika with_case)."""
+    """Create one real test alert and optionally escalate it to a case."""
     try:
         from iris_client import IrisClient
-        from llm_analyzer import describe_error
-        c = IrisClient.from_env(os.environ)
-        if c is None:
+        client = IrisClient.from_env(os.environ)
+        if client is None:
             return SKIP, "IRIS uji", "-", "IRIS_ENABLED=false"
-        doc = {"log_uuid": "test-" + uuid.uuid4().hex[:8], "event": {"action": "koneksi-uji", "outcome": "success",
-               "category": ["test"], "severity": 1}, "source": {"ip": "203.0.113.1"},
-               "risk": {"score": 30, "level": "low", "asset_criticality": 1, "event_severity": 1,
-                        "event_outcome": 1, "threat_weight": 1, "repeat_count": 0}}
+        doc = {
+            "log_uuid": "test-" + uuid.uuid4().hex[:8],
+            "event": {"action": "koneksi-uji", "outcome": "success", "category": ["test"], "severity": 1},
+            "source": {"ip": "203.0.113.1"},
+            "risk": {"score": 30, "level": "low", "asset_criticality": 1,
+                     "event_severity": 1, "event_outcome": 1, "threat_weight": 1, "repeat_count": 0},
+        }
         try:
-            alert_id = await c.create_alert(doc, None)
+            alert_id = await client.create_alert(doc)
             msg = f"alert_id={alert_id}"
             if with_case:
                 if alert_id is None:
                     return FAIL, "IRIS uji", "-", "alert dibuat tapi ID tak terbaca dari respons"
-                msg += f", case_id={await c.escalate_alert(int(alert_id), doc, None)}"
+                msg += f", case_id={await client.escalate_alert(int(alert_id), doc)}"
         finally:
-            await c.aclose()
+            await client.aclose()
         return OK, "IRIS uji", "-", msg + "  -> HAPUS objek uji ini di IRIS"
     except Exception as exc:
-        from llm_analyzer import describe_error
-        return FAIL, "IRIS uji", "-", describe_error(exc) + " (lihat baris 'IRIS ... HTTP' di atas untuk alasan dari server)"
-
-
-async def check_live(name: str):
-    """Analisis AI sungguhan (memakai token / waktu)."""
-    try:
-        from llm_analyzer import build_analyzer
-        chain = build_analyzer({**os.environ, "LLM_PROVIDERS": name}, E("PERSONA_PATH", "soc_persona.md"))
-        doc = {"event": {"action": "ssh-bruteforce", "outcome": "failure", "severity": 4},
-               "source": {"ip": "198.51.100.77"}, "risk": {"score": 70, "level": "high"}}
-        t = time.perf_counter()
-        res, prov, model = await asyncio.wait_for(chain.analyze("test-" + uuid.uuid4().hex[:6], doc), 180)
-        await chain.aclose()
-        return OK, f"LIVE {prov}", model, f"{time.perf_counter() - t:.1f}s, verdict={res['verdict']}, parse_warning={res.get('parse_warning', False)}"
-    except Exception as exc:
-        return FAIL, f"LIVE {name}", "-", explain(exc)
+        return FAIL, "IRIS uji", "-", explain(exc) + " (lihat baris 'IRIS ... HTTP' di atas untuk alasan dari server)"
 
 
 def config_warnings() -> list[str]:
-    w = []
+    warnings = []
     lists = {x.strip() for x in E("REDIS_LISTS", "").split(",")}
     if E("REDIS_MODE", "list") == "list" and lists & PROD_LISTS:
-        w.append(f"REDIS_LISTS memuat list produksi {sorted(lists & PROD_LISTS)}: pastikan Logstash TIDAK lagi BLPOP list itu.")
+        warnings.append(f"REDIS_LISTS memuat list produksi {sorted(lists & PROD_LISTS)}: pastikan Logstash TIDAK lagi BLPOP list itu.")
     if urlparse(E("POSTGRES_DSN", "")).hostname not in ("postgres", None):
-        w.append("POSTGRES_DSN bukan host 'postgres' (service compose). Benar hanya jika memakai DB eksternal.")
+        warnings.append("POSTGRES_DSN bukan host 'postgres' (service compose). Benar hanya jika memakai DB eksternal.")
     if urlparse(E("LOGSTASH_URL", "")).hostname in ("localhost", "127.0.0.1"):
-        w.append("LOGSTASH_URL = localhost: di dalam container itu artinya container app sendiri. Pakai IP/host Logstash.")
+        warnings.append("LOGSTASH_URL = localhost: di dalam container itu artinya container app sendiri. Pakai IP/host Logstash.")
     if urlparse(E("REDIS_URL", "")).hostname in ("localhost", "127.0.0.1"):
-        w.append("REDIS_URL = localhost: di dalam container itu artinya container app sendiri. Pakai IP Redis.")
-    return w
+        warnings.append("REDIS_URL = localhost: di dalam container itu artinya container app sendiri. Pakai IP Redis.")
+    return warnings
 
 
 async def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--live", action="store_true", help="uji analisis AI sungguhan (memakai token/waktu)")
-    ap.add_argument("--iris-ids", action="store_true", help="tampilkan ID severity & status alert di IRIS")
-    ap.add_argument("--iris-test", action="store_true", help="BUAT 1 alert uji di IRIS")
-    ap.add_argument("--iris-test-case", action="store_true", help="BUAT 1 alert uji + eskalasi jadi case")
-    a = ap.parse_args()
-    providers = [x.strip() for x in E("LLM_PROVIDERS", "ollama").split(",") if x.strip()]
-    tasks = [check_redis(), check_postgres(), check_logstash(), check_iris()] + [check_llm(p) for p in providers]
-    if a.live:
-        tasks += [check_live(p) for p in providers]
-    if a.iris_ids:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--iris-ids", action="store_true", help="tampilkan ID severity & status alert di IRIS")
+    parser.add_argument("--iris-test", action="store_true", help="BUAT 1 alert uji di IRIS")
+    parser.add_argument("--iris-test-case", action="store_true", help="BUAT 1 alert uji + eskalasi jadi case")
+    args = parser.parse_args()
+    tasks = [check_redis(), check_postgres(), check_logstash(), check_iris()]
+    if args.iris_ids:
         tasks.append(iris_ids())
-    if a.iris_test or a.iris_test_case:
-        tasks.append(iris_selftest(a.iris_test_case))
-    results = await asyncio.gather(*[asyncio.wait_for(t, 200) for t in tasks], return_exceptions=True)
+    if args.iris_test or args.iris_test_case:
+        tasks.append(iris_selftest(args.iris_test_case))
+    results = await asyncio.gather(
+        *[asyncio.wait_for(task, 200) for task in tasks],
+        return_exceptions=True,
+    )
     print(f"\n{'STATUS':8} {'KOMPONEN':14} {'TARGET':28} DETAIL\n" + "-" * 100)
-    bad = 0
-    for r in results:
-        if isinstance(r, Exception):
-            r = (FAIL, "?", "-", explain(r))
-        st, name, tgt, detail = r
-        bad += st == FAIL
-        print(f"[{st:^6}] {name:14} {tgt:28} {detail}")
-    for w in config_warnings():
-        print(f"[ CEK  ] Konfigurasi: {w}")
+    failures = 0
+    for result in results:
+        if isinstance(result, Exception):
+            result = (FAIL, "?", "-", explain(result))
+        status, name, target, detail = result
+        failures += status == FAIL
+        print(f"[{status:^6}] {name:14} {target:28} {detail}")
+    for warning in config_warnings():
+        print(f"[ CEK  ] Konfigurasi: {warning}")
     print("-" * 100)
-    print("SEMUA KONEKSI OK" if not bad else f"{bad} KOMPONEN GAGAL - perbaiki sesuai petunjuk di kolom DETAIL")
-    return 1 if bad else 0
+    print("SEMUA KONEKSI OK" if not failures else f"{failures} KOMPONEN GAGAL - perbaiki sesuai petunjuk di kolom DETAIL")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
