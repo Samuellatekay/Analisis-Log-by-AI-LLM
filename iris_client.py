@@ -149,7 +149,10 @@ def _format_reputation(value: Any, observables: list | None = None) -> list[str]
             lines.append(f"- **AbuseIPDB:** tidak ada temuan{suffix} (sumber: {provider}).")
     elif "abuseipdb" in reputation:
         status = _display(provider_status.get("abuseipdb"), 120)
-        if status and "hasil lookup tidak disertakan" not in status.lower():
+        if status and not any(
+            message in status.lower()
+            for message in ("hasil lookup tidak disertakan", "api key belum dikonfigurasi")
+        ):
             lines.append(f"- **AbuseIPDB:** {status}.")
 
     vt = reputation.get("virustotal")
@@ -166,7 +169,10 @@ def _format_reputation(value: Any, observables: list | None = None) -> list[str]
             lines.append(f"- **VirusTotal:** data tersedia, ringkasan deteksi tidak tersedia (sumber: {provider}{suffix}).")
     elif "virustotal" in reputation:
         status = _display(provider_status.get("virustotal"), 120)
-        if status and "hasil lookup tidak disertakan" not in status.lower():
+        if status and not any(
+            message in status.lower()
+            for message in ("hasil lookup tidak disertakan", "api key belum dikonfigurasi")
+        ):
             lines.append(f"- **VirusTotal:** {status}.")
 
     return lines or ["- Data reputasi belum tersedia."]
