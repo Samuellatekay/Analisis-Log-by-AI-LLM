@@ -831,7 +831,7 @@ class App:
         normalized_type = entity_type.lower()
         normalized_value = normalize_ioc_value(normalized_type, value)
         identity = f"{normalized_type}\0{normalized_value}"
-        return f"analysis:enrichment:{hashlib.sha256(identity.encode()).hexdigest()}"
+        return f"analysis:enrichment:v2:{hashlib.sha256(identity.encode()).hexdigest()}"
 
     async def _handle_enrichment_batch(
         self, items: list[Item], ack: Callable[[], Awaitable]
