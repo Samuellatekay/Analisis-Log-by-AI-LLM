@@ -12,10 +12,9 @@ ke Logstash, dan mengirim alert berisiko ke DFIR-IRIS.
    `risk_calculator.py`.
 3. Dokumen disimpan di PostgreSQL, diteruskan ke Logstash, dan diproses untuk
    pengiriman ke IRIS sesuai ambang risiko dan level Wazuh.
-4. Alert Wazuh meminta lookup GLPI melalui `outbound-glpi` berdasarkan IP sumber
-   dan tujuan. Jika IP sumber tidak tersedia, nama host/agent dipakai sebagai
-   fallback untuk mencari aset sensor yang melaporkan event. Collector menerbitkan
-   hasilnya ke `enrichment-events`.
+4. Alert Wazuh meminta lookup GLPI melalui `outbound-glpi` berdasarkan IP sumber,
+   IP tujuan, dan hostname agent untuk mengenali aset sensor yang melaporkan event.
+   Hasilnya diterbitkan ke `enrichment-events`.
 5. Data enrichment yang datang kemudian digabung ke record PostgreSQL dan
    Logstash. Alert atau case IRIS yang sudah ada diperbarui dengan konteks baru.
 
@@ -25,17 +24,20 @@ list tersebut.
 
 ## GLPI dan OpenCTI
 
-Lookup aset dijadwalkan untuk IP sumber dan tujuan pada event Wazuh. Jika IP
-sumber tidak ada, collector mencoba pencarian Computer GLPI dengan nama host
-yang sama persis dan hanya menerima hasil yang unik. Hasilnya dipasangkan ke
-aset host/agent yang melaporkan event, bukan dianggap sebagai IP penyerang.
-Informasi aset yang tersedia dapat mencakup nama, pemilik, serial, sistem operasi,
-status, dan lokasi.
+Lookup aset dijadwalkan untuk IP sumber dan tujuan pada event Wazuh serta nama
+Computer GLPI yang sama persis dengan hostname agent. Hasil hostname hanya
+ditampilkan sebagai aset host pelapor/sensor (atau host tujuan bila IP sumber
+tidak ada), bukan dianggap sebagai IP penyerang. Hasil hostname ambigu ditolak.
+Informasi aset yang tersedia dapat mencakup nama, semua alamat IP terkait, pemilik,
+serial, nomor inventaris, sistem operasi, status, lokasi, tipe, produsen, model,
+entity/grup, kontak, catatan, dan tanggal inventaris, selama kolom tersebut terisi
+di GLPI.
 
 Lookup OpenCTI dijadwalkan untuk IP sumber/tujuan, domain, dan hash file yang
-terekstrak dari alert Wazuh. GLPI dicari berdasarkan IP sumber/tujuan, dengan
-fallback hostname untuk host pelapor bila IP sumber tidak ada. Hanya record yang
-cocok dengan IOC/hostname alert yang digabungkan; daftar inventaris atau feed
+terekstrak dari alert Wazuh. GLPI dicari berdasarkan IP sumber/tujuan dan hostname
+agent yang cocok persis. Hasil hostname dilaporkan sebagai aset sensor, bukan
+sebagai IP sumber atau penyerang. Hanya record yang cocok dengan IOC/hostname alert
+yang digabungkan; daftar inventaris atau feed
 OpenCTI yang tidak terkait tidak disalin ke alert. Reputasi, geolokasi, data
 indicator/observable yang cocok, referensi intel, status connector, dan seluruh
 aset GLPI yang cocok disimpan di konten sumber IRIS; ringkasan ditampilkan di

@@ -253,26 +253,53 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any) -> list[str]:
             asset_id = _display(item.get("id"), 80)
             label = f"GLPI #{asset_id}" if asset_id else f"GLPI {index}"
             lines.append(f"- **Aset {label}:**")
+            ip_addresses = item.get("ip_addresses")
+            if isinstance(ip_addresses, list):
+                ip_addresses = ", ".join(
+                    str(value).strip() for value in ip_addresses
+                    if isinstance(value, str) and value.strip()
+                )
             fields = (
                 ("Nama", item.get("name")),
-                ("IP", item.get("ip") or source_ip),
+                ("Alamat IP", ip_addresses or item.get("ip") or source_ip),
                 ("Pemilik", item.get("owner") or item.get("user")),
                 ("Serial", item.get("serial_number")),
+                ("Nomor inventaris", item.get("asset_tag")),
                 ("Sistem operasi", item.get("operating_system")),
                 ("Status", item.get("status")),
                 ("Lokasi", item.get("location")),
                 ("Tipe", item.get("type")),
+                ("Produsen", item.get("manufacturer")),
+                ("Model", item.get("model")),
+                ("Entitas GLPI", item.get("entity")),
+                ("Grup", item.get("group")),
+                ("Kontak", item.get("contact")),
+                ("Nomor kontak", item.get("contact_number")),
+                ("Dibuat", item.get("created_at")),
+                ("Terakhir diperbarui", item.get("updated_at")),
+                ("Tanggal pembelian", item.get("purchase_date")),
             )
             lines.extend(
                 f"  - **{field}:** {_md_escape(value, 180)}"
                 for field, value in fields if _display(value, 180)
             )
+            description = _display(item.get("description"), 400)
+            if description:
+                lines.append(f"  - **Catatan GLPI:** {_md_escape(description, 400)}")
         if len(assets) > 10:
             lines.append(
                 f"- {len(assets) - 10} aset GLPI lainnya tersedia di konten sumber alert."
             )
         if not lines:
             lines = ["- Data aset ditemukan, tetapi detailnya kosong."]
+        matched_by = _display(asset.get("matched_by"), 40)
+        matched_value = _display(asset.get("matched_value"), 180)
+        if matched_by and matched_value:
+            match_label = "IP" if matched_by == "ip" else "hostname"
+            lines.insert(
+                0,
+                f"- **Cocok berdasarkan:** {match_label} `{_md_escape(matched_value, 180)}`",
+            )
 
     if host_name and _display(host_name, 160):
         lines.append(f"- **Hostname Wazuh:** {_md_escape(host_name, 160)}")
@@ -482,6 +509,7 @@ class IrisClient:
         who = _md_escape(src.get("ip") or asset.get("name") or "unknown", 80)
         host = _d(doc.get("host"))
         agent = _d(doc.get("agent"))
+        agent_asset = _d(agent.get("asset"))
         agent_name = agent.get("name") or asset.get("agent_name") or host.get("name")
 
         lines = []
@@ -524,7 +552,11 @@ class IrisClient:
             ),
             "",
             "## Aset tujuan / penerima serangan",
-            *_format_asset(destination_asset, destination.get("ip"), None),
+            *(
+                ["- Alert Wazuh tidak mencantumkan IP tujuan; aset tujuan belum dapat dicari di GLPI."]
+                if is_wazuh and not destination_ip and not destination_asset else
+                _format_asset(destination_asset, destination.get("ip"), None)
+            ),
             "",
             "## Agent Wazuh (sensor yang melaporkan event)",
             f"- **Nama:** {_display(agent_name, 160) or 'Tidak tersedia'}",
@@ -532,6 +564,14 @@ class IrisClient:
             f"- **IP agent:** {_display(agent.get('ip'), 80) or ('Tidak dikirim di event Wazuh' if is_wazuh else 'Tidak tersedia')}",
             f"- **Manager:** {_display(agent.get('manager'), 160) or 'Tidak tersedia'}",
             f"- **IP manager:** {_display(agent.get('manager_ip'), 80) or ('Tidak dikirim di event Wazuh' if is_wazuh else 'Tidak tersedia')}",
+            *(
+                [
+                    "",
+                    "## Aset host pelapor / sensor (GLPI)",
+                    *_format_asset(agent_asset, agent.get("ip"), None),
+                ]
+                if agent_asset else []
+            ),
             "",
             "## Intelijen ancaman",
             *_format_reputation(doc.get("reputation"), observables),

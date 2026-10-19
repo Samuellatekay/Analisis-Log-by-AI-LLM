@@ -157,6 +157,13 @@ ALTER TABLE log_events ADD COLUMN IF NOT EXISTS iris_alert_id INTEGER;
 ALTER TABLE log_events ADD COLUMN IF NOT EXISTS iris_case_id INTEGER;
 """
 
+GLPI_ASSET_FIELDS = (
+    "id", "name", "ip", "ip_addresses", "owner", "user", "serial_number", "asset_tag",
+    "operating_system", "status", "location", "type", "manufacturer", "model",
+    "entity", "group", "contact", "contact_number", "description",
+    "created_at", "updated_at", "purchase_date",
+)
+
 
 def merge_enrichment(target: dict, event: dict) -> None:
     entity_type = str(event.get("entity_type") or "").lower()
@@ -214,15 +221,13 @@ def merge_enrichment(target: dict, event: dict) -> None:
         if glpi_asset:
             glpi_details = {
                 key: glpi_asset[key]
-                for key in ("id", "name", "ip", "owner", "user", "serial_number",
-                            "operating_system", "status", "location", "type")
+                for key in GLPI_ASSET_FIELDS
                 if glpi_asset.get(key) not in (None, "")
             }
             all_glpi_details = [
                 {
                     key: item[key]
-                    for key in ("id", "name", "ip", "owner", "user", "serial_number",
-                                "operating_system", "status", "location", "type")
+                    for key in GLPI_ASSET_FIELDS
                     if item.get(key) not in (None, "")
                 }
                 for item in glpi_assets
@@ -230,6 +235,8 @@ def merge_enrichment(target: dict, event: dict) -> None:
             side_asset = {
                 "found": True,
                 "inventory_source": "GLPI",
+                "matched_by": "ip",
+                "matched_value": value,
                 "items": all_glpi_details,
                 **glpi_details,
             }
@@ -296,19 +303,43 @@ def merge_enrichment(target: dict, event: dict) -> None:
             agent_ip = agent.get("ip")
             source = target.get("source")
             source = source if isinstance(source, dict) else {}
+            if source.get("ip"):
+                if glpi_asset:
+                    details = {
+                        key: glpi_asset[key]
+                        for key in GLPI_ASSET_FIELDS
+                        if glpi_asset.get(key) not in (None, "")
+                    }
+                    agent["asset"] = {
+                        "found": True,
+                        "inventory_source": "GLPI",
+                        "matched_by": "hostname",
+                        "matched_value": value,
+                        "items": [details],
+                        **details,
+                    }
+                elif isinstance(asset_result, dict) and asset_result.get("found") is False:
+                    agent["asset"] = {
+                        "found": False,
+                        "host_name": value,
+                        "error": asset_result.get("error"),
+                    }
+                target["agent"] = agent
             if not source.get("ip") and (
                 not destination_ip or (agent_ip and destination_ip == agent_ip)
             ):
                 if glpi_asset:
                     details = {
                         key: glpi_asset[key]
-                        for key in ("name", "ip", "owner", "user", "serial_number",
-                                    "operating_system", "status", "location", "type")
+                        for key in GLPI_ASSET_FIELDS
                         if glpi_asset.get(key) not in (None, "")
                     }
                     destination["asset"] = {
                         "found": True,
                         "inventory_source": "GLPI",
+                        "matched_by": "hostname",
+                        "matched_value": value,
+                        "items": [details],
                         **details,
                     }
                 elif isinstance(asset_result, dict) and asset_result.get("found") is False:
@@ -855,7 +886,6 @@ class App:
     @staticmethod
     def _alert_iocs(data: dict) -> list[tuple[str, str]]:
         iocs: set[tuple[str, str]] = set()
-        has_source_ip = False
         for side_name in ("source", "destination"):
             side = data.get(side_name) if isinstance(data.get(side_name), dict) else {}
             side_ip = side.get("ip")
@@ -864,17 +894,14 @@ class App:
                     parsed_ip = ipaddress.ip_address(side_ip)
                     entity_type = "IPv4-Addr" if parsed_ip.version == 4 else "IPv6-Addr"
                     iocs.add((entity_type, str(parsed_ip)))
-                    if side_name == "source":
-                        has_source_ip = True
                 except ValueError:
                     pass
 
-        if not has_source_ip:
-            host = data.get("host") if isinstance(data.get("host"), dict) else {}
-            agent = data.get("agent") if isinstance(data.get("agent"), dict) else {}
-            host_name = host.get("name") or agent.get("name")
-            if isinstance(host_name, str) and host_name.strip():
-                iocs.add(("Host-Name", host_name.strip()))
+        host = data.get("host") if isinstance(data.get("host"), dict) else {}
+        agent = data.get("agent") if isinstance(data.get("agent"), dict) else {}
+        host_name = host.get("name") or agent.get("name")
+        if isinstance(host_name, str) and host_name.strip():
+            iocs.add(("Host-Name", host_name.strip()))
 
         file_data = data.get("file") if isinstance(data.get("file"), dict) else {}
         hashes = file_data.get("hash") if isinstance(file_data.get("hash"), dict) else {}
@@ -990,9 +1017,6 @@ class App:
                     log.exception("Gagal mengantrekan lookup OpenCTI type=%s value=%s",
                                   entity_type, value)
 
-            source = event.get("source") if isinstance(event.get("source"), dict) else {}
-            if source.get("ip"):
-                continue
             host = event.get("host") if isinstance(event.get("host"), dict) else {}
             agent = event.get("agent") if isinstance(event.get("agent"), dict) else {}
             host_name = host.get("name") or agent.get("name")
