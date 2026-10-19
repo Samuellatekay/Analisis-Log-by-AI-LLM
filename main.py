@@ -250,7 +250,11 @@ def merge_enrichment(target: dict, event: dict) -> None:
             }
             side_asset = {"found": True, "inventory_source": "GLPI", **glpi_details}
         elif isinstance(asset_result, dict) and asset_result.get("found") is False:
-            side_asset = {"found": False, "error": asset_result.get("error")}
+            side_asset = {
+                "found": False,
+                "ip": value,
+                "error": asset_result.get("error"),
+            }
         else:
             side_asset = None
 

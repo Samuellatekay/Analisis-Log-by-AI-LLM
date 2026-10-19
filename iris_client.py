@@ -355,7 +355,12 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any) -> list[str]:
         if error:
             message = f"Pencarian aset GLPI gagal: {error}."
         elif asset.get("found") is False:
-            message = "Tidak ada aset GLPI yang cocok dengan IP ini."
+            searched_ip = _display(asset.get("ip"), 80)
+            message = (
+                f"Tidak ada aset GLPI yang cocok dengan IP {searched_ip}."
+                if searched_ip else
+                "Tidak ada aset GLPI yang cocok dengan IP ini."
+            )
         else:
             message = "Data aset GLPI belum tersedia."
         lines = [f"- {message}"]
