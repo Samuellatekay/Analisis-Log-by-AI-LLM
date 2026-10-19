@@ -369,24 +369,177 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any) -> list[str]:
             message = "Data aset GLPI belum tersedia."
         lines = [f"- {message}"]
     else:
-        fields = (
-            ("Nama", asset.get("name")),
-            ("IP", asset.get("ip") or source_ip),
-            ("Pemilik", asset.get("owner") or asset.get("user")),
-            ("Serial", asset.get("serial_number")),
-            ("Sistem operasi", asset.get("operating_system")),
-            ("Status", asset.get("status")),
-            ("Lokasi", asset.get("location")),
-            ("Tipe", asset.get("type")),
-        )
-        lines = [f"- **{label}:** {_md_escape(value, 180)}"
-                 for label, value in fields if _display(value, 180)]
+        assets = asset.get("items")
+        if not isinstance(assets, list) or not assets:
+            assets = [asset]
+        lines = []
+        for index, item in enumerate(assets[:10], start=1):
+            if not isinstance(item, dict):
+                continue
+            asset_id = _display(item.get("id"), 80)
+            label = f"GLPI #{asset_id}" if asset_id else f"GLPI {index}"
+            lines.append(f"- **Aset {label}:**")
+            fields = (
+                ("Nama", item.get("name")),
+                ("IP", item.get("ip") or source_ip),
+                ("Pemilik", item.get("owner") or item.get("user")),
+                ("Serial", item.get("serial_number")),
+                ("Sistem operasi", item.get("operating_system")),
+                ("Status", item.get("status")),
+                ("Lokasi", item.get("location")),
+                ("Tipe", item.get("type")),
+            )
+            lines.extend(
+                f"  - **{field}:** {_md_escape(value, 180)}"
+                for field, value in fields if _display(value, 180)
+            )
+        if len(assets) > 10:
+            lines.append(
+                f"- {len(assets) - 10} aset GLPI lainnya tersedia di konten sumber alert."
+            )
         if not lines:
             lines = ["- Data aset ditemukan, tetapi detailnya kosong."]
 
     if host_name and _display(host_name, 160):
         lines.append(f"- **Hostname Wazuh:** {_md_escape(host_name, 160)}")
     return lines
+
+
+def _format_opencti_matches(doc: dict, observables: list) -> list[str]:
+    contexts = [_d(doc.get("opencti"))]
+    contexts.extend(
+        _d(item.get("opencti")) for item in observables if isinstance(item, dict)
+    )
+    seen_observables = set()
+    seen_indicators = set()
+    seen_locations = set()
+    matched_observables = []
+    indicators = []
+    locations = []
+    for context in contexts:
+        observable = context.get("observable")
+        if isinstance(observable, dict):
+            key = (observable.get("entity_type"), observable.get("value"), observable.get("id"))
+            if key not in seen_observables:
+                seen_observables.add(key)
+                matched_observables.append(observable)
+        for indicator in context.get("indicators", []):
+            if not isinstance(indicator, dict):
+                continue
+            key = indicator.get("id") or (
+                indicator.get("name"), indicator.get("pattern")
+            )
+            if key not in seen_indicators:
+                seen_indicators.add(key)
+                indicators.append(indicator)
+        for location in context.get("locations", []):
+            if not isinstance(location, dict):
+                continue
+            key = (
+                location.get("type"), location.get("name"),
+                location.get("latitude"), location.get("longitude"),
+            )
+            if key not in seen_locations:
+                seen_locations.add(key)
+                locations.append(location)
+
+    lines = []
+    for observable in matched_observables[:20]:
+        entity_type = _display(observable.get("entity_type"), 40)
+        value = _display(observable.get("value"), 180)
+        if entity_type and value:
+            lines.append(f"- **Observable:** {entity_type} `{_md_escape(value, 180)}`")
+            if observable.get("id"):
+                lines.append(f"  - **OpenCTI ID:** {_md_escape(observable['id'], 120)}")
+            for label, field, limit in (
+                ("Nama", "name", 120),
+                ("Dibuat", "created_at", 80),
+                ("Diubah", "updated_at", 80),
+                ("Deskripsi", "description", 240),
+            ):
+                detail = _display(observable.get(field), limit)
+                if detail:
+                    lines.append(f"  - **{label}:** {_md_escape(detail, limit)}")
+            labels = observable.get("labels")
+            if isinstance(labels, list) and labels:
+                lines.append(
+                    "  - **Label:** "
+                    + ", ".join(_md_escape(label, 100) for label in labels[:20])
+                )
+    if len(matched_observables) > 20:
+        lines.append(
+            f"- {len(matched_observables) - 20} observable cocok lainnya tersedia di konten sumber alert."
+        )
+    for location in locations[:10]:
+        details = [
+            _display(location.get("type"), 80),
+            _display(location.get("name"), 160),
+            _display(location.get("latitude"), 40),
+            _display(location.get("longitude"), 40),
+        ]
+        details = [value for value in details if value]
+        if details:
+            lines.append("- **Lokasi OpenCTI:** " + " | ".join(details))
+    if len(locations) > 10:
+        lines.append(
+            f"- {len(locations) - 10} lokasi terkait lainnya tersedia di konten sumber alert."
+        )
+
+    for index, indicator in enumerate(indicators[:5], start=1):
+        name = _display(indicator.get("name"), 180) or "Indicator tanpa nama"
+        identifier = _display(indicator.get("id"), 120)
+        lines.append(f"- **Indicator {index}:** {_md_escape(name, 180)}")
+        if identifier:
+            lines.append(f"  - **ID:** {_md_escape(identifier, 120)}")
+        for label, field, limit in (
+            ("Skor OpenCTI", "score", 40),
+            ("Confidence", "confidence", 40),
+            ("Status revoked", "revoked", 20),
+            ("Valid dari", "valid_from", 80),
+            ("Valid sampai", "valid_until", 80),
+            ("Dibuat", "created", 80),
+            ("Diubah", "modified", 80),
+            ("Pembuat/sumber", "created_by", 160),
+        ):
+            value = indicator.get(field)
+            if isinstance(value, dict):
+                value = value.get("name") or value.get("id")
+            display = _display(value, limit)
+            if display:
+                lines.append(f"  - **{label}:** {_md_escape(display, limit)}")
+        for label, field in (("Deskripsi", "description"), ("Pattern", "pattern")):
+            value = _display(indicator.get(field), 240)
+            if value:
+                lines.append(f"  - **{label}:** `{_md_escape(value, 240)}`")
+        labels = indicator.get("labels")
+        if isinstance(labels, list) and labels:
+            lines.append(
+                "  - **Label:** " + ", ".join(
+                    _md_escape(label, 100) for label in labels[:20]
+                )
+            )
+        references = indicator.get("external_references")
+        if isinstance(references, list):
+            for reference in references[:3]:
+                if not isinstance(reference, dict):
+                    continue
+                details = [
+                    _display(reference.get("source_name"), 120),
+                    _display(reference.get("external_id"), 120),
+                    _display(reference.get("url"), 240),
+                    _display(reference.get("description"), 180),
+                ]
+                details = [value for value in details if value]
+                if details:
+                    lines.append(
+                        "  - **Referensi:** "
+                        + " | ".join(_md_escape(value, 240) for value in details)
+                    )
+    if len(indicators) > 5:
+        lines.append(
+            f"- {len(indicators) - 5} indicator cocok lainnya tersedia di konten sumber alert."
+        )
+    return lines or ["- Belum ada observable atau indicator OpenCTI yang cocok."]
 
 
 class IrisClient:
@@ -511,6 +664,11 @@ class IrisClient:
             "",
             "## Sumber intel / connector OpenCTI",
             *_format_intel_sources(doc, _d(doc.get("enrichment")).get("observables") or []),
+            "",
+            "## Data OpenCTI yang cocok dengan alert",
+            *_format_opencti_matches(
+                doc, _d(doc.get("enrichment")).get("observables") or []
+            ),
             "",
             "## Geolokasi",
             *_format_geolocation(doc.get("geolocation")),

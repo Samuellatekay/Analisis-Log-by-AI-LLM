@@ -29,6 +29,37 @@ def _dict(v: Any) -> dict:
     return v if isinstance(v, dict) else {}
 
 
+def _wazuh_domain(data: dict) -> str | None:
+    dns = _dict(data.get("dns"))
+    question = dns.get("question")
+    question_name = question.get("name") if isinstance(question, dict) else question
+    win = _dict(data.get("win"))
+    eventdata = _dict(win.get("eventdata"))
+    url = _dict(data.get("url"))
+    domain_data = _dict(data.get("domain"))
+    candidates = (
+        question_name, dns.get("question_name"), dns.get("query"),
+        eventdata.get("queryName"), data.get("queryName"),
+        url.get("domain"), domain_data.get("name"),
+        data.get("domain_name"), data.get("domain"),
+    )
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            continue
+        domain = candidate.strip().rstrip(".").casefold()
+        if (
+            not domain
+            or len(domain) > 253
+            or any(char.isspace() or char in "/:@?#" for char in domain)
+        ):
+            continue
+        try:
+            ipaddress.ip_address(domain)
+        except ValueError:
+            return domain
+    return None
+
+
 # ------------------------------------------------------------------- Wazuh
 def wazuh_severity(level: int) -> int:
     """Level Wazuh -> severity 1-5 (ambang milik pengguna)."""
@@ -185,6 +216,9 @@ def norm_wazuh(p: dict) -> dict:
             hashes[algorithm] = value.strip().lower()
     if hashes:
         out["file"] = {"hash": hashes}
+    domain = _wazuh_domain(data)
+    if domain:
+        out["domain"] = {"name": domain}
     return out
 
 

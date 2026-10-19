@@ -189,15 +189,13 @@ def merge_enrichment(target: dict, event: dict) -> None:
         elif isinstance(asset_result, list):
             asset_candidates.extend(item for item in asset_result if isinstance(item, dict))
 
-        glpi_asset = next(
-            (
-                item for item in asset_candidates
-                if any(item.get(k) not in (None, "") for k in (
-                    "name", "ip", "owner", "serial_number", "operating_system", "status"
-                ))
-            ),
-            None,
-        )
+        glpi_assets = [
+            item for item in asset_candidates
+            if any(item.get(k) not in (None, "") for k in (
+                "name", "ip", "owner", "serial_number", "operating_system", "status"
+            ))
+        ]
+        glpi_asset = glpi_assets[0] if glpi_assets else None
         side_ips = {}
         for side_name in ("source", "destination"):
             side = target.get(side_name)
@@ -216,11 +214,25 @@ def merge_enrichment(target: dict, event: dict) -> None:
         if glpi_asset:
             glpi_details = {
                 key: glpi_asset[key]
-                for key in ("name", "ip", "owner", "user", "serial_number",
+                for key in ("id", "name", "ip", "owner", "user", "serial_number",
                             "operating_system", "status", "location", "type")
                 if glpi_asset.get(key) not in (None, "")
             }
-            side_asset = {"found": True, "inventory_source": "GLPI", **glpi_details}
+            all_glpi_details = [
+                {
+                    key: item[key]
+                    for key in ("id", "name", "ip", "owner", "user", "serial_number",
+                                "operating_system", "status", "location", "type")
+                    if item.get(key) not in (None, "")
+                }
+                for item in glpi_assets
+            ]
+            side_asset = {
+                "found": True,
+                "inventory_source": "GLPI",
+                "items": all_glpi_details,
+                **glpi_details,
+            }
         elif isinstance(asset_result, dict) and asset_result.get("found") is False:
             side_asset = {
                 "found": False,
@@ -353,6 +365,8 @@ def normalize_ioc_value(entity_type: str, value: str) -> str:
         return str(address)
     if kind == "host-name":
         return normalized.casefold()
+    if kind == "domain-name":
+        return normalized.rstrip(".").casefold()
     if kind == "stixfile":
         return normalized.lower()
     return normalized
@@ -409,6 +423,7 @@ class Database:
 
         ip_value = value if entity_type in {"ipv4-addr", "ipv6-addr"} else None
         host_name = value if entity_type == "host-name" else None
+        domain_value = value if entity_type == "domain-name" else None
         file_hash = event.get("file_hash") if isinstance(event.get("file_hash"), dict) else {}
         hash_value = str(file_hash.get("value") or value).strip().lower() if entity_type == "stixfile" else None
         query = """
@@ -431,6 +446,7 @@ class Database:
                     lower(payload #>> '{host,name}') = $7
                     OR lower(payload #>> '{agent,name}') = $7
                 ))
+                OR ($8::text IS NOT NULL AND lower(payload #>> '{domain,name}') = $8)
               )
             ORDER BY received_at DESC
             LIMIT 500
@@ -448,7 +464,7 @@ class Database:
             async with conn.transaction():
                 rows = await conn.fetch(
                     query, ip_value, hash_args[0], hash_args[1], hash_args[2],
-                    retention_minutes, ip_value, host_name
+                    retention_minutes, ip_value, host_name, domain_value
                 )
                 for row in rows:
                     payload = row["payload"]
@@ -862,9 +878,25 @@ class App:
 
         file_data = data.get("file") if isinstance(data.get("file"), dict) else {}
         hashes = file_data.get("hash") if isinstance(file_data.get("hash"), dict) else {}
-        for value in hashes.values():
-            if isinstance(value, str) and value.strip():
-                iocs.add(("StixFile", value.strip().lower()))
+        hash_lengths = {"md5": 32, "sha1": 40, "sha256": 64, "sha512": 128}
+        for algorithm, raw_value in hashes.items():
+            value = raw_value.strip().lower() if isinstance(raw_value, str) else ""
+            expected_length = hash_lengths.get(str(algorithm).lower().replace("-", ""))
+            if (
+                expected_length
+                and len(value) == expected_length
+                and all(char in "0123456789abcdef" for char in value)
+            ):
+                iocs.add(("StixFile", value))
+            else:
+                log.warning("Skipping malformed Wazuh file hash algorithm=%s", algorithm)
+        domain = data.get("domain")
+        domain_name = (
+            domain.get("name") if isinstance(domain, dict)
+            else domain if isinstance(domain, str) else None
+        )
+        if isinstance(domain_name, str) and domain_name.strip():
+            iocs.add(("Domain-Name", domain_name.strip().rstrip(".").casefold()))
         return sorted(iocs)
 
     async def _apply_cached_enrichment(self, parsed: list[tuple[Item, dict]]) -> None:
@@ -885,7 +917,7 @@ class App:
                 merge_enrichment(data, orjson.loads(raw_event))
 
     async def _queue_glpi_asset_lookups(self, events: list[dict]) -> None:
-        """Queue GLPI and OpenCTI lookups for Wazuh source and destination IPs."""
+        """Queue GLPI asset and OpenCTI IOC lookups for Wazuh alerts."""
         for event in events:
             if event.get("data_source") != "wazuh":
                 continue
@@ -927,16 +959,36 @@ class App:
                             await self.redis.delete(lookup_key)
                             log.exception("Gagal mengantrekan pencarian aset GLPI untuk IP %s", ip)
 
-                opencti_key = f"analysis:opencti-enrichment:{ip}"
-                if await self.redis.set(opencti_key, "1", nx=True, ex=300):
-                    request = {"action": "lookup_enrichment", "ip": ip,
-                               "entity_type": entity_type}
-                    try:
-                        await self.redis.rpush("outbound-opencti", orjson.dumps(request).decode())
-                        log.info("OpenCTI connector lookup queued ip=%s", ip)
-                    except Exception:
-                        await self.redis.delete(opencti_key)
-                        log.exception("Gagal mengantrekan lookup connector OpenCTI untuk IP %s", ip)
+            for entity_type, value in self._alert_iocs(event):
+                if entity_type == "Host-Name":
+                    continue
+                lookup_identity = hashlib.sha256(
+                    f"{entity_type.lower()}\0{value}".encode()
+                ).hexdigest()
+                opencti_key = f"analysis:opencti-enrichment:{lookup_identity}"
+                if not await self.redis.set(opencti_key, "1", nx=True, ex=300):
+                    continue
+                request = {
+                    "action": "lookup_enrichment",
+                    "entity_type": entity_type,
+                    "value": value,
+                }
+                if entity_type in {"IPv4-Addr", "IPv6-Addr"}:
+                    request["ip"] = value
+                elif entity_type == "StixFile":
+                    algorithm_by_length = {
+                        32: "MD5", 40: "SHA-1", 64: "SHA-256", 128: "SHA-512",
+                    }
+                    algorithm = algorithm_by_length.get(len(value))
+                    if algorithm:
+                        request["file_hash"] = {"algorithm": algorithm, "value": value}
+                try:
+                    await self.redis.rpush("outbound-opencti", orjson.dumps(request).decode())
+                    log.info("OpenCTI lookup queued type=%s value=%s", entity_type, value)
+                except Exception:
+                    await self.redis.delete(opencti_key)
+                    log.exception("Gagal mengantrekan lookup OpenCTI type=%s value=%s",
+                                  entity_type, value)
 
             source = event.get("source") if isinstance(event.get("source"), dict) else {}
             if source.get("ip"):

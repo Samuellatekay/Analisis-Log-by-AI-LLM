@@ -32,10 +32,15 @@ aset host/agent yang melaporkan event, bukan dianggap sebagai IP penyerang.
 Informasi aset yang tersedia dapat mencakup nama, pemilik, serial, sistem operasi,
 status, dan lokasi.
 
-Lookup OpenCTI juga dijadwalkan untuk IP sumber dan tujuan. Hasil reputasi,
-geolokasi, indikator, dan status connector yang tersedia disimpan sebagai konteks
-enrichment. Data tersebut ditampilkan pada deskripsi alert IRIS; layanan ini tidak
-membuat objek aset native baru di IRIS.
+Lookup OpenCTI dijadwalkan untuk IP sumber/tujuan, domain, dan hash file yang
+terekstrak dari alert Wazuh. GLPI dicari berdasarkan IP sumber/tujuan, dengan
+fallback hostname untuk host pelapor bila IP sumber tidak ada. Hanya record yang
+cocok dengan IOC/hostname alert yang digabungkan; daftar inventaris atau feed
+OpenCTI yang tidak terkait tidak disalin ke alert. Reputasi, geolokasi, data
+indicator/observable yang cocok, referensi intel, status connector, dan seluruh
+aset GLPI yang cocok disimpan di konten sumber IRIS; ringkasan ditampilkan di
+deskripsi alert. Lookup hanya dipicu alert yang masuk setelah fitur ini diaktifkan; tidak ada backfill
+massal untuk alert lama.
 
 ## DFIR-IRIS
 
