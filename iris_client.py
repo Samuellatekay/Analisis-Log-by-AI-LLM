@@ -276,7 +276,7 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any) -> list[str]:
                 ("Kontak", item.get("contact")),
                 ("Nomor kontak", item.get("contact_number")),
                 ("Dibuat", item.get("created_at")),
-                ("Terakhir diperbarui", item.get("updated_at")),
+                ("Computer terakhir diperbarui (GLPI)", item.get("updated_at")),
                 ("Tanggal pembelian", item.get("purchase_date")),
             )
             lines.extend(
@@ -521,6 +521,35 @@ class IrisClient:
         destination_ip = _display(destination.get("ip"), 80)
         source_ip = _display(src.get("ip"), 80)
         reporting_host = _display(agent_name or host.get("name"), 160)
+        sensor_asset_match = None
+        if agent.get("ip") and reporting_host and not agent_asset.get("found"):
+            expected_name = reporting_host.casefold()
+            expected_ip = str(agent["ip"]).strip()
+            for section_name, candidate_asset in (
+                ("tujuan", destination_asset),
+                ("sumber", source_asset),
+            ):
+                if candidate_asset.get("found") is not True:
+                    continue
+                candidate_items = candidate_asset.get("items")
+                if not isinstance(candidate_items, list) or not candidate_items:
+                    candidate_items = [candidate_asset]
+                for item in candidate_items:
+                    if not isinstance(item, dict):
+                        continue
+                    item_name = str(item.get("name") or "").strip().casefold()
+                    item_ips = item.get("ip_addresses")
+                    item_ips = item_ips if isinstance(item_ips, list) else []
+                    item_ips = {
+                        str(value).strip()
+                        for value in [*item_ips, item.get("ip")]
+                        if value
+                    }
+                    if item_name == expected_name and expected_ip in item_ips:
+                        sensor_asset_match = (section_name, item)
+                        break
+                if sensor_asset_match:
+                    break
         source_label = source_ip or (
             f"Tidak tersedia di event (aktivitas dilaporkan oleh host {reporting_host})"
             if reporting_host else "Tidak tersedia di event"
@@ -565,6 +594,17 @@ class IrisClient:
             f"- **Manager:** {_display(agent.get('manager'), 160) or 'Tidak tersedia'}",
             f"- **IP manager:** {_display(agent.get('manager_ip'), 80) or ('Tidak dikirim di event Wazuh' if is_wazuh else 'Tidak tersedia')}",
             *(
+                [
+                    "",
+                    "## Aset host pelapor / sensor (GLPI)",
+                    (
+                        f"- Sama dengan aset GLPI #{_display(sensor_asset_match[1].get('id'), 80) or 'tanpa ID'} "
+                        f"({_display(sensor_asset_match[1].get('name'), 160) or reporting_host}) "
+                        f"pada bagian Aset {sensor_asset_match[0]}; cocok berdasarkan hostname "
+                        f"dan IP agent {_display(agent.get('ip'), 80)}."
+                    ),
+                ]
+                if sensor_asset_match else
                 [
                     "",
                     "## Aset host pelapor / sensor (GLPI)",

@@ -43,6 +43,7 @@ except ImportError:  # opsional
 log = logging.getLogger("analisis-log")
 UUID_NS = uuid.UUID("6f1c2f0e-8c1e-4e0a-9d52-3b1f7a5e9c11")
 LATENCY_BUDGET_S = 1.0
+GLPI_ASSET_REFRESH_TTL_S = 300
 
 
 def _error_label(exc: Exception) -> str:
@@ -833,6 +834,14 @@ class App:
         identity = f"{normalized_type}\0{normalized_value}"
         return f"analysis:enrichment:v2:{hashlib.sha256(identity.encode()).hexdigest()}"
 
+    @staticmethod
+    def _glpi_asset_refresh_key(entity_type: str, value: str) -> str:
+        normalized_type = entity_type.lower()
+        normalized_value = normalize_ioc_value(normalized_type, value)
+        identity = f"{normalized_type}\0{normalized_value}"
+        digest = hashlib.sha256(identity.encode()).hexdigest()
+        return f"analysis:glpi-asset-refresh:{digest}"
+
     async def _handle_enrichment_batch(
         self, items: list[Item], ack: Callable[[], Awaitable]
     ) -> None:
@@ -863,6 +872,18 @@ class App:
                 orjson.dumps(event).decode(),
                 ex=max(86400, self.s.retention_minutes * 60),
             )
+            if (
+                str(event.get("id") or "").startswith("glpi-asset")
+                and isinstance(event.get("asset"), dict)
+                and event["entity_type"] in {"IPv4-Addr", "IPv6-Addr", "Host-Name"}
+            ):
+                await self.redis.set(
+                    self._glpi_asset_refresh_key(
+                        event["entity_type"], str(event["value"])
+                    ),
+                    "1",
+                    ex=GLPI_ASSET_REFRESH_TTL_S,
+                )
             for record in await self.db.attach_enrichment(event, self.s.retention_minutes):
                 matched[record.log_uuid] = record
 
@@ -962,29 +983,21 @@ class App:
             for address in sorted(addresses, key=lambda item: (item.version, int(item))):
                 ip = str(address)
                 entity_type = "IPv4-Addr" if address.version == 4 else "IPv6-Addr"
-                cache_key = self._enrichment_cache_key(entity_type, ip)
-                cached = await self.redis.get(cache_key)
-                if cached:
+                refresh_key = self._glpi_asset_refresh_key(entity_type, ip)
+                if await self.redis.get(refresh_key):
+                    continue
+                lookup_key = f"analysis:glpi-lookup:{ip}"
+                if await self.redis.set(
+                    lookup_key, "1", nx=True, ex=GLPI_ASSET_REFRESH_TTL_S
+                ):
+                    request = {"action": "lookup_asset", "ip": ip,
+                               "entity_type": entity_type}
                     try:
-                        cached_event = orjson.loads(cached)
-                    except orjson.JSONDecodeError:
-                        cached_event = {}
-                    asset = cached_event.get("asset") if isinstance(cached_event, dict) else None
-                    asset_cached = isinstance(asset, dict) and asset.get("found") and asset.get("items")
-                else:
-                    asset_cached = False
-
-                if not asset_cached:
-                    lookup_key = f"analysis:glpi-lookup:{ip}"
-                    if await self.redis.set(lookup_key, "1", nx=True, ex=300):
-                        request = {"action": "lookup_asset", "ip": ip,
-                                   "entity_type": entity_type}
-                        try:
-                            await self.redis.rpush("outbound-glpi", orjson.dumps(request).decode())
-                            log.info("GLPI asset lookup queued ip=%s", ip)
-                        except Exception:
-                            await self.redis.delete(lookup_key)
-                            log.exception("Gagal mengantrekan pencarian aset GLPI untuk IP %s", ip)
+                        await self.redis.rpush("outbound-glpi", orjson.dumps(request).decode())
+                        log.info("GLPI asset lookup queued ip=%s", ip)
+                    except Exception:
+                        await self.redis.delete(lookup_key)
+                        log.exception("Gagal mengantrekan pencarian aset GLPI untuk IP %s", ip)
 
             for entity_type, value in self._alert_iocs(event):
                 if entity_type == "Host-Name":
@@ -1024,19 +1037,14 @@ class App:
                 continue
             host_name = host_name.strip()
             entity_type = "Host-Name"
-            cache_key = self._enrichment_cache_key(entity_type, host_name)
-            cached = await self.redis.get(cache_key)
-            if cached:
-                try:
-                    cached_event = orjson.loads(cached)
-                except orjson.JSONDecodeError:
-                    cached_event = {}
-                asset = cached_event.get("asset") if isinstance(cached_event, dict) else None
-                if isinstance(asset, dict) and asset.get("found") and asset.get("items"):
-                    continue
+            refresh_key = self._glpi_asset_refresh_key(entity_type, host_name)
+            if await self.redis.get(refresh_key):
+                continue
 
             lookup_key = f"analysis:glpi-host-lookup:{host_name.casefold()}"
-            if await self.redis.set(lookup_key, "1", nx=True, ex=300):
+            if await self.redis.set(
+                lookup_key, "1", nx=True, ex=GLPI_ASSET_REFRESH_TTL_S
+            ):
                 request = {
                     "action": "lookup_asset_by_name",
                     "host_name": host_name,

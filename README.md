@@ -28,6 +28,9 @@ Lookup aset dijadwalkan untuk IP sumber dan tujuan pada event Wazuh serta nama
 Computer GLPI yang sama persis dengan hostname agent. Hasil hostname hanya
 ditampilkan sebagai aset host pelapor/sensor (atau host tujuan bila IP sumber
 tidak ada), bukan dianggap sebagai IP penyerang. Hasil hostname ambigu ditolak.
+Jika pencarian hostname sensor gagal tetapi hostname dan IP agent sama persis
+dengan aset GLPI yang sudah cocok melalui IP sumber/tujuan, alert merujuk ke aset
+tersebut alih-alih melaporkannya sebagai tidak ditemukan.
 Informasi aset yang tersedia dapat mencakup nama, semua alamat IP terkait, pemilik,
 serial, nomor inventaris, sistem operasi, status, lokasi, tipe, produsen, model,
 entity/grup, kontak, catatan, dan tanggal inventaris, selama kolom tersebut terisi
@@ -43,6 +46,13 @@ indicator/observable yang cocok, referensi intel, status connector, dan seluruh
 aset GLPI yang cocok disimpan di konten sumber IRIS; ringkasan ditampilkan di
 deskripsi alert. Lookup hanya dipicu alert yang masuk setelah fitur ini diaktifkan; tidak ada backfill
 massal untuk alert lama.
+Data aset GLPI di-cache untuk membatasi panggilan API. Saat ada alert Wazuh berikutnya
+dengan IP atau hostname yang sama, lookup GLPI dijalankan ulang jika hasil terakhir
+lebih lama dari 5 menit; hasil baru memperbarui alert IRIS terkait yang masih berada
+dalam masa retensi. GLPI tidak dipantau secara live, sehingga perubahan tanpa event
+Wazuh baru tidak langsung tercermin. Timestamp `Terakhir diperbarui` adalah tanggal
+perubahan objek Computer (`date_mod`) dan tidak selalu berubah saat relasi NetworkName
+atau IPAddress yang diubah.
 
 ## DFIR-IRIS
 
