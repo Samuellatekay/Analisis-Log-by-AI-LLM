@@ -60,10 +60,11 @@ disimpan di konten sumber IRIS. Ringkasan deskripsi dibatasi agar bagian alert l
 tidak terpotong.
 Hasil OpenCTI dan GLPI untuk IOC yang sama digabungkan, bukan saling menimpa, sehingga
 event lookup GLPI yang datang belakangan tidak menghapus detail indicator OpenCTI.
-Data aset GLPI di-cache untuk membatasi panggilan API. Saat ada alert Wazuh berikutnya
-dengan IP atau hostname yang sama, lookup GLPI dijalankan ulang jika hasil terakhir
-lebih lama dari 1 detik. Lookup IOC OpenCTI mengikuti batas deduplikasi yang sama.
-Hasil baru memperbarui alert IRIS terkait yang masih berada dalam masa retensi.
+Hasil OpenCTI dapat digunakan dari cache untuk mempercepat alert baru. Hasil aset GLPI
+yang tersimpan di cache tidak diterapkan ke alert baru agar alamat IP inventaris lama
+tidak terbawa; alert baru meminta lookup GLPI, dengan deduplikasi satu detik untuk IP
+atau hostname yang sama. Lookup IOC OpenCTI mengikuti batas deduplikasi yang sama.
+Hasil GLPI terbaru memperbarui alert IRIS terkait yang masih berada dalam masa retensi.
 GLPI dan OpenCTI tidak dipantau secara live oleh jalur ini, sehingga perubahan tanpa
 event Wazuh baru tidak langsung tercermin. Timestamp `Terakhir diperbarui` adalah tanggal
 perubahan objek Computer (`date_mod`) dan tidak selalu berubah saat relasi NetworkName

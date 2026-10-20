@@ -948,16 +948,18 @@ class App:
         matched: dict[uuid.UUID, Record] = {}
         for _, event in parsed:
             cache_key = self._enrichment_cache_key(event["entity_type"], str(event["value"]))
-            await self.redis.set(
-                cache_key,
-                orjson.dumps(event).decode(),
-                ex=max(86400, self.s.retention_minutes * 60),
-            )
-            if (
+            is_glpi_asset = (
                 str(event.get("id") or "").startswith("glpi-asset")
                 and isinstance(event.get("asset"), dict)
                 and event["entity_type"] in {"IPv4-Addr", "IPv6-Addr", "Host-Name"}
-            ):
+            )
+            if not is_glpi_asset:
+                await self.redis.set(
+                    cache_key,
+                    orjson.dumps(event).decode(),
+                    ex=max(86400, self.s.retention_minutes * 60),
+                )
+            if is_glpi_asset:
                 await self.redis.set(
                     self._glpi_asset_refresh_key(
                         event["entity_type"], str(event["value"])
@@ -1043,7 +1045,13 @@ class App:
         cached_events = await pipe.execute()
         for (data, _), raw_event in zip(lookups, cached_events):
             if raw_event:
-                merge_enrichment(data, orjson.loads(raw_event))
+                event = orjson.loads(raw_event)
+                if (
+                    str(event.get("id") or "").startswith("glpi-asset")
+                    and isinstance(event.get("asset"), dict)
+                ):
+                    continue
+                merge_enrichment(data, event)
 
     async def _queue_glpi_asset_lookups(self, events: list[dict]) -> None:
         """Queue GLPI asset and OpenCTI IOC lookups for Wazuh alerts."""
