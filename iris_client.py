@@ -356,16 +356,13 @@ def _format_opencti_matches(doc: dict, observables: list) -> list[str]:
     seen_locations = set()
     seen_related_entities = set()
     seen_relationships = set()
-    seen_sightings = set()
     matched_observables = []
     indicators = []
     locations = []
     related_entities = []
     relationships = []
-    sightings = []
     related_entity_count = 0
     relationship_count = 0
-    sighting_count = 0
     related_data_truncated = False
     for context in contexts:
         if isinstance(context.get("related_entity_count"), int):
@@ -376,8 +373,6 @@ def _format_opencti_matches(doc: dict, observables: list) -> list[str]:
             relationship_count = max(
                 relationship_count, context["relationship_count"]
             )
-        if isinstance(context.get("sighting_count"), int):
-            sighting_count = max(sighting_count, context["sighting_count"])
         related_data_truncated = (
             related_data_truncated
             or context.get("related_data_truncated") is True
@@ -431,20 +426,6 @@ def _format_opencti_matches(doc: dict, observables: list) -> list[str]:
             if key not in seen_relationships:
                 seen_relationships.add(key)
                 relationships.append(relationship)
-        for sighting in context.get("sightings", []):
-            if not isinstance(sighting, dict):
-                continue
-            from_entity = sighting.get("from")
-            to_entity = sighting.get("to")
-            key = sighting.get("id") or (
-                from_entity.get("id") if isinstance(from_entity, dict) else None,
-                to_entity.get("id") if isinstance(to_entity, dict) else None,
-                sighting.get("first_seen"),
-                sighting.get("last_seen"),
-            )
-            if key not in seen_sightings:
-                seen_sightings.add(key)
-                sightings.append(sighting)
 
     lines = []
     for observable in matched_observables[:20]:
@@ -583,46 +564,7 @@ def _format_opencti_matches(doc: dict, observables: list) -> list[str]:
             f"- {indicator_count - 10} indicator cocok lainnya tersedia di konten sumber alert."
         )
 
-    def is_event_entity(entity):
-        entity_type = str(
-            entity.get("entity_type") or entity.get("type") or ""
-        ).casefold()
-        return entity_type in {"event", "x-opencti-event"}
-
-    events = [entity for entity in related_entities if is_event_entity(entity)]
-    other_entities = [
-        entity for entity in related_entities if not is_event_entity(entity)
-    ]
-    for event in events[:10]:
-        name = _display(event.get("name"), 180) or "Event tanpa nama"
-        lines.append(f"- **Event OpenCTI:** {_md_escape(name, 180)}")
-        identifier = _display(event.get("id"), 120)
-        if identifier:
-            lines.append(f"  - **ID:** {_md_escape(identifier, 120)}")
-        for label, field, limit in (
-            ("Jenis event", "event_types", 120),
-            ("Mulai", "start_time", 80),
-            ("Selesai", "stop_time", 80),
-            ("Pertama terlihat", "first_seen", 80),
-            ("Terakhir terlihat", "last_seen", 80),
-            ("Deskripsi", "description", 300),
-        ):
-            value = event.get(field)
-            if isinstance(value, list):
-                value = ", ".join(str(item) for item in value[:10])
-            display = _display(value, limit)
-            if display:
-                lines.append(f"  - **{label}:** {_md_escape(display, limit)}")
-        labels = event.get("labels")
-        if isinstance(labels, list) and labels:
-            lines.append(
-                "  - **Label:** "
-                + ", ".join(_md_escape(label, 100) for label in labels[:12])
-            )
-    if len(events) > 10:
-        lines.append(f"- {len(events) - 10} event OpenCTI lain tersedia di konten sumber alert.")
-
-    for entity in other_entities[:12]:
+    for entity in related_entities[:12]:
         entity_type = _display(
             entity.get("entity_type") or entity.get("type"), 60
         ) or "Entitas"
@@ -673,11 +615,9 @@ def _format_opencti_matches(doc: dict, observables: list) -> list[str]:
                         "  - **Referensi:** "
                         + " | ".join(_md_escape(value, 180) for value in details)
                     )
-    displayed_related_entities = min(len(other_entities), 12) + min(len(events), 10)
-    if related_entity_count > displayed_related_entities:
+    if related_entity_count > 12:
         lines.append(
-            f"- {related_entity_count - displayed_related_entities} entitas terkait OpenCTI lainnya "
-            "tersedia di konten sumber alert."
+            f"- {related_entity_count - 12} entitas terkait OpenCTI lainnya tersedia di konten sumber alert."
         )
 
     def relationship_endpoint(value):
@@ -708,35 +648,6 @@ def _format_opencti_matches(doc: dict, observables: list) -> list[str]:
     if relationship_count > 15:
         lines.append(
             f"- {relationship_count - 15} relasi OpenCTI lainnya tersedia di konten sumber alert."
-        )
-    for sighting in sightings[:10]:
-        from_entity = relationship_endpoint(sighting.get("from"))
-        to_entity = relationship_endpoint(sighting.get("to"))
-        lines.append(
-            f"- **Sighting OpenCTI:** {_md_escape(from_entity, 160)} "
-            f"terlihat pada {_md_escape(to_entity, 160)}"
-        )
-        identifier = _display(sighting.get("id"), 120)
-        if identifier:
-            lines.append(f"  - **ID:** {_md_escape(identifier, 120)}")
-        negative = sighting.get("negative")
-        if negative is None:
-            negative = sighting.get("x_opencti_negative")
-        for label, field, limit in (
-            ("Pertama terlihat", "first_seen", 80),
-            ("Terakhir terlihat", "last_seen", 80),
-            ("Jumlah atribut", "attribute_count", 40),
-            ("Catatan", "description", 240),
-        ):
-            display = _display(sighting.get(field), limit)
-            if display:
-                lines.append(f"  - **{label}:** {_md_escape(display, limit)}")
-        negative_display = _display(negative, 20)
-        if negative_display:
-            lines.append(f"  - **Negatif:** {negative_display}")
-    if sighting_count > 10:
-        lines.append(
-            f"- {sighting_count - 10} sighting OpenCTI lainnya tersedia di konten sumber alert."
         )
     if related_data_truncated:
         lines.append(

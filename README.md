@@ -52,9 +52,7 @@ Indicator berdasarkan nilai IOC persis. Deskripsi IRIS membedakan observable yan
 ditemukan tanpa Indicator terkait dari IOC yang tidak ditemukan.
 Untuk observable dan indicator yang cocok, collector juga mengambil entitas STIX
 serta relasi yang terhubung langsung (misalnya malware, threat actor, campaign,
-attack pattern, dan hubungan `uses`/`indicates`), Event OpenCTI yang terkait,
-serta Sightings beserta waktu pengamatan, endpoint, dan jumlah atributnya;
-bukan seluruh isi OpenCTI.
+attack pattern, dan hubungan `uses`/`indicates`), bukan seluruh isi OpenCTI.
 Ringkasan deskripsi dibatasi agar konten IOC lain tidak terpotong; data enrichment
 yang lebih lengkap tetap disimpan pada konten sumber alert.
 Hasil OpenCTI dan GLPI untuk IOC yang sama digabungkan, bukan saling menimpa, sehingga
