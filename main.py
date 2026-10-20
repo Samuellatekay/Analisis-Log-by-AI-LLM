@@ -382,7 +382,21 @@ def merge_enrichment(target: dict, event: dict) -> None:
         if isinstance(existing, dict) and (
             existing.get("entity_type"), existing.get("value")
         ) == identity:
-            observables[index] = entry
+            merged_entry = {**existing, **entry}
+            previous_opencti = existing.get("opencti")
+            incoming_opencti = entry.get("opencti")
+            if isinstance(previous_opencti, dict) and isinstance(incoming_opencti, dict):
+                merged_opencti = {**previous_opencti, **incoming_opencti}
+                previous_observable = previous_opencti.get("observable")
+                incoming_observable = incoming_opencti.get("observable")
+                if isinstance(previous_observable, dict) and isinstance(
+                    incoming_observable, dict
+                ):
+                    merged_opencti["observable"] = {
+                        **previous_observable, **incoming_observable
+                    }
+                merged_entry["opencti"] = merged_opencti
+            observables[index] = merged_entry
             return
     observables.append(entry)
 

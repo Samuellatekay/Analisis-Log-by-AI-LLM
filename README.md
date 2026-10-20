@@ -50,6 +50,8 @@ massal untuk alert lama.
 Jika relasi OpenCTI `based-on` tidak memberikan Indicator, collector mencari pattern
 Indicator berdasarkan nilai IOC persis. Deskripsi IRIS membedakan observable yang
 ditemukan tanpa Indicator terkait dari IOC yang tidak ditemukan.
+Hasil OpenCTI dan GLPI untuk IOC yang sama digabungkan, bukan saling menimpa, sehingga
+event lookup GLPI yang datang belakangan tidak menghapus detail indicator OpenCTI.
 Data aset GLPI di-cache untuk membatasi panggilan API. Saat ada alert Wazuh berikutnya
 dengan IP atau hostname yang sama, lookup GLPI dijalankan ulang jika hasil terakhir
 lebih lama dari 1 detik. Lookup IOC OpenCTI mengikuti batas deduplikasi yang sama.
