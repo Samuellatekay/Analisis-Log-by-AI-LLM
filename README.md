@@ -53,9 +53,11 @@ Indicator berdasarkan nilai IOC persis melalui pencarian OpenCTI dan filter fiel
 terkait dari IOC yang tidak ditemukan.
 Untuk observable dan indicator yang cocok, collector juga mengambil entitas STIX
 serta relasi yang terhubung langsung (misalnya malware, threat actor, campaign,
-attack pattern, dan hubungan `uses`/`indicates`), bukan seluruh isi OpenCTI.
-Ringkasan deskripsi dibatasi agar konten IOC lain tidak terpotong; data enrichment
-yang lebih lengkap tetap disimpan pada konten sumber alert.
+attack pattern, dan hubungan `uses`/`indicates`), Event OpenCTI, serta Sightings
+yang terhubung langsung dengan IOC cocok; bukan seluruh isi OpenCTI.
+Detail Observable, Indicator, Events, Sightings, entitas, dan relasi yang diambil
+disimpan di konten sumber IRIS. Ringkasan deskripsi dibatasi agar bagian alert lain
+tidak terpotong.
 Hasil OpenCTI dan GLPI untuk IOC yang sama digabungkan, bukan saling menimpa, sehingga
 event lookup GLPI yang datang belakangan tidak menghapus detail indicator OpenCTI.
 Data aset GLPI di-cache untuk membatasi panggilan API. Saat ada alert Wazuh berikutnya

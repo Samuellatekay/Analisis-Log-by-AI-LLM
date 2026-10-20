@@ -402,7 +402,7 @@ def merge_enrichment(target: dict, event: dict) -> None:
                     }
                 for field in (
                     "indicators", "related_entities", "relationships",
-                    "locations", "sources", "labels",
+                    "events", "sightings", "locations", "sources", "labels",
                 ):
                     previous_items = previous_opencti.get(field)
                     incoming_items = incoming_opencti.get(field)
@@ -448,6 +448,8 @@ def merge_enrichment(target: dict, event: dict) -> None:
                         "indicators": "indicator_match_count",
                         "related_entities": "related_entity_count",
                         "relationships": "relationship_count",
+                        "events": "event_count",
+                        "sightings": "sighting_count",
                     }.get(field)
                     if count_field:
                         counts = [
