@@ -48,8 +48,9 @@ aset GLPI yang cocok disimpan di konten sumber IRIS; ringkasan ditampilkan di
 deskripsi alert. Lookup hanya dipicu alert yang masuk setelah fitur ini diaktifkan; tidak ada backfill
 massal untuk alert lama.
 Jika relasi OpenCTI `based-on` tidak memberikan Indicator, collector mencari pattern
-Indicator berdasarkan nilai IOC persis. Deskripsi IRIS membedakan observable yang
-ditemukan tanpa Indicator terkait dari IOC yang tidak ditemukan.
+Indicator berdasarkan nilai IOC persis melalui pencarian OpenCTI dan filter field
+`pattern`. Deskripsi IRIS membedakan observable yang ditemukan tanpa Indicator
+terkait dari IOC yang tidak ditemukan.
 Untuk observable dan indicator yang cocok, collector juga mengambil entitas STIX
 serta relasi yang terhubung langsung (misalnya malware, threat actor, campaign,
 attack pattern, dan hubungan `uses`/`indicates`), bukan seluruh isi OpenCTI.
