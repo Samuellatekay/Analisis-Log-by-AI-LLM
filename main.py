@@ -1193,18 +1193,10 @@ class App:
             if got_lock:
                 await self.redis.delete(lock)
 
-    async def _add_case_update_note(self, case_id: int, r: Record) -> None:
-        description = self.iris.build_payload(r.doc)["alert_description"]
-        note_hash = hashlib.sha256(description.encode()).hexdigest()
-        note_key = f"iris:update-note:{case_id}:{note_hash}"
-        if not await self.redis.set(note_key, "1", nx=True, ex=86400):
-            return
-        try:
-            await self.iris.add_case_note(case_id, r.doc)
-        except Exception:
-            await self.redis.delete(note_key)
-            raise
-        log.info("IRIS case %s menerima catatan enrichment log=%s", case_id, r.log_uuid)
+    async def _update_case_from_enrichment(self, case_id: int, r: Record) -> None:
+        updated = await self.iris.update_case_description(case_id, r.doc)
+        if updated:
+            log.info("IRIS case %s diperbarui dari enrichment log=%s", case_id, r.log_uuid)
 
     @staticmethod
     def _has_enrichment_update(doc: dict) -> bool:
@@ -1226,11 +1218,11 @@ class App:
                     await self.iris.update_alert(int(alert_id), r.doc)
                     log.info("IRIS alert %s diperbarui log=%s", alert_id, r.log_uuid)
                     if case_id is not None and self._has_enrichment_update(r.doc):
-                        await self._add_case_update_note(int(case_id), r)
+                        await self._update_case_from_enrichment(int(case_id), r)
                     continue
                 if case_id is not None:
                     if self._has_enrichment_update(r.doc):
-                        await self._add_case_update_note(int(case_id), r)
+                        await self._update_case_from_enrichment(int(case_id), r)
                     continue
                 # cegah banjir: 1 item / (source, action) / window
                 if not await self.redis.set(key, "1", nx=True, ex=s.iris_dedup_s):

@@ -22,12 +22,14 @@ RETRY_STATUS = {429, 500, 502, 503, 504}
 PATHS = {
     "legacy": {"alert": "/alerts/add", "alert_update": "/alerts/update/{id}",
                "escalate": "/alerts/escalate/{id}", "merge": "/alerts/merge/{id}",
-               "case": "/manage/cases/add", "case_note": "/case/notes/add",
+               "case": "/manage/cases/add", "case_read": "/manage/cases/{id}",
+               "case_update": "/manage/cases/update/{id}", "case_note": "/case/notes/add",
                "probe": "/manage/cases/list",
                "severity_list": ["/manage/severities/list"], "status_list": ["/manage/alert-status/list"]},
     "v2": {"alert": "/api/v2/alerts", "alert_update": "/api/v2/alerts/{id}",
            "escalate": "/api/v2/alerts/escalate/{id}",
            "merge": "/api/v2/alerts/merge/{id}", "case": "/api/v2/cases",
+           "case_read": "/api/v2/cases/{id}", "case_update": "/api/v2/cases/{id}",
            "case_note": "/api/v2/cases/{id}/notes",
            "case_note_directories": "/api/v2/cases/{id}/notes-directories",
            "probe": "/api/v2/cases",
@@ -756,6 +758,69 @@ class IrisClient:
                 "case_customer": self.customer_id, "case_soc_id": str(doc.get("log_uuid"))}
         d = await self._post(self.paths["case"], body)
         return d.get("case_id") or d.get("id")
+
+    async def update_case_description(self, case_id: int, doc: dict) -> bool:
+        """Update the managed Analisis_Log section in the existing case summary."""
+        current = await self._get(self.paths["case_read"].format(id=case_id))
+        existing = current.get("case_description")
+        if not isinstance(existing, str):
+            existing = current.get("description")
+        if not isinstance(existing, str):
+            raise IrisError(
+                f"IRIS tidak mengembalikan deskripsi case {case_id}; pembaruan dibatalkan"
+            )
+
+        start_marker = "<!-- analisis-log-enrichment:start -->"
+        end_marker = "<!-- analisis-log-enrichment:end -->"
+        description = self.build_payload(doc)["alert_description"]
+        managed_section = (
+            f"{start_marker}\n\n"
+            "## Enrichment terbaru dari Analisis_Log\n\n"
+            f"{description}\n\n"
+            f"{end_marker}"
+        )
+        start = existing.find(start_marker)
+        if start >= 0:
+            end = existing.find(end_marker, start + len(start_marker))
+            if end < 0:
+                raise IrisError(
+                    f"Marker pembaruan Analisis_Log pada case {case_id} tidak lengkap"
+                )
+            end += len(end_marker)
+            updated_description = (
+                existing[:start] + managed_section + existing[end:]
+            )
+        else:
+            updated_description = (
+                f"{existing.rstrip()}\n\n---\n\n{managed_section}"
+                if existing.strip() else managed_section
+            )
+
+        if updated_description == existing:
+            return False
+
+        if self.api_version == "v2":
+            await self._put(
+                self.paths["case_update"].format(id=case_id),
+                {"case_description": updated_description},
+            )
+        else:
+            await self._post(
+                self.paths["case_update"].format(id=case_id),
+                {
+                    "case_name": current.get("case_name") or current.get("name"),
+                    "case_soc_id": current.get("case_soc_id") or current.get("soc_id") or "",
+                    "case_description": updated_description,
+                    "classification_id": (
+                        current.get("classification_id")
+                        or current.get("case_classification_id")
+                    ),
+                    "custom_attributes": current.get("custom_attributes") or {},
+                    "owner_id": current.get("owner_id") or current.get("case_owner_id"),
+                    "case_tags": current.get("case_tags") or "",
+                },
+            )
+        return True
 
     async def add_case_note(self, case_id: int, doc: dict) -> None:
         """Add newly correlated enrichment to an existing IRIS case."""

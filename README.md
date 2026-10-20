@@ -54,9 +54,10 @@ GLPI dan OpenCTI tidak dipantau secara live oleh jalur ini, sehingga perubahan t
 event Wazuh baru tidak langsung tercermin. Timestamp `Terakhir diperbarui` adalah tanggal
 perubahan objek Computer (`date_mod`) dan tidak selalu berubah saat relasi NetworkName
 atau IPAddress yang diubah.
-Jika alert sudah dieskalasi ke case, enrichment baru juga ditambahkan sebagai case note
-dengan ringkasan alert terbaru; perubahan detail GLPI/OpenCTI menghasilkan pembaruan note
-meskipun daftar IOC tetap sama.
+Jika alert sudah dieskalasi ke case, enrichment baru memperbarui blok
+`Enrichment terbaru dari Analisis_Log` pada deskripsi case di menu Case. Blok lama
+diganti dengan data terbaru sementara teks deskripsi di luar blok tersebut dipertahankan;
+perubahan detail GLPI/OpenCTI memperbarui isi case meskipun daftar IOC sama.
 
 ## DFIR-IRIS
 
