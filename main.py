@@ -43,7 +43,7 @@ except ImportError:  # opsional
 log = logging.getLogger("analisis-log")
 UUID_NS = uuid.UUID("6f1c2f0e-8c1e-4e0a-9d52-3b1f7a5e9c11")
 LATENCY_BUDGET_S = 1.0
-GLPI_ASSET_REFRESH_TTL_S = 300
+ENRICHMENT_LOOKUP_DEDUP_TTL_S = 1
 
 
 def _error_label(exc: Exception) -> str:
@@ -882,7 +882,7 @@ class App:
                         event["entity_type"], str(event["value"])
                     ),
                     "1",
-                    ex=GLPI_ASSET_REFRESH_TTL_S,
+                    ex=ENRICHMENT_LOOKUP_DEDUP_TTL_S,
                 )
             for record in await self.db.attach_enrichment(event, self.s.retention_minutes):
                 matched[record.log_uuid] = record
@@ -988,7 +988,7 @@ class App:
                     continue
                 lookup_key = f"analysis:glpi-lookup:{ip}"
                 if await self.redis.set(
-                    lookup_key, "1", nx=True, ex=GLPI_ASSET_REFRESH_TTL_S
+                    lookup_key, "1", nx=True, ex=ENRICHMENT_LOOKUP_DEDUP_TTL_S
                 ):
                     request = {"action": "lookup_asset", "ip": ip,
                                "entity_type": entity_type}
@@ -1006,7 +1006,9 @@ class App:
                     f"{entity_type.lower()}\0{value}".encode()
                 ).hexdigest()
                 opencti_key = f"analysis:opencti-enrichment:{lookup_identity}"
-                if not await self.redis.set(opencti_key, "1", nx=True, ex=300):
+                if not await self.redis.set(
+                    opencti_key, "1", nx=True, ex=ENRICHMENT_LOOKUP_DEDUP_TTL_S
+                ):
                     continue
                 request = {
                     "action": "lookup_enrichment",
@@ -1043,7 +1045,7 @@ class App:
 
             lookup_key = f"analysis:glpi-host-lookup:{host_name.casefold()}"
             if await self.redis.set(
-                lookup_key, "1", nx=True, ex=GLPI_ASSET_REFRESH_TTL_S
+                lookup_key, "1", nx=True, ex=ENRICHMENT_LOOKUP_DEDUP_TTL_S
             ):
                 request = {
                     "action": "lookup_asset_by_name",
@@ -1192,8 +1194,8 @@ class App:
                 await self.redis.delete(lock)
 
     async def _add_case_update_note(self, case_id: int, r: Record) -> None:
-        observables = (r.doc.get("enrichment") or {}).get("observables") or []
-        note_hash = hashlib.sha256(orjson.dumps(observables, option=orjson.OPT_SORT_KEYS)).hexdigest()
+        description = self.iris.build_payload(r.doc)["alert_description"]
+        note_hash = hashlib.sha256(description.encode()).hexdigest()
         note_key = f"iris:update-note:{case_id}:{note_hash}"
         if not await self.redis.set(note_key, "1", nx=True, ex=86400):
             return
@@ -1203,6 +1205,15 @@ class App:
             await self.redis.delete(note_key)
             raise
         log.info("IRIS case %s menerima catatan enrichment log=%s", case_id, r.log_uuid)
+
+    @staticmethod
+    def _has_enrichment_update(doc: dict) -> bool:
+        enrichment = doc.get("enrichment")
+        observables = enrichment.get("observables") if isinstance(enrichment, dict) else None
+        return isinstance(observables, list) and any(
+            isinstance(item, dict) and item.get("entity_type") and item.get("value")
+            for item in observables
+        )
 
     async def _iris_worker(self) -> None:
         s = self.s
@@ -1214,11 +1225,11 @@ class App:
                 if alert_id is not None:
                     await self.iris.update_alert(int(alert_id), r.doc)
                     log.info("IRIS alert %s diperbarui log=%s", alert_id, r.log_uuid)
-                    if case_id is not None and (r.doc.get("enrichment") or {}).get("observables"):
+                    if case_id is not None and self._has_enrichment_update(r.doc):
                         await self._add_case_update_note(int(case_id), r)
                     continue
                 if case_id is not None:
-                    if (r.doc.get("enrichment") or {}).get("observables"):
+                    if self._has_enrichment_update(r.doc):
                         await self._add_case_update_note(int(case_id), r)
                     continue
                 # cegah banjir: 1 item / (source, action) / window

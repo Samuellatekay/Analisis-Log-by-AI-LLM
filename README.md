@@ -48,11 +48,15 @@ deskripsi alert. Lookup hanya dipicu alert yang masuk setelah fitur ini diaktifk
 massal untuk alert lama.
 Data aset GLPI di-cache untuk membatasi panggilan API. Saat ada alert Wazuh berikutnya
 dengan IP atau hostname yang sama, lookup GLPI dijalankan ulang jika hasil terakhir
-lebih lama dari 5 menit; hasil baru memperbarui alert IRIS terkait yang masih berada
-dalam masa retensi. GLPI tidak dipantau secara live, sehingga perubahan tanpa event
-Wazuh baru tidak langsung tercermin. Timestamp `Terakhir diperbarui` adalah tanggal
+lebih lama dari 1 detik. Lookup IOC OpenCTI mengikuti batas deduplikasi yang sama.
+Hasil baru memperbarui alert IRIS terkait yang masih berada dalam masa retensi.
+GLPI dan OpenCTI tidak dipantau secara live oleh jalur ini, sehingga perubahan tanpa
+event Wazuh baru tidak langsung tercermin. Timestamp `Terakhir diperbarui` adalah tanggal
 perubahan objek Computer (`date_mod`) dan tidak selalu berubah saat relasi NetworkName
 atau IPAddress yang diubah.
+Jika alert sudah dieskalasi ke case, enrichment baru juga ditambahkan sebagai case note
+dengan ringkasan alert terbaru; perubahan detail GLPI/OpenCTI menghasilkan pembaruan note
+meskipun daftar IOC tetap sama.
 
 ## DFIR-IRIS
 
