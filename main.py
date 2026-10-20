@@ -159,7 +159,8 @@ ALTER TABLE log_events ADD COLUMN IF NOT EXISTS iris_case_id INTEGER;
 """
 
 GLPI_ASSET_FIELDS = (
-    "id", "name", "ip", "ip_addresses", "owner", "user", "serial_number", "asset_tag",
+    "id", "name", "ip", "ip_addresses", "private_ip_addresses",
+    "public_ip_addresses", "other_ip_addresses", "owner", "user", "serial_number", "asset_tag",
     "operating_system", "status", "location", "type", "manufacturer", "model",
     "entity", "group", "contact", "contact_number", "description",
     "created_at", "updated_at", "purchase_date",

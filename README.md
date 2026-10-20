@@ -34,7 +34,8 @@ tersebut alih-alih melaporkannya sebagai tidak ditemukan.
 Informasi aset yang tersedia dapat mencakup nama, semua alamat IP terkait, pemilik,
 serial, nomor inventaris, sistem operasi, status, lokasi, tipe, produsen, model,
 entity/grup, kontak, catatan, dan tanggal inventaris, selama kolom tersebut terisi
-di GLPI.
+di GLPI. Alamat IP aset dipisahkan menjadi IP privat (RFC1918/IPv6 ULA), IP publik
+yang dapat dirutekan global, dan IP lainnya yang tidak termasuk dua kategori tersebut.
 
 Lookup OpenCTI dijadwalkan untuk IP sumber/tujuan, domain, dan hash file yang
 terekstrak dari alert Wazuh. GLPI dicari berdasarkan IP sumber/tujuan dan hostname

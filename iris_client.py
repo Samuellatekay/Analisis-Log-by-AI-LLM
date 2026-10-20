@@ -261,9 +261,34 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any) -> list[str]:
                     str(value).strip() for value in ip_addresses
                     if isinstance(value, str) and value.strip()
                 )
+            classified_ip_fields = (
+                ("IP privat", "private_ip_addresses"),
+                ("IP publik", "public_ip_addresses"),
+                ("IP lainnya", "other_ip_addresses"),
+            )
+            classified_ip_addresses = {
+                key: item.get(key) if isinstance(item.get(key), list) else []
+                for _, key in classified_ip_fields
+            }
+            has_classified_ip_addresses = any(classified_ip_addresses.values())
             fields = (
                 ("Nama", item.get("name")),
-                ("Alamat IP", ip_addresses or item.get("ip") or source_ip),
+                *(
+                    (
+                        label,
+                        ", ".join(
+                            str(value).strip()
+                            for value in classified_ip_addresses[key]
+                            if isinstance(value, str) and value.strip()
+                        ),
+                    )
+                    for label, key in classified_ip_fields
+                ),
+                (
+                    "Alamat IP",
+                    (ip_addresses or item.get("ip") or source_ip)
+                    if not has_classified_ip_addresses else None,
+                ),
                 ("Pemilik", item.get("owner") or item.get("user")),
                 ("Serial", item.get("serial_number")),
                 ("Nomor inventaris", item.get("asset_tag")),
