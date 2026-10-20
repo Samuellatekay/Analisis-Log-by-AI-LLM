@@ -551,14 +551,14 @@ def _format_opencti_matches(doc: dict, observables: list) -> list[str]:
                         "  - **Referensi:** "
                         + " | ".join(_md_escape(value, 240) for value in details)
                     )
-    indicator_count = max(
+    indicator_count = max([
         len(indicators),
         *(
             context.get("indicator_match_count")
             for context in contexts
             if isinstance(context.get("indicator_match_count"), int)
         ),
-    )
+    ])
     if indicator_count > 10:
         lines.append(
             f"- {indicator_count - 10} indicator cocok lainnya tersedia di konten sumber alert."
