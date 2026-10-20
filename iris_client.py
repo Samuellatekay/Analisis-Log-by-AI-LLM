@@ -338,6 +338,19 @@ def _format_opencti_matches(doc: dict, observables: list) -> list[str]:
     contexts.extend(
         _d(item.get("opencti")) for item in observables if isinstance(item, dict)
     )
+    lookup_targets = []
+    for item in observables:
+        if not isinstance(item, dict):
+            continue
+        context = _d(item.get("opencti"))
+        status = context.get("lookup_status")
+        entity_type = _display(item.get("entity_type"), 40)
+        value = _display(item.get("value"), 180)
+        if status in {"observable_found", "observable_not_found"} and entity_type and value:
+            target = (entity_type, value, status)
+            if target not in lookup_targets:
+                lookup_targets.append(target)
+
     seen_observables = set()
     seen_indicators = set()
     seen_locations = set()
@@ -467,6 +480,20 @@ def _format_opencti_matches(doc: dict, observables: list) -> list[str]:
         lines.append(
             f"- {len(indicators) - 5} indicator cocok lainnya tersedia di konten sumber alert."
         )
+    if matched_observables and not indicators:
+        lines.append("- Observable ditemukan di OpenCTI, tetapi belum ada indicator terkait.")
+    elif not matched_observables and not indicators:
+        for entity_type, value, status in lookup_targets:
+            if status == "observable_not_found":
+                lines.append(
+                    f"- Observable {entity_type} `{_md_escape(value, 180)}` tidak ditemukan "
+                    "di OpenCTI; pencarian indicator berdasarkan IOC tetap dilakukan."
+                )
+            else:
+                lines.append(
+                    f"- OpenCTI melaporkan observable {entity_type} "
+                    f"`{_md_escape(value, 180)}` ditemukan, tetapi detailnya tidak tersedia."
+                )
     return lines or ["- Belum ada observable atau indicator OpenCTI yang cocok."]
 
 

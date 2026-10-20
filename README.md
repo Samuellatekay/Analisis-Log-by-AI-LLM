@@ -47,6 +47,9 @@ indicator/observable yang cocok, referensi intel, status connector, dan seluruh
 aset GLPI yang cocok disimpan di konten sumber IRIS; ringkasan ditampilkan di
 deskripsi alert. Lookup hanya dipicu alert yang masuk setelah fitur ini diaktifkan; tidak ada backfill
 massal untuk alert lama.
+Jika relasi OpenCTI `based-on` tidak memberikan Indicator, collector mencari pattern
+Indicator berdasarkan nilai IOC persis. Deskripsi IRIS membedakan observable yang
+ditemukan tanpa Indicator terkait dari IOC yang tidak ditemukan.
 Data aset GLPI di-cache untuk membatasi panggilan API. Saat ada alert Wazuh berikutnya
 dengan IP atau hostname yang sama, lookup GLPI dijalankan ulang jika hasil terakhir
 lebih lama dari 1 detik. Lookup IOC OpenCTI mengikuti batas deduplikasi yang sama.
