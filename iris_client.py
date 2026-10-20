@@ -760,43 +760,18 @@ class IrisClient:
         return d.get("case_id") or d.get("id")
 
     async def update_case_description(self, case_id: int, doc: dict) -> bool:
-        """Update the managed Analisis_Log section in the existing case summary."""
+        """Replace the case summary with the latest Analisis_Log alert description."""
         current = await self._get(self.paths["case_read"].format(id=case_id))
-        existing = current.get("case_description")
-        if not isinstance(existing, str):
-            existing = current.get("description")
-        if not isinstance(existing, str):
+        current_description = current.get("case_description")
+        if not isinstance(current_description, str):
+            current_description = current.get("description")
+        if not isinstance(current_description, str):
             raise IrisError(
                 f"IRIS tidak mengembalikan deskripsi case {case_id}; pembaruan dibatalkan"
             )
 
-        start_marker = "<!-- analisis-log-enrichment:start -->"
-        end_marker = "<!-- analisis-log-enrichment:end -->"
-        description = self.build_payload(doc)["alert_description"]
-        managed_section = (
-            f"{start_marker}\n\n"
-            "## Enrichment terbaru dari Analisis_Log\n\n"
-            f"{description}\n\n"
-            f"{end_marker}"
-        )
-        start = existing.find(start_marker)
-        if start >= 0:
-            end = existing.find(end_marker, start + len(start_marker))
-            if end < 0:
-                raise IrisError(
-                    f"Marker pembaruan Analisis_Log pada case {case_id} tidak lengkap"
-                )
-            end += len(end_marker)
-            updated_description = (
-                existing[:start] + managed_section + existing[end:]
-            )
-        else:
-            updated_description = (
-                f"{existing.rstrip()}\n\n---\n\n{managed_section}"
-                if existing.strip() else managed_section
-            )
-
-        if updated_description == existing:
+        updated_description = self.build_payload(doc)["alert_description"]
+        if updated_description == current_description:
             return False
 
         if self.api_version == "v2":
