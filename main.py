@@ -387,6 +387,11 @@ def merge_enrichment(target: dict, event: dict) -> None:
             incoming_opencti = entry.get("opencti")
             if isinstance(previous_opencti, dict) and isinstance(incoming_opencti, dict):
                 merged_opencti = {**previous_opencti, **incoming_opencti}
+                if (
+                    previous_opencti.get("related_data_truncated") is True
+                    or incoming_opencti.get("related_data_truncated") is True
+                ):
+                    merged_opencti["related_data_truncated"] = True
                 previous_observable = previous_opencti.get("observable")
                 incoming_observable = incoming_opencti.get("observable")
                 if isinstance(previous_observable, dict) and isinstance(
@@ -395,6 +400,66 @@ def merge_enrichment(target: dict, event: dict) -> None:
                     merged_opencti["observable"] = {
                         **previous_observable, **incoming_observable
                     }
+                for field in (
+                    "indicators", "related_entities", "relationships",
+                    "sightings", "locations", "sources", "labels",
+                ):
+                    previous_items = previous_opencti.get(field)
+                    incoming_items = incoming_opencti.get(field)
+                    if not isinstance(previous_items, list) and not isinstance(
+                        incoming_items, list
+                    ):
+                        continue
+                    merged_items = []
+                    item_positions = {}
+                    for item in (
+                        (previous_items if isinstance(previous_items, list) else [])
+                        + (incoming_items if isinstance(incoming_items, list) else [])
+                    ):
+                        if isinstance(item, dict):
+                            if field == "relationships":
+                                from_entity = item.get("from")
+                                to_entity = item.get("to")
+                                identity = item.get("id") or (
+                                    item.get("relationship_type"),
+                                    from_entity.get("id") if isinstance(from_entity, dict) else None,
+                                    to_entity.get("id") if isinstance(to_entity, dict) else None,
+                                )
+                            else:
+                                identity = item.get("id") or (
+                                    item.get("entity_type") or item.get("type"),
+                                    item.get("name") or item.get("value"),
+                                )
+                        else:
+                            identity = item
+                        if identity in item_positions:
+                            position = item_positions[identity]
+                            if isinstance(item, dict) and isinstance(
+                                merged_items[position], dict
+                            ):
+                                merged_items[position] = {
+                                    **merged_items[position], **item
+                                }
+                            continue
+                        item_positions[identity] = len(merged_items)
+                        merged_items.append(item)
+                    merged_opencti[field] = merged_items
+                    count_field = {
+                        "indicators": "indicator_match_count",
+                        "related_entities": "related_entity_count",
+                        "relationships": "relationship_count",
+                        "sightings": "sighting_count",
+                    }.get(field)
+                    if count_field:
+                        counts = [
+                            context.get(count_field)
+                            for context in (previous_opencti, incoming_opencti)
+                            if isinstance(context.get(count_field), int)
+                        ]
+                        if counts:
+                            merged_opencti[count_field] = max(
+                                max(counts), len(merged_items)
+                            )
                 merged_entry["opencti"] = merged_opencti
             observables[index] = merged_entry
             return
