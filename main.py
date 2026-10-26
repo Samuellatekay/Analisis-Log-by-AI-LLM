@@ -1150,33 +1150,45 @@ class App:
                                   host_name)
 
     async def _enrich(self, events: list[dict]) -> list[tuple[int, float | None]]:
-        """1 pipeline Redis per batch: counter pengulangan (+ fallback asset criticality)."""
+        # 1 pipeline Redis per batch: counter pengulangan (+ fallback asset criticality).
+        # Criticality dicari di Redis hash asset:<kunci>, field "criticality", berurutan:
+        # asset.id / nama host, lalu IP tujuan, lalu IP sumber. Nilai pertama yang ada dipakai.
         s = self.s
         pipe = self.redis.pipeline(transaction=False)
-        need_asset: list[bool] = []
+        asset_keys: list[list[str]] = []
         for d in events:
             pipe.incr(self._repeat_key(d))
             pipe.expire(self._repeat_key(d), s.repeat_window_s)
+            keys: list[str] = []
             asset = d.get("asset") if isinstance(d.get("asset"), dict) else {}
-            host = (d.get("host") or {}).get("name") if isinstance(d.get("host"), dict) else None
-            need = asset.get("criticality") is None and bool(host or asset.get("id"))
-            if need:
-                pipe.hget(f"asset:{asset.get('id') or host}", "criticality")
-            need_asset.append(need)
+            if asset.get("criticality") is None:
+                host = (d.get("host") or {}).get("name") if isinstance(d.get("host"), dict) else None
+                idents = [asset.get("id") or host]
+                for side in ("destination", "source"):
+                    side_data = d.get(side) if isinstance(d.get(side), dict) else {}
+                    idents.append(side_data.get("ip"))
+                for ident in idents:
+                    key = f"asset:{ident}" if ident else None
+                    if key and key not in keys:
+                        keys.append(key)
+            for key in keys:
+                pipe.hget(key, "criticality")
+            asset_keys.append(keys)
         res = await pipe.execute()
         out, i = [], 0
-        for need in need_asset:
+        for keys in asset_keys:
             repeat = int(res[i]); i += 2
             crit = None
-            if need:
-                try:
-                    crit = float(res[i]) if res[i] is not None else None
-                except (TypeError, ValueError):
-                    crit = None
-                i += 1
+            for _ in keys:
+                raw = res[i]; i += 1
+                if crit is None and raw is not None:
+                    try:
+                        crit = float(raw)
+                    except (TypeError, ValueError):
+                        crit = None
             out.append((repeat, crit))
         return out
-
+    
     @staticmethod
     def _repeat_key(d: dict) -> str:
         src = d.get("source") if isinstance(d.get("source"), dict) else {}
