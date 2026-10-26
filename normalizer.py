@@ -281,7 +281,7 @@ def norm_opencti(payload: dict) -> dict:
     out = dict(p)
     out["event"] = event
     out["data_source"] = "opencti"
-    out["threat"] = {**_dict(p.get("threat")), "base_weight": _dict(p.get("threat")).get("base_weight", 3)}
+    out["threat"] = {**_dict(p.get("threat")), "base_weight": _dict(p.get("threat")).get("base_weight", 4)}
     if score is not None or is_indicator:
         out["reputation"] = {
             **_dict(p.get("reputation")),

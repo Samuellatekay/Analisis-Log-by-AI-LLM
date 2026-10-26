@@ -64,9 +64,9 @@ def compute_threat_weight(base_weight: float, reputation_score: float | None = N
     w = _clamp(base_weight, 1, 5)
     bonus = 0.0
     if reputation_score is not None:  # 0-100, makin tinggi makin buruk
-        bonus += 2.0 if reputation_score >= 80 else 1.0 if reputation_score >= 50 else 0.0
+        bonus += 1.0 if reputation_score >= 80 else 0.5 if reputation_score >= 50 else 0.0
     if ioc_match:
-        bonus += 1.0
+        bonus += 0.5
     if domain_age_days is not None:
         bonus += 1.0 if domain_age_days < 30 else 0.5 if domain_age_days < 180 else 0.0
     if repeat_count >= 100:
