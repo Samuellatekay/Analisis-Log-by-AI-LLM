@@ -75,7 +75,7 @@ def wazuh_severity(level: int) -> int:
 
 
 _MALWARE = ("malware", "virus", "ransomware", "backdoor", "rootkit", "rootcheck", "trojan", "webshell")
-_THREAT_EXACT = {"attack", "intrusion_detection", "authentication_failed"}  # pilihan pengguna
+_THREAT_EXACT = {"attack", "attacks", "intrusion_detection", "authentication_failed"}  # pilihan pengguna
 
 
 def _wazuh_category(groups: list[str]) -> str:
