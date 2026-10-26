@@ -1329,9 +1329,11 @@ class App:
         )
 
     async def _update_deduped_alert(self, key: str, r: Record) -> None:
-        """Event berulang yang kena dedup: perbarui alert IRIS yang sudah ada (skor, pengulangan).
+        """Event berulang yang kena dedup: perbarui alert dan case IRIS yang sudah ada.
 
-        Nilai key dedup berisi "<alert_id>:<log_uuid record asli>". Pembaruan dibatasi
+        Yang diperbarui: skor dan pengulangan pada alert, serta deskripsi case (bila alert sudah
+        dieskalasi) dengan laporan alert terbaru, sama seperti pembaruan dari enrichment.
+        Nilai key dedup berisi "<alert_id>:<log_uuid record asli>" ("0" bila mode case). Pembaruan dibatasi
         IRIS_UPDATE_MIN_S detik per (sumber, aksi) agar burst tidak membanjiri API IRIS.
         Set IRIS_UPDATE_MIN_S=0 untuk menonaktifkan.
         """
@@ -1340,21 +1342,41 @@ class App:
             return
         alert_part, _, uuid_part = str(await self.redis.get(key) or "").partition(":")
         if not alert_part.isdigit() or not uuid_part:
-            return  # alert belum selesai dibuat, atau mode case
+            return  # alert/case belum selesai dibuat
         throttle = key.replace("iris:dedup:", "iris:upd:", 1)
         if not await self.redis.set(throttle, "1", nx=True, ex=s.iris_update_s):
             return
         try:
-            doc = await self.db.bump_risk(uuid.UUID(uuid_part), r.doc.get("risk") or {}, r.risk_score)
+            origin = uuid.UUID(uuid_part)
+            doc = await self.db.bump_risk(origin, r.doc.get("risk") or {}, r.risk_score)
             if doc is None:
                 return
-            await self.iris.update_alert(int(alert_part), doc)
-            log.info("IRIS alert %s diperbarui dari event berulang (pengulangan=%s skor=%s)",
-                     alert_part, (r.doc.get("risk") or {}).get("repeat_count"), r.risk_score)
+            _, case_id = await self.db.get_iris_ids(origin)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.error("Gagal memperbarui alert IRIS %s dari event berulang: %s", alert_part, _error_label(exc))
+            log.error("Gagal membaca record asli untuk event berulang: %s", _error_label(exc))
+            return
+        repeat = (r.doc.get("risk") or {}).get("repeat_count")
+        alert_id = int(alert_part) or None
+        if alert_id:
+            try:
+                await self.iris.update_alert(alert_id, doc)
+                log.info("IRIS alert %s diperbarui dari event berulang (pengulangan=%s skor=%s)",
+                         alert_id, repeat, r.risk_score)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.error("Gagal memperbarui alert IRIS %s dari event berulang: %s", alert_id, _error_label(exc))
+        if case_id is not None:
+            try:
+                if await self.iris.update_case_description(int(case_id), doc):
+                    log.info("IRIS case %s diperbarui dari event berulang (pengulangan=%s skor=%s)",
+                             case_id, repeat, r.risk_score)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.error("Gagal memperbarui case IRIS %s dari event berulang: %s", case_id, _error_label(exc))
 
     async def _iris_worker(self) -> None:
         s = self.s
@@ -1390,9 +1412,9 @@ class App:
                     log.error("Gagal membuat %s IRIS %s: %s", "case" if s.iris_mode == "case" else "alert",
                               r.log_uuid, _error_label(exc))
                     continue
-                if alert_id is not None:
+                if alert_id is not None or case_id is not None:
                     try:  # simpan ID alert di key dedup (TTL tetap) agar event berulang bisa memperbaruinya
-                        await self.redis.set(key, f"{alert_id}:{r.log_uuid}", xx=True, keepttl=True)
+                        await self.redis.set(key, f"{alert_id or 0}:{r.log_uuid}", xx=True, keepttl=True)
                     except Exception:
                         log.warning("Gagal menyimpan ID alert di key dedup %s", key)
                 if s.iris_mode == "alert_case" and alert_id and r.risk_score >= s.iris_case_min_risk:
