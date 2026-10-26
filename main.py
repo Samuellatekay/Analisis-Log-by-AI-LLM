@@ -84,6 +84,7 @@ class Settings:
     logstash_timeout_s: float
     iris_min_risk: float
     iris_dedup_s: int
+    iris_update_s: int
     iris_workers: int
     iris_queue_max: int
     iris_mode: str
@@ -117,6 +118,7 @@ class Settings:
             logstash_timeout_s=float(_e("LOGSTASH_TIMEOUT_S", "5")),
             iris_min_risk=float(_e("IRIS_MIN_RISK", "60")),
             iris_dedup_s=int(_e("IRIS_DEDUP_WINDOW_S", "300")),
+            iris_update_s=int(_e("IRIS_UPDATE_MIN_S", "10")),
             iris_workers=int(_e("IRIS_WORKERS", "1")),
             iris_queue_max=int(_e("IRIS_QUEUE_MAX", "500")),
             iris_mode=_e("IRIS_MODE", "alert").lower(),
@@ -617,6 +619,22 @@ class Database:
                 log_uuid,
             )
         return (row["iris_alert_id"], row["iris_case_id"]) if row else (None, None)
+
+    async def bump_risk(self, log_uuid: uuid.UUID, risk: dict, risk_score: float) -> dict | None:
+        """Perbarui blok risk (skor, pengulangan) pada record asli yang sudah punya alert IRIS.
+
+        Mengembalikan payload terbaru (beserta enrichment yang sudah digabung), atau None bila
+        record sudah dihapus retensi atau skor barunya lebih rendah dari yang tersimpan.
+        """
+        async with self.pool.acquire() as conn:
+            payload = await conn.fetchval(
+                "UPDATE log_events SET payload = jsonb_set(payload, '{risk}', $2::jsonb), "
+                "risk_score = $3::real WHERE log_uuid = $1 AND risk_score <= $3::real "
+                "RETURNING payload",
+                log_uuid, orjson.dumps(risk).decode(), float(risk_score))
+        if isinstance(payload, str):
+            payload = orjson.loads(payload)
+        return payload if isinstance(payload, dict) else None
 
     async def purge_old(self, minutes: int) -> int:
         """Retensi: hapus log yang umurnya > N menit (default 60)."""
@@ -1150,9 +1168,11 @@ class App:
                                   host_name)
 
     async def _enrich(self, events: list[dict]) -> list[tuple[int, float | None]]:
-        # 1 pipeline Redis per batch: counter pengulangan (+ fallback asset criticality).
-        # Criticality dicari di Redis hash asset:<kunci>, field "criticality", berurutan:
-        # asset.id / nama host, lalu IP tujuan, lalu IP sumber. Nilai pertama yang ada dipakai.
+        """1 pipeline Redis per batch: counter pengulangan (+ fallback asset criticality).
+
+        Criticality dicari di Redis hash asset:<kunci>, field "criticality", berurutan:
+        asset.id / nama host, lalu IP tujuan, lalu IP sumber. Nilai pertama yang ada dipakai.
+        """
         s = self.s
         pipe = self.redis.pipeline(transaction=False)
         asset_keys: list[list[str]] = []
@@ -1188,7 +1208,7 @@ class App:
                         crit = None
             out.append((repeat, crit))
         return out
-    
+
     @staticmethod
     def _repeat_key(d: dict) -> str:
         src = d.get("source") if isinstance(d.get("source"), dict) else {}
@@ -1308,6 +1328,34 @@ class App:
             for item in observables
         )
 
+    async def _update_deduped_alert(self, key: str, r: Record) -> None:
+        """Event berulang yang kena dedup: perbarui alert IRIS yang sudah ada (skor, pengulangan).
+
+        Nilai key dedup berisi "<alert_id>:<log_uuid record asli>". Pembaruan dibatasi
+        IRIS_UPDATE_MIN_S detik per (sumber, aksi) agar burst tidak membanjiri API IRIS.
+        Set IRIS_UPDATE_MIN_S=0 untuk menonaktifkan.
+        """
+        s = self.s
+        if s.iris_update_s <= 0:
+            return
+        alert_part, _, uuid_part = str(await self.redis.get(key) or "").partition(":")
+        if not alert_part.isdigit() or not uuid_part:
+            return  # alert belum selesai dibuat, atau mode case
+        throttle = key.replace("iris:dedup:", "iris:upd:", 1)
+        if not await self.redis.set(throttle, "1", nx=True, ex=s.iris_update_s):
+            return
+        try:
+            doc = await self.db.bump_risk(uuid.UUID(uuid_part), r.doc.get("risk") or {}, r.risk_score)
+            if doc is None:
+                return
+            await self.iris.update_alert(int(alert_part), doc)
+            log.info("IRIS alert %s diperbarui dari event berulang (pengulangan=%s skor=%s)",
+                     alert_part, (r.doc.get("risk") or {}).get("repeat_count"), r.risk_score)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.error("Gagal memperbarui alert IRIS %s dari event berulang: %s", alert_part, _error_label(exc))
+
     async def _iris_worker(self) -> None:
         s = self.s
         while True:
@@ -1327,6 +1375,7 @@ class App:
                     continue
                 # cegah banjir: 1 item / (source, action) / window
                 if not await self.redis.set(key, "1", nx=True, ex=s.iris_dedup_s):
+                    await self._update_deduped_alert(key, r)
                     continue
                 alert_id = case_id = None
                 try:
@@ -1341,6 +1390,11 @@ class App:
                     log.error("Gagal membuat %s IRIS %s: %s", "case" if s.iris_mode == "case" else "alert",
                               r.log_uuid, _error_label(exc))
                     continue
+                if alert_id is not None:
+                    try:  # simpan ID alert di key dedup (TTL tetap) agar event berulang bisa memperbaruinya
+                        await self.redis.set(key, f"{alert_id}:{r.log_uuid}", xx=True, keepttl=True)
+                    except Exception:
+                        log.warning("Gagal menyimpan ID alert di key dedup %s", key)
                 if s.iris_mode == "alert_case" and alert_id and r.risk_score >= s.iris_case_min_risk:
                     case_id = await self._case_for(r, int(alert_id))
                 if alert_id is not None or case_id is not None:
