@@ -255,25 +255,25 @@ class IrisClient:
         destination_label = destination_ip or "Tidak tersedia di event"
 
         lines = [
-            "Risiko",
+            "**Risiko**",
             f"- Skor: {risk.get('score')} ({level})",
             f"- Faktor: kritikalitas aset {risk.get('asset_criticality')}, severity {risk.get('event_severity')}, outcome {risk.get('event_outcome')}, ancaman {risk.get('threat_weight')}, pengulangan {risk.get('repeat_count')}",
-            "Event",
+            "**Event**",
             f"- Deteksi: {what}",
             f"- Hasil: {_display(ev.get('outcome'), 60) or 'Tidak tersedia'}",
             f"- IP sumber (kemungkinan penyerang): {source_label}",
             *([f"- Wazuh Level: {_display(ev.get('wazuh_level'), 30)}"] if is_wazuh else []),
             f"- IP tujuan (host yang diserang): {destination_label}",
-            "Source",
+            "**Source**",
             *_format_asset(source_asset, src.get("ip")),
-            "Destination",
+            "**Destination**",
             *_format_asset(destination_asset, destination.get("ip")),
-            "Threat Intelligence Enrichment",
+            "**Threat Intelligence Enrichment**",
             *([f"- IP : {source_ip}"] if source_ip else []),
             *_format_reputation(doc.get("reputation"), observables),
-            "Geolokasi",
+            "**Geolokasi***",
             *_format_geolocation(doc.get("geolocation")),
-            "IOC terkait"
+            "**IOC terkait**"
         ]
         
         shown_ioc = False
