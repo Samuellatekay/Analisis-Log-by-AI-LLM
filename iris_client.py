@@ -196,6 +196,34 @@ def _format_threat_intel(doc: dict, observables: Any, source_ip: str | None) -> 
     return lines
 
 
+def _format_host_user(doc: dict) -> list[str]:
+    """Host (agen Wazuh) dan pengguna yang terlibat; berguna terutama saat event tidak punya IP."""
+    agent, host, asset = _d(doc.get("agent")), _d(doc.get("host")), _d(doc.get("asset"))
+    user, file_info = _d(doc.get("user")), _d(doc.get("file"))
+    host_name = _display(agent.get("name") or host.get("name") or asset.get("name"), 120)
+    agent_ip = _display(agent.get("ip"), 80)
+    actor = _display(user.get("name"), 120)
+    target = _display(_d(user.get("target")).get("name"), 120)
+    owner = _display(file_info.get("owner"), 120)
+    path = _display(file_info.get("path"), 300)
+    lines: list[str] = []
+    if host_name:
+        lines.append(f"- Host (agen Wazuh): {host_name}")
+    if agent_ip:
+        lines.append(f"- IP host: {agent_ip}")
+    if actor:
+        lines.append(f"- Pengguna (pelaku): {actor}")
+    if target:
+        lines.append(f"- Pengguna target: {target}")
+    if not (actor or target):
+        lines.append("- Pengguna: Tidak tersedia di event")
+    if owner:
+        lines.append(f"- Pemilik file: {owner}")
+    if path:
+        lines.append(f"- File: {path}")
+    return lines
+
+
 def _format_geolocation(value: Any) -> list[str]:
     geo = _d(value)
     if not geo or geo.get("available") is False:
@@ -345,6 +373,8 @@ class IrisClient:
             f"- IP sumber (kemungkinan penyerang): {source_label}",
             *([f"- Wazuh Level: {_display(ev.get('wazuh_level'), 30)}"] if is_wazuh else []),
             f"- IP tujuan (host yang diserang): {destination_label}",
+            "# Host dan Pengguna",
+            *_format_host_user(doc),
             "# Source",
             *_format_asset(source_asset, src.get("ip")),
             "# Destination",
