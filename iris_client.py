@@ -80,6 +80,7 @@ def _display(v: Any, n: int = 300) -> str | None:
 
 
 def _join_list(val: Any) -> str:
+    """Helper kebal-error untuk menggabungkan list menjadi string."""
     if isinstance(val, list):
         return ", ".join(str(v) for v in val if v)
     return str(val) if val else ""
@@ -88,19 +89,19 @@ def _join_list(val: Any) -> str:
 def _format_reputation(value: Any, observables: list | None = None) -> list[str]:
     reputation = _d(value)
     if not reputation:
-        return ["## Data reputasi belum tersedia."]
+        return ["- Data reputasi belum tersedia."]
     
     lines = []
     score = _display(reputation.get("opencti_score"), 30)
     verdict = _display(reputation.get("verdict"), 40)
     if score or verdict:
-        lines.append(f"## Skor OpenCTI: {score or 0}/100 - Verdict: {verdict or 'unknown'}.")
+        lines.append(f"- Skor OpenCTI: {score or 0}/100 - Verdict: {verdict or 'unknown'}.")
         
     labels = reputation.get("labels")
     if isinstance(labels, list) and labels:
         shown = [_display(label, 80) for label in labels[:8] if label]
         if shown:
-            lines.append(f"## Label: {', '.join(shown)}.")
+            lines.append(f"- Label: {', '.join(shown)}.")
             
     authors = []
     if isinstance(observables, list):
@@ -113,14 +114,14 @@ def _format_reputation(value: Any, observables: list | None = None) -> list[str]
                     if isinstance(author, dict): author = author.get("name")
                     if author and author not in authors: authors.append(str(author))
     
-    lines.append("## Author: " + ("; ".join(authors[:5]) + "." if authors else "Tidak tersedia."))
+    lines.append("- Author: " + ("; ".join(authors[:5]) + "." if authors else "Tidak tersedia."))
     return lines
 
 
 def _format_geolocation(value: Any) -> list[str]:
     geo = _d(value)
     if not geo or geo.get("available") is False:
-        return ["## Data geolokasi belum tersedia."]
+        return ["- Data geolokasi belum tersedia."]
         
     fields = (
         ("Lokasi", ", ".join(str(p) for p in (geo.get("city"), geo.get("region"), geo.get("country_name")) if p)),
@@ -129,14 +130,14 @@ def _format_geolocation(value: Any) -> list[str]:
         ("Hosting", "Ya" if geo.get("hosting") is True else "Tidak" if geo.get("hosting") is False else None),
         ("Proxy", "Ya" if geo.get("proxy") is True else "Tidak" if geo.get("proxy") is False else None),
     )
-    return [f"## {label}: {_md_escape(val, 180)}" for label, val in fields if _display(val, 180)]
+    return [f"- {label}: {_md_escape(val, 180)}" for label, val in fields if _display(val, 180)]
 
 
 def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[str]:
     is_glpi_asset = (asset.get("inventory_source") == "GLPI" or asset.get("found") is True)
     if not is_glpi_asset:
         searched_ip = _display(asset.get("ip") or source_ip, 80)
-        return [f"## Tidak ada aset GLPI yang cocok dengan IP {searched_ip}."]
+        return [f"- Tidak ada aset GLPI yang cocok dengan IP {searched_ip}."]
     
     assets = asset.get("items")
     if not isinstance(assets, list) or not assets:
@@ -146,7 +147,7 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[st
     for index, item in enumerate(assets[:10], start=1):
         if not isinstance(item, dict): continue
         asset_id = _display(item.get("id"), 80)
-        lines.append(f"## Aset GLPI #{asset_id or index}:")
+        lines.append(f"- Aset GLPI #{asset_id or index}:")
         
         fields = (
             ("Nama", item.get("name")),
@@ -164,7 +165,7 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[st
         for label, value in fields:
             display_val = _display(value, 180)
             if display_val:
-                lines.append(f"## {label}: {display_val}")
+                lines.append(f"- {label}: {display_val}")
     return lines
 
 
@@ -226,7 +227,8 @@ class IrisClient:
         return not (self.max_wazuh_level and lvl > self.max_wazuh_level)
 
     def build_payload(self, doc: dict) -> dict:
-        """Merakit dictionary payload dengan Heading 1 untuk kategori dan Heading 2 untuk data."""
+        """Merakit dictionary payload yang rapi dan ringkas."""
+        # Pengamanan: Jika input berupa object, ambil dictionary-nya
         if hasattr(doc, "doc") and isinstance(doc.doc, dict):
             doc = doc.doc
         if not isinstance(doc, dict):
@@ -254,23 +256,23 @@ class IrisClient:
 
         lines = [
             "# Risiko",
-            f" Skor: {risk.get('score')} ({level})",
-            f" Faktor: kritikalitas aset {risk.get('asset_criticality')}, severity {risk.get('event_severity')}, outcome {risk.get('event_outcome')}, ancaman {risk.get('threat_weight')}, pengulangan {risk.get('repeat_count')}",
+            f"- Skor: {risk.get('score')} ({level})",
+            f"- Faktor: kritikalitas aset {risk.get('asset_criticality')}, severity {risk.get('event_severity')}, outcome {risk.get('event_outcome')}, ancaman {risk.get('threat_weight')}, pengulangan {risk.get('repeat_count')}",
             "# Event",
-            f" Deteksi: {what}",
-            f" Hasil: {_display(ev.get('outcome'), 60) or 'Tidak tersedia'}",
-            f" IP sumber (kemungkinan penyerang): {source_label}",
-            *([f" Wazuh Level: {_display(ev.get('wazuh_level'), 30)}"] if is_wazuh else []),
-            f" IP tujuan (host yang diserang): {destination_label}",
+            f"- Deteksi: {what}",
+            f"- Hasil: {_display(ev.get('outcome'), 60) or 'Tidak tersedia'}",
+            f"- IP sumber (kemungkinan penyerang): {source_label}",
+            *([f"- Wazuh Level: {_display(ev.get('wazuh_level'), 30)}"] if is_wazuh else []),
+            f"- IP tujuan (host yang diserang): {destination_label}",
             "# Source",
-            _format_asset(source_asset, src.get("ip")),
+            *_format_asset(source_asset, src.get("ip")),
             "# Destination",
-            _format_asset(destination_asset, destination.get("ip")),
+            *_format_asset(destination_asset, destination.get("ip")),
             "# Threat Intelligence Enrichment",
-            ([f" IP : {source_ip}"] if source_ip else []),
-            _format_reputation(doc.get("reputation"), observables),
+            *([f"- IP : {source_ip}"] if source_ip else []),
+            *_format_reputation(doc.get("reputation"), observables),
             "# Geolokasi",
-            _format_geolocation(doc.get("geolocation")),
+            *_format_geolocation(doc.get("geolocation")),
             "# IOC terkait"
         ]
         
@@ -281,11 +283,11 @@ class IrisClient:
                 e_type = _display(obs.get("entity_type"), 40)
                 e_val = _display(obs.get("value"), 180)
                 if e_type and e_val:
-                    lines.append(f"## {e_type}: {e_val}")
+                    lines.append(f"- {e_type}: {e_val}")
                     shown_ioc = True
                     
         if not shown_ioc:
-            lines.append("## Detail IOC tidak tersedia.")
+            lines.append("- Detail IOC tidak tersedia.")
             
         lines.append(f"log_uuid: {doc.get('log_uuid')}")
 
