@@ -118,6 +118,14 @@ def _format_geolocation(value: Any) -> list[str]:
 
 class IrisClient:
     """Class untuk berinteraksi dengan API DFIR-IRIS."""
+    
+    @classmethod
+    def from_env(cls, env: dict) -> IrisClient | None:
+        """Instansiasi klien berdasarkan environment variables."""
+        if str(env.get("IRIS_ENABLED", "false")).strip().lower() != "true":
+            return None
+        return cls()
+
     def __init__(self):
         self.url = os.getenv("IRIS_URL", "").rstrip("/")
         self.api_key = os.getenv("IRIS_API_KEY", "")
