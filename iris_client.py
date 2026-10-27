@@ -143,6 +143,12 @@ class IrisClient:
             "medium": 4,
             "low": 3
         }
+        
+    def allows(self, doc: dict) -> bool:
+        """Mengecek apakah log ini valid dan diizinkan untuk dikirim ke IRIS."""
+        if not self.url or not self.api_key:
+            return False
+        return True
 
     def build_payload(self, doc: dict) -> dict:
         """Merakit dictionary payload yang siap dikirim via POST JSON ke IRIS."""
