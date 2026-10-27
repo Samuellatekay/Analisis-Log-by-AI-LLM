@@ -48,8 +48,7 @@ def _unwrap(j) -> dict:
         return {}
     d = j.get("data")
     return d if isinstance(d, dict) else j
-
-
+    
 DEFAULT_SEVERITY_MAP = {"low": 3, "medium": 4, "high": 5, "critical": 6}
 
 
@@ -80,18 +79,6 @@ def _display(v: Any, n: int = 300) -> str | None:
     return _md_escape(text, n)
 
 
-def _plain(v: Any, n: int = 120) -> str | None:
-    """Seperti _display, tetapi tanda '|' dipertahankan (mis. author 'Threat Fox | Abuse.ch')."""
-    if v is None or v == "" or v == [] or v == {}:
-        return None
-    text = str(v).strip()
-    if not text or text.lower() in {"none", "null", "n/a", "not available", "tidak tersedia"}:
-        return None
-    for ch in ("<", ">", "`"):
-        text = text.replace(ch, " ")
-    return " ".join(text.split())[:n]
-
-
 def _join_list(val: Any) -> str:
     """Helper kebal-error untuk menggabungkan list menjadi string."""
     if isinstance(val, list):
@@ -99,100 +86,35 @@ def _join_list(val: Any) -> str:
     return str(val) if val else ""
 
 
-# ----------------------------------------------------------- Threat Intelligence Enrichment
-_HASH_LABELS = {"sha256": "SHA-256", "sha-256": "SHA-256", "sha512": "SHA-512", "sha-512": "SHA-512",
-                "sha1": "SHA-1", "sha-1": "SHA-1", "md5": "MD5"}
-_HASH_ORDER = ("sha256", "sha512", "sha1", "md5")
-
-
-def _entry_authors(entry: dict) -> list[str]:
-    """Author indikator OpenCTI eksternal (indikator buatan collector sendiri dilewati)."""
-    authors: list[str] = []
-    indicators = _d(entry.get("opencti")).get("indicators")
-    for indicator in indicators if isinstance(indicators, list) else []:
-        if not isinstance(indicator, dict) or indicator.get("source") == "collector":
-            continue
-        author = indicator.get("created_by") or indicator.get("author")
-        if isinstance(author, dict):
-            author = author.get("name")
-        author = _plain(author, 120)
-        if author and author not in authors:
-            authors.append(author)
-    return authors
-
-
-def _ioc_entries(doc: dict, observables: Any, source_ip: str | None) -> list[dict]:
-    """IOC berbasis IP/jaringan, hash file, dan domain untuk bagian Threat Intelligence.
-
-    Urutan: IP sumber, IP lain, hash file, domain. IOC yang sudah ada di event tetapi belum punya
-    hasil enrichment tetap ditampilkan (tanpa data reputasi). Tanpa IP, baris IP tidak ditampilkan.
-    """
-    kinds = {"ipv4-addr": "IP", "ipv6-addr": "IP", "stixfile": "Hash", "domain-name": "Domain"}
-    entries: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    for obs in observables if isinstance(observables, list) else []:
-        if not isinstance(obs, dict):
-            continue
-        kind = kinds.get(str(obs.get("entity_type") or "").strip().lower())
-        value = _plain(obs.get("value"), 180)
-        if not kind or not value or (kind, value) in seen:
-            continue
-        seen.add((kind, value))
-        label = kind
-        algorithm = _HASH_LABELS.get(str(_d(obs.get("file_hash")).get("algorithm") or "").strip().lower())
-        if kind == "Hash" and algorithm:
-            label = f"Hash ({algorithm})"
-        entries.append({"kind": kind, "label": label, "value": value, "entry": obs})
-
-    if not any(item["kind"] == "Hash" for item in entries):
-        hashes = _d(_d(doc.get("file")).get("hash"))
-        for algorithm in _HASH_ORDER:
-            value = _plain(hashes.get(algorithm), 180)
-            if value:
-                entries.append({"kind": "Hash", "label": f"Hash ({_HASH_LABELS[algorithm]})",
-                                "value": value, "entry": {}})
-                break
-    if not any(item["kind"] == "Domain" for item in entries):
-        domain = _plain(_d(doc.get("domain")).get("name"), 180)
-        if domain:
-            entries.append({"kind": "Domain", "label": "Domain", "value": domain, "entry": {}})
-    if not entries and source_ip:
-        # alert lama tanpa observable: reputasi tingkat atas (khusus IP) dipakai bila ada
-        entries.append({"kind": "IP", "label": "IP", "value": source_ip,
-                        "entry": {"reputation": _d(doc.get("reputation"))}})
-
-    rank = {"IP": 1, "Hash": 2, "Domain": 3}
-    entries.sort(key=lambda item: 0 if (item["kind"] == "IP" and item["value"] == source_ip)
-                 else rank[item["kind"]])
-    return entries[:4]
-
-
-def _format_threat_intel(doc: dict, observables: Any, source_ip: str | None) -> list[str]:
-    """Threat Intelligence Enrichment untuk serangan berbasis IP/jaringan dan file/hash.
-
-    Per IOC: baris IP / Hash / Domain, lalu skor + verdict OpenCTI, label, dan author.
-    """
-    entries = _ioc_entries(doc, observables, source_ip)
-    if not entries:
+def _format_reputation(value: Any, observables: list | None = None) -> list[str]:
+    reputation = _d(value)
+    if not reputation:
         return ["- Data reputasi belum tersedia."]
-    lines: list[str] = []
-    for item in entries:
-        entry = item["entry"]
-        reputation = _d(entry.get("reputation"))
-        lines.append(f"- {item['label']} : {item['value']}")
-        score = _display(reputation.get("opencti_score"), 30)
-        verdict = _display(reputation.get("verdict"), 40)
-        if not (score or verdict):
-            lines.append("- Data reputasi belum tersedia.")
-            continue
+    
+    lines = []
+    score = _display(reputation.get("opencti_score"), 30)
+    verdict = _display(reputation.get("verdict"), 40)
+    if score or verdict:
         lines.append(f"- Skor OpenCTI: {score or 0}/100 - Verdict: {verdict or 'unknown'}.")
-        labels = reputation.get("labels")
-        shown = [_display(label, 80) for label in labels[:8] if label] if isinstance(labels, list) else []
-        shown = [label for label in shown if label]
+        
+    labels = reputation.get("labels")
+    if isinstance(labels, list) and labels:
+        shown = [_display(label, 80) for label in labels[:8] if label]
         if shown:
             lines.append(f"- Label: {', '.join(shown)}.")
-        authors = _entry_authors(entry)
-        lines.append("- Author: " + ("; ".join(authors[:5]) + "." if authors else "Tidak tersedia."))
+            
+    authors = []
+    if isinstance(observables, list):
+        for obs in observables:
+            if not isinstance(obs, dict): continue
+            inds = _d(obs.get("opencti")).get("indicators", [])
+            for ind in inds if isinstance(inds, list) else []:
+                if isinstance(ind, dict):
+                    author = ind.get("created_by") or ind.get("author")
+                    if isinstance(author, dict): author = author.get("name")
+                    if author and author not in authors: authors.append(str(author))
+    
+    lines.append("- Author: " + ("; ".join(authors[:5]) + "." if authors else "Tidak tersedia."))
     return lines
 
 
@@ -200,7 +122,7 @@ def _format_geolocation(value: Any) -> list[str]:
     geo = _d(value)
     if not geo or geo.get("available") is False:
         return ["- Data geolokasi belum tersedia."]
-
+        
     fields = (
         ("Lokasi", ", ".join(str(p) for p in (geo.get("city"), geo.get("region"), geo.get("country_name")) if p)),
         ("ISP", geo.get("isp") or geo.get("org")),
@@ -215,21 +137,18 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[st
     is_glpi_asset = (asset.get("inventory_source") == "GLPI" or asset.get("found") is True)
     if not is_glpi_asset:
         searched_ip = _display(asset.get("ip") or source_ip, 80)
-        if not searched_ip:
-            return ["- Tidak ada IP pada event; pencarian aset GLPI berdasarkan IP dilewati."]
         return [f"- Tidak ada aset GLPI yang cocok dengan IP {searched_ip}."]
-
+    
     assets = asset.get("items")
     if not isinstance(assets, list) or not assets:
         assets = [asset]
-
+    
     lines = []
     for index, item in enumerate(assets[:10], start=1):
-        if not isinstance(item, dict):
-            continue
+        if not isinstance(item, dict): continue
         asset_id = _display(item.get("id"), 80)
         lines.append(f"- Aset GLPI #{asset_id or index}:")
-
+        
         fields = (
             ("Nama", item.get("name")),
             ("IP privat", _join_list(item.get("private_ip_addresses"))),
@@ -288,9 +207,9 @@ class IrisClient:
             smap[k.strip().lower()] = int(v)
         status = env.get("IRIS_STATUS_ID", "").strip()
         obj = cls(url, key, int(env.get("IRIS_CUSTOMER_ID", "1")), verify,
-                  float(env.get("IRIS_TIMEOUT_S", "30")), smap,
-                  int(status) if status else None, env.get("IRIS_SOURCE_LINK_TEMPLATE", ""),
-                  env.get("IRIS_API_VERSION", "v2").lower())
+                   float(env.get("IRIS_TIMEOUT_S", "30")), smap,
+                   int(status) if status else None, env.get("IRIS_SOURCE_LINK_TEMPLATE", ""),
+                   env.get("IRIS_API_VERSION", "v2").lower())
         obj._severity_explicit = bool(env.get("IRIS_SEVERITY_MAP", "").strip())
         obj.min_wazuh_level = int(env.get("IRIS_MIN_WAZUH_LEVEL", "0") or 0)
         obj.max_wazuh_level = int(env.get("IRIS_MAX_WAZUH_LEVEL", "0") or 0)
@@ -319,17 +238,17 @@ class IrisClient:
         ev = _d(doc.get("event"))
         src = _d(doc.get("source"))
         asset = _d(doc.get("asset"))
-
+        
         level = str(risk.get("level", "medium")).lower()
         what = _md_escape(ev.get("action") or ev.get("category") or "event", 80)
         who = _md_escape(src.get("ip") or asset.get("name") or "unknown", 80)
-
+        
         destination = _d(doc.get("destination"))
         source_asset = _d(src.get("asset")) or (asset if src.get("ip") else {})
         destination_asset = _d(destination.get("asset"))
         observables = _d(doc.get("enrichment")).get("observables") or []
         is_wazuh = doc.get("data_source") == "wazuh" or "wazuh_level" in ev
-
+        
         destination_ip = _display(destination.get("ip"), 80)
         source_ip = _display(src.get("ip"), 80)
         source_label = source_ip or "Tidak tersedia di event"
@@ -350,26 +269,26 @@ class IrisClient:
             "# Destination",
             *_format_asset(destination_asset, destination.get("ip")),
             "# Threat Intelligence Enrichment",
-            *_format_threat_intel(doc, observables, source_ip),
+            *([f"- IP : {source_ip}"] if source_ip else []),
+            *_format_reputation(doc.get("reputation"), observables),
             "# Geolokasi",
             *_format_geolocation(doc.get("geolocation")),
             "# IOC terkait"
         ]
-
+        
         shown_ioc = False
         if isinstance(observables, list) and observables:
             for obs in observables[:20]:
-                if not isinstance(obs, dict):
-                    continue
+                if not isinstance(obs, dict): continue
                 e_type = _display(obs.get("entity_type"), 40)
                 e_val = _display(obs.get("value"), 180)
                 if e_type and e_val:
                     lines.append(f"- {e_type}: {e_val}")
                     shown_ioc = True
-
+                    
         if not shown_ioc:
             lines.append("- Detail IOC tidak tersedia.")
-
+            
         lines.append(f"log_uuid: {doc.get('log_uuid')}")
 
         tags = ["analisis_log", f"risk:{level}"]
@@ -471,12 +390,7 @@ class IrisClient:
         d = await self._post(self.paths["case"], body)
         return d.get("case_id") or d.get("id")
 
-    async def update_case_description(self, case_id: int, doc: dict, reason: str = "") -> bool:
-        """Ganti deskripsi case (tab Summary) dengan laporan alert terbaru.
-
-        Deskripsi lama tidak dibuang: disimpan lebih dulu sebagai catatan (Notes) case. Bila catatan
-        gagal dibuat, deskripsi TIDAK diganti (agar versi lama tidak hilang) dan error diteruskan.
-        """
+    async def update_case_description(self, case_id: int, doc: dict) -> bool:
         current = await self._get(self.paths["case_read"].format(id=case_id))
         current_description = current.get("case_description")
         if not isinstance(current_description, str):
@@ -489,13 +403,6 @@ class IrisClient:
         updated_description = self.build_payload(doc)["alert_description"]
         if updated_description == current_description:
             return False
-
-        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        title = f"Laporan sebelumnya - diganti {stamp}" + (f" ({reason})" if reason else "")
-        await self._post_case_note(
-            case_id, title[:154],
-            f"Versi laporan case sebelum diperbarui pada {stamp}.\n\n{current_description}",
-        )
 
         if self.api_version == "v2":
             await self._put(
@@ -522,14 +429,6 @@ class IrisClient:
 
     async def add_case_note(self, case_id: int, doc: dict) -> None:
         payload = self.build_payload(doc)
-        await self._post_case_note(
-            case_id,
-            f"Enrichment update - {doc.get('log_uuid')}"[:154],
-            payload["alert_description"],
-        )
-
-    async def _post_case_note(self, case_id: int, title: str, content: str) -> None:
-        """Buat satu catatan (Notes) pada case; v2 memakai direktori catatan."""
         if self.api_version == "v2":
             directories_path = self.paths["case_note_directories"].format(id=case_id)
             response = await self._get(directories_path, {"per_page": 100, "page": 1})
@@ -559,8 +458,8 @@ class IrisClient:
         else:
             directory_id = None
         body: dict[str, Any] = {
-            "note_title": title,
-            "note_content": content,
+            "note_title": f"Enrichment update - {doc.get('log_uuid')}"[:154],
+            "note_content": payload["alert_description"],
         }
         if directory_id is not None:
             body["directory_id"] = directory_id
