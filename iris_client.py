@@ -7,7 +7,8 @@ from __future__ import annotations
 import os
 import json
 import logging
-import requests
+import urllib.request
+import urllib.error
 from typing import Any
 from datetime import datetime, timezone
 
@@ -215,7 +216,7 @@ class IrisClient:
         return payload
 
     def send_alert(self, doc: dict) -> dict:
-        """Kirim payload alert ke IRIS via HTTP API."""
+        """Kirim payload alert ke IRIS via HTTP API menggunakan library bawaan urllib."""
         if not self.url or not self.api_key:
             logger.warning("IRIS_URL atau IRIS_API_KEY tidak diatur. Melewati pengiriman ke IRIS.")
             return {"status": "skipped", "reason": "iris_not_configured"}
@@ -229,12 +230,19 @@ class IrisClient:
         
         try:
             endpoint = f"{self.url}/alerts/add"
-            resp = requests.post(endpoint, json=payload, headers=headers, timeout=10)
-            resp.raise_for_status()
-            logger.info(f"Berhasil mengirim alert ke IRIS untuk log: {doc.get('log_uuid')}")
-            return resp.json()
-        except requests.exceptions.RequestException as e:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(endpoint, data=data, headers=headers, method="POST")
+            
+            with urllib.request.urlopen(req, timeout=10) as response:
+                resp_data = response.read().decode("utf-8")
+                logger.info(f"Berhasil mengirim alert ke IRIS untuk log: {doc.get('log_uuid')}")
+                return json.loads(resp_data)
+                
+        except urllib.error.HTTPError as e:
+            logger.error(f"Gagal mengirim alert ke IRIS (HTTP Error): {e.code} - {e.reason}")
+            error_body = e.read().decode("utf-8")
+            logger.error(f"Response body: {error_body}")
+            return {"status": "error", "error": f"HTTP {e.code}: {error_body}"}
+        except Exception as e:
             logger.error(f"Gagal mengirim alert ke IRIS: {e}")
-            if hasattr(e, "response") and e.response is not None:
-                logger.error(f"Response body: {e.response.text}")
             return {"status": "error", "error": str(e)}
