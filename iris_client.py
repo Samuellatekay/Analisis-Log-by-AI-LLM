@@ -9,6 +9,7 @@ import json
 import logging
 import urllib.request
 import urllib.error
+import traceback
 from typing import Any
 from datetime import datetime, timezone
 
@@ -32,6 +33,12 @@ def _md_escape(value: Any, max_len: int = 100) -> str:
         s = s.replace(char, f"\\{char}")
     return s
 
+def _join_list(val: Any) -> str:
+    """Helper kebal-error untuk menggabungkan list menjadi string."""
+    if isinstance(val, list):
+        return ", ".join(str(v) for v in val if v)
+    return str(val) if val else ""
+
 def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[str]:
     """Format tampilan aset ke list Markdown."""
     is_glpi_asset = (asset.get("inventory_source") == "GLPI" or asset.get("found") is True)
@@ -51,8 +58,8 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[st
         
         fields = (
             ("Nama", item.get("name")),
-            ("IP privat", ", ".join(item.get("private_ip_addresses", []))),
-            ("IP publik", ", ".join(item.get("public_ip_addresses", []))),
+            ("IP privat", _join_list(item.get("private_ip_addresses"))),
+            ("IP publik", _join_list(item.get("public_ip_addresses"))),
             ("Pemilik", item.get("owner") or item.get("user")),
             ("Sistem operasi", item.get("operating_system")),
             ("Status", item.get("status")),
@@ -152,6 +159,12 @@ class IrisClient:
 
     def build_payload(self, doc: dict) -> dict:
         """Merakit dictionary payload yang siap dikirim via POST JSON ke IRIS."""
+        # PENGAMANAN: Jika yang dikirim adalah object (LogRecord), ambil dictionary-nya
+        if hasattr(doc, "doc") and isinstance(doc.doc, dict):
+            doc = doc.doc
+        if not isinstance(doc, dict):
+            doc = {}
+
         risk = _d(doc.get("risk"))
         ev = _d(doc.get("event"))
         src = _d(doc.get("source"))
@@ -230,26 +243,26 @@ class IrisClient:
         return payload
 
     def send_alert(self, doc: dict) -> dict:
-        """Kirim payload alert ke IRIS via HTTP API menggunakan library bawaan urllib."""
-        if not self.url or not self.api_key:
-            logger.warning("IRIS_URL atau IRIS_API_KEY tidak diatur. Melewati pengiriman ke IRIS.")
-            return {"status": "skipped", "reason": "iris_not_configured"}
-
-        payload = self.build_payload(doc)
-        
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        
+        """Kirim payload alert ke IRIS via HTTP API."""
         try:
+            if not self.url or not self.api_key:
+                logger.warning("IRIS_URL atau IRIS_API_KEY tidak diatur. Melewati pengiriman ke IRIS.")
+                return {"status": "skipped", "reason": "iris_not_configured"}
+
+            payload = self.build_payload(doc)
+            
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
             endpoint = f"{self.url}/alerts/add"
             data = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(endpoint, data=data, headers=headers, method="POST")
             
             with urllib.request.urlopen(req, timeout=10) as response:
                 resp_data = response.read().decode("utf-8")
-                logger.info(f"Berhasil mengirim alert ke IRIS untuk log: {doc.get('log_uuid')}")
+                logger.info(f"Berhasil mengirim alert ke IRIS untuk log: {payload.get('alert_source_ref')}")
                 return json.loads(resp_data)
                 
         except urllib.error.HTTPError as e:
@@ -258,5 +271,6 @@ class IrisClient:
             logger.error(f"Response body: {error_body}")
             return {"status": "error", "error": f"HTTP {e.code}: {error_body}"}
         except Exception as e:
-            logger.error(f"Gagal mengirim alert ke IRIS: {e}")
-            return {"status": "error", "error": str(e)}
+            # Jika masih terjadi error, ini akan mencetak baris penyebab utamanya di terminal!
+            logger.error(f"Gagal mengirim alert ke IRIS: {e}\n{traceback.format_exc()}")
+            raise e
