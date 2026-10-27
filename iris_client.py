@@ -80,7 +80,6 @@ def _display(v: Any, n: int = 300) -> str | None:
 
 
 def _join_list(val: Any) -> str:
-    """Helper kebal-error untuk menggabungkan list menjadi string."""
     if isinstance(val, list):
         return ", ".join(str(v) for v in val if v)
     return str(val) if val else ""
@@ -114,7 +113,8 @@ def _format_reputation(value: Any, observables: list | None = None) -> list[str]
                     if isinstance(author, dict): author = author.get("name")
                     if author and author not in authors: authors.append(str(author))
     
-    lines.append("- Author: " + ("; ".join(authors[:5]) + "." if authors else "Tidak tersedia."))
+    author_str = " | ".join(authors[:5]) if authors else "Tidak tersedia"
+    lines.append(f"- Author: {author_str}.")
     return lines
 
 
@@ -227,8 +227,7 @@ class IrisClient:
         return not (self.max_wazuh_level and lvl > self.max_wazuh_level)
 
     def build_payload(self, doc: dict) -> dict:
-        """Merakit dictionary payload yang rapi dan ringkas."""
-        # Pengamanan: Jika input berupa object, ambil dictionary-nya
+        """Merakit dictionary payload sesuai desain bersih yang diinginkan."""
         if hasattr(doc, "doc") and isinstance(doc.doc, dict):
             doc = doc.doc
         if not isinstance(doc, dict):
@@ -255,25 +254,25 @@ class IrisClient:
         destination_label = destination_ip or "Tidak tersedia di event"
 
         lines = [
-            "# Risiko",
+            "Risiko",
             f"- Skor: {risk.get('score')} ({level})",
             f"- Faktor: kritikalitas aset {risk.get('asset_criticality')}, severity {risk.get('event_severity')}, outcome {risk.get('event_outcome')}, ancaman {risk.get('threat_weight')}, pengulangan {risk.get('repeat_count')}",
-            "# Event",
+            "Event",
             f"- Deteksi: {what}",
             f"- Hasil: {_display(ev.get('outcome'), 60) or 'Tidak tersedia'}",
             f"- IP sumber (kemungkinan penyerang): {source_label}",
             *([f"- Wazuh Level: {_display(ev.get('wazuh_level'), 30)}"] if is_wazuh else []),
             f"- IP tujuan (host yang diserang): {destination_label}",
-            "# Source",
+            "Source",
             *_format_asset(source_asset, src.get("ip")),
-            "# Destination",
+            "Destination",
             *_format_asset(destination_asset, destination.get("ip")),
-            "# Threat Intelligence Enrichment",
+            "Threat Intelligence Enrichment",
             *([f"- IP : {source_ip}"] if source_ip else []),
             *_format_reputation(doc.get("reputation"), observables),
-            "# Geolokasi",
+            "Geolokasi",
             *_format_geolocation(doc.get("geolocation")),
-            "# IOC terkait"
+            "IOC terkait"
         ]
         
         shown_ioc = False
