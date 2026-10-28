@@ -43,7 +43,7 @@ async def fetch_latest_alerts():
     headers = {
         "Authorization": f"Bearer {IRIS_API_KEY}",
         "Accept": "application/json",
-        "User-Agent": "IRIS-Alert-Stream/2.1",
+        "User-Agent": "IRIS-Alert-Stream/3.0",
     }
     
     async with httpx.AsyncClient(verify=False, timeout=REQUEST_TIMEOUT) as client:
@@ -124,8 +124,6 @@ async def handle_client(reader, writer):
             
             formatted_alerts = []
             for alert in alerts:
-                alert_id = alert.get("id") or alert.get("alert_id")
-                
                 # Ekstrak 'original'
                 original_log = alert.get("original") or alert.get("alert_source_content", "Tidak ada data original")
                 if isinstance(original_log, str):
@@ -136,11 +134,10 @@ async def handle_client(reader, writer):
                     except json.JSONDecodeError:
                         pass
                 
+                # HANYA 2 FIELD SESUAI PERMINTAAN
                 formatted_alerts.append({
-                    "iris_alert_id": alert_id,
-                    "alert_title": alert.get("alert_title", "Tanpa Judul"),
                     "alert_description": alert.get("alert_description", ""),
-                    "original": original_log  # <-- FIELD ORIGINAL DITAMBAHKAN DI SINI
+                    "original": original_log
                 })
 
             body = json.dumps(formatted_alerts, ensure_ascii=False, indent=2, default=str).encode("utf-8")
@@ -172,8 +169,6 @@ async def handle_client(reader, writer):
             if initial_alerts:
                 log.info("📦 Mengirim %d alert snapshot awal ke %s", len(initial_alerts), peer)
                 for alert in initial_alerts[:5]:
-                    alert_id = alert.get("id") or alert.get("alert_id")
-                    
                     original_log = alert.get("original") or alert.get("alert_source_content", "Tidak ada data original")
                     if isinstance(original_log, str):
                         try:
@@ -183,12 +178,10 @@ async def handle_client(reader, writer):
                         except json.JSONDecodeError:
                             pass
                     
+                    # HANYA 2 FIELD SESUAI PERMINTAAN
                     snapshot_payload = {
-                        "type": "snapshot",
-                        "iris_alert_id": alert_id,
-                        "alert_title": alert.get("alert_title", "Tanpa Judul"),
                         "alert_description": alert.get("alert_description", ""),
-                        "original": original_log  # <-- FIELD ORIGINAL DITAMBAHKAN DI SINI
+                        "original": original_log
                     }
                     await send_to_client(writer, snapshot_payload)
         except Exception as e:
@@ -223,6 +216,7 @@ async def iris_monitor():
             alerts = await fetch_latest_alerts()
 
             for alert in alerts:
+                # Deduplikasi tetap berjalan di background agar tidak spam
                 alert_id = alert.get("id") or alert.get("alert_id")
                 dedup_key = str(alert_id) if alert_id else json.dumps(alert, sort_keys=True, default=str)
 
@@ -261,17 +255,14 @@ async def iris_monitor():
                         pass
 
                 # ============================================================
-                # SUSUN PAYLOAD AKHIR (LENGKAP DENGAN "original")
+                # SUSUN PAYLOAD AKHIR (HANYA 2 FIELD)
                 # ============================================================
                 payload = {
-                    "type": "new_alert",
-                    "iris_alert_id": alert_id,
-                    "alert_title": alert.get("alert_title", "Tanpa Judul"),
                     "alert_description": alert.get("alert_description", ""),
-                    "original": original_log  # <-- FIELD ORIGINAL DITAMBAHKAN DI SINI
+                    "original": original_log
                 }
 
-                log.info("✅ Alert BARU: id=%s | title=%s", alert_id, alert.get("alert_title", "N/A")[:50])
+                log.info("✅ Alert BARU dikirim: id=%s", alert_id)
                 await broadcast_alert(payload)
 
         except Exception as e:
