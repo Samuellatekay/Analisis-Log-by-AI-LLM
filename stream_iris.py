@@ -175,9 +175,37 @@ def fetch_latest_alerts_sync():
     request = Request(IRIS_URL, headers=headers, method="GET")
     context = get_tls_context()
 
-    with urlopen(request, timeout=REQUEST_TIMEOUT, context=context) as response:
-        body = response.read().decode("utf-8")
-        payload = json.loads(body)
+    try:
+        with urlopen(request, timeout=REQUEST_TIMEOUT, context=context) as response:
+            # Baca dan bersihkan spasi/baris baru di awal/akhir
+            body = response.read().decode("utf-8").strip()
+            
+            # 1. Tangani respons kosong
+            if not body:
+                log.warning("IRIS API mengembalikan respons kosong (HTTP Status: %s)", response.status)
+                return []
+            
+            # 2. Coba parse JSON, jika gagal tampilkan potongan respons aslinya
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError as e:
+                log.error(
+                    "Gagal mengurai JSON dari IRIS API (Status: %s). "
+                    "Respons mentah (500 karakter pertama): %s", 
+                    response.status, 
+                    body[:500]  # Batasi 500 char agar log tidak penuh
+                )
+                raise ValueError(f"Invalid JSON dari IRIS API: {e}")
+                
+    except HTTPError as e:
+        # Tangani error HTTP (4xx, 5xx) secara eksplisit
+        error_body = e.read().decode("utf-8", errors="replace").strip()
+        log.error("IRIS API mengembalikan HTTP Error: %s %s", e.code, e.reason)
+        log.error("Detail error dari server: %s", error_body[:500])
+        raise
+    except URLError as e:
+        log.error("Gagal terhubung ke IRIS API (Network/SSL Error): %s", e.reason)
+        raise
 
     alerts = extract_alerts(payload)
     return [normalize_alert(alert) for alert in alerts]
@@ -265,7 +293,7 @@ async def handle_http_request(reader, writer, first_data):
         })
         await send_http_response(writer, 502, "Bad Gateway", body)
 
-    except (URLError, ssl.SSLError, TimeoutError) as exc:
+    except (URLError, ssl.SSLError, TimeoutError, ValueError) as exc:
         log.exception("Gagal mengambil data IRIS melalui HTTP")
         await send_http_response(
             writer, 502, "Bad Gateway",
