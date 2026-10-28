@@ -3,7 +3,7 @@ import json
 import httpx
 import os
 
-# Mengambil konfigurasi IRIS dari .env yang disuntikkan Docker
+# Mengambil konfigurasi IRIS (Otomatis disuntikkan oleh docker-compose)
 IRIS_URL = os.getenv("IRIS_URL", "https://iris.example.local")
 IRIS_API_KEY = os.getenv("IRIS_API_KEY", "")
 
@@ -37,7 +37,6 @@ async def fetch_latest_alert_from_iris():
                 if isinstance(inner_data, list):
                     alerts = inner_data
                 elif isinstance(inner_data, dict):
-                    # Jika ada pagination bersarang
                     alerts = inner_data.get("data", [])
                     if not isinstance(alerts, list):
                         alerts = []
@@ -79,6 +78,23 @@ async def handle_client(reader, writer):
     print(f"[+] Klien terkoneksi dari {addr}")
     
     try:
+        # [TAMBAHAN UNTUK WEB] Baca request GET awal dari browser agar buffer bersih
+        try:
+            await asyncio.wait_for(reader.read(1024), timeout=1.0)
+        except Exception:
+            pass
+            
+        # [TAMBAHAN UNTUK WEB] Kirim HTTP Header ke browser
+        http_header = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            "Connection: keep-alive\r\n"
+            "Cache-Control: no-cache\r\n"
+            "\r\n"
+        )
+        writer.write(http_header.encode('utf-8'))
+        await writer.drain()
+
         while True:
             payload = await fetch_latest_alert_from_iris()
             
@@ -95,7 +111,7 @@ async def handle_client(reader, writer):
             await asyncio.sleep(5)
             
     except (ConnectionResetError, BrokenPipeError):
-        print(f"[-] Klien {addr} terputus (koneksi ditutup pengguna).")
+        print(f"[-] Klien {addr} terputus (koneksi ditutup pengguna/browser).")
     except Exception as e:
         print(f"[!] Error koneksi pada klien {addr}: {e}")
     finally:
