@@ -40,8 +40,9 @@ services:
     command: ["python", "stream_iris.py"]
     env_file: .env
     environment:
-      - IRIS_VERIFY_SSL=true
-      - IRIS_CA_CERT=/app/iris-ca.crt
+      IRIS_VERIFY_SSL: "true"
+      IRIS_CA_CERT: /app/iris-ca.crt
+      IRIS_STREAM_PORT: "17771"
     ports:
       - "17771:17771"
     networks:

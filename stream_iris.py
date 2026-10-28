@@ -1,325 +1,398 @@
 
 import asyncio
 import json
-import httpx
+import logging
 import os
+import socket
+import ssl
+from datetime import datetime, timezone
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+from urllib.parse import urlparse
 
 # ============================================================
-# KONFIGURASI
+# CONFIGURATION
 # ============================================================
 
-IRIS_URL = os.getenv("IRIS_URL", "https://iris.local")
+HOST = "0.0.0.0"
+PORT = int(os.getenv("IRIS_STREAM_PORT", "17771"))
+
+IRIS_URL = os.getenv(
+    "IRIS_URL",
+    "https://iris.local/api/v2/alerts"
+).rstrip("/")
+
 IRIS_API_KEY = os.getenv("IRIS_API_KEY", "")
 
 IRIS_VERIFY_SSL = os.getenv(
     "IRIS_VERIFY_SSL", "true"
-).strip().lower() in ("1", "true", "yes", "on")
+).lower() in ("1", "true", "yes", "on")
 
 IRIS_CA_CERT = os.getenv(
-    "IRIS_CA_CERT",
-    "/etc/ssl/custom/iris-ca.pem"
+    "IRIS_CA_CERT", "/app/iris-ca.crt"
 )
 
-HOST = "0.0.0.0"
-PORT = 17771
+POLL_INTERVAL = float(os.getenv("IRIS_POLL_INTERVAL", "5"))
+REQUEST_TIMEOUT = float(os.getenv("IRIS_REQUEST_TIMEOUT", "30"))
 
-POLL_INTERVAL = 1
-PER_PAGE = 100
-
-IRIS_ALERTS_ENDPOINT = (
-    f"{IRIS_URL.rstrip('/')}/api/v2/alerts"
-)
-
-# Klien TCP aktif
+# Client TCP yang sedang terhubung
 clients = set()
 
-# ID alert yang sudah berhasil dikirim selama proses berjalan
-sent_alert_ids = set()
+# Hindari mengirim alert yang sama berulang kali
+seen_alerts = set()
 
-broadcast_lock = asyncio.Lock()
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
+log = logging.getLogger("iris-stream")
 
 
 # ============================================================
-# PARSING DATA
+# TLS
+# ============================================================
+
+def get_tls_context():
+    if not IRIS_VERIFY_SSL:
+        log.warning("IRIS TLS certificate verification DISABLED")
+        return ssl._create_unverified_context()
+
+    if not os.path.isfile(IRIS_CA_CERT):
+        raise FileNotFoundError(
+            f"CA certificate tidak ditemukan: {IRIS_CA_CERT}"
+        )
+
+    return ssl.create_default_context(cafile=IRIS_CA_CERT)
+
+
+# ============================================================
+# JSON HELPERS
 # ============================================================
 
 def parse_json_if_string(value):
-    if not isinstance(value, str):
-        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return value
 
-    try:
-        return json.loads(value)
-    except (json.JSONDecodeError, TypeError):
-        return value
+    return value
 
 
-def extract_alerts(data):
-    if isinstance(data, list):
-        return data
+def extract_alerts(payload):
+    """
+    Mendukung respons IRIS berbentuk:
+      - list alert
+      - {"data": [...]}
+      - {"alerts": [...]}
+      - {"data": {"alerts": [...]}}
+      - satu objek alert
+    """
+    payload = parse_json_if_string(payload)
 
-    if not isinstance(data, dict):
+    if isinstance(payload, list):
+        return payload
+
+    if not isinstance(payload, dict):
         return []
 
-    inner = data.get("data")
+    for key in ("alerts", "data", "results", "items"):
+        value = parse_json_if_string(payload.get(key))
 
-    if isinstance(inner, list):
-        return inner
+        if isinstance(value, list):
+            return value
 
-    if isinstance(inner, dict):
-        nested = inner.get("data")
-        if isinstance(nested, list):
-            return nested
+        if isinstance(value, dict):
+            for nested_key in ("alerts", "results", "items"):
+                nested = parse_json_if_string(value.get(nested_key))
+                if isinstance(nested, list):
+                    return nested
+
+    # Respons API mungkin membungkus satu alert di dalam data.
+    data = parse_json_if_string(payload.get("data"))
+    if isinstance(data, dict):
+        payload = data
+
+    if any(
+        key in payload
+        for key in ("alert_id", "id", "alert_title", "title")
+    ):
+        return [payload]
 
     return []
 
 
 def normalize_alert(alert):
+    """
+    Normalisasi satu alert untuk HTTP dan TCP.
+    Data asli tetap disimpan di field 'original'.
+    """
     if not isinstance(alert, dict):
-        return None
+        alert = {"value": alert}
 
-    alert_id = alert.get("id")
-
-    if alert_id is None:
-        alert_id = alert.get("alert_id")
-
-    if alert_id is None:
-        print("[!] Alert dilewati: ID tidak tersedia.")
-        return None
-
-    source_content = parse_json_if_string(
-        alert.get("alert_source_content", {})
+    alert_id = (
+        alert.get("alert_id")
+        or alert.get("id")
+        or alert.get("alert_uuid")
     )
 
-    if not isinstance(source_content, dict):
-        source_content = {}
-
-    original = parse_json_if_string(
-        source_content.get(
-            "original",
-            "Data original tidak ditemukan di alert ini"
-        )
+    title = (
+        alert.get("alert_title")
+        or alert.get("title")
+        or alert.get("name")
+        or "IRIS Alert"
     )
 
-    return {
-        "alert_title": alert.get("alert_title"),
-        "alert_description": alert.get("alert_description"),
-        "original": original,
-        "iris_alert_id": alert_id
+    description = (
+        alert.get("alert_description")
+        or alert.get("description")
+        or alert.get("details")
+        or ""
+    )
+
+    result = {
+        "alert_title": title,
+        "alert_description": description,
+        "original": alert,
     }
 
+    if alert_id is not None:
+        try:
+            result["iris_alert_id"] = int(alert_id)
+        except (ValueError, TypeError):
+            result["iris_alert_id"] = alert_id
+
+    return result
+
 
 # ============================================================
-# KONFIGURASI TLS
+# IRIS API REQUEST
 # ============================================================
 
-def get_tls_verify():
+def fetch_latest_alerts_sync():
     """
-    Verifikasi TLS selalu aktif.
-    Jika CA internal disediakan, gunakan CA tersebut.
-    Jika tidak, gunakan CA bawaan sistem.
+    Mengambil alert dari IRIS menggunakan urllib.
+    Fungsi sinkron ini dijalankan melalui asyncio.to_thread().
     """
+    if not IRIS_API_KEY:
+        raise RuntimeError("IRIS_API_KEY belum diatur di .env")
 
-    if not IRIS_VERIFY_SSL:
-        raise RuntimeError(
-            "IRIS_VERIFY_SSL=false tidak diizinkan. "
-            "Aktifkan verifikasi TLS."
-        )
-
-    if IRIS_CA_CERT:
-        if not os.path.isfile(IRIS_CA_CERT):
-            raise FileNotFoundError(
-                f"CA IRIS tidak ditemukan: {IRIS_CA_CERT}. "
-                "Pastikan file tersedia dan di-mount ke container."
-            )
-
-        return IRIS_CA_CERT
-
-    return True
-
-
-# ============================================================
-# AMBIL ALERT DARI IRIS
-# ============================================================
-
-async def fetch_latest_alerts(client):
     headers = {
         "Authorization": f"Bearer {IRIS_API_KEY}",
         "Accept": "application/json",
-        "Content-Type": "application/json"
+        "User-Agent": "IRIS-Alert-Stream/1.0",
     }
 
-    try:
-        response = await client.get(
-            IRIS_ALERTS_ENDPOINT,
-            headers=headers,
-            params={
-                "per_page": PER_PAGE,
-                "page": 1
-            }
-        )
+    request = Request(
+        IRIS_URL,
+        headers=headers,
+        method="GET",
+    )
 
-        response.raise_for_status()
+    context = get_tls_context()
 
-        return extract_alerts(response.json())
+    with urlopen(
+        request,
+        timeout=REQUEST_TIMEOUT,
+        context=context,
+    ) as response:
+        body = response.read().decode("utf-8")
+        payload = json.loads(body)
 
-    except httpx.HTTPStatusError as exc:
-        print(
-            f"[!] HTTP IRIS {exc.response.status_code}: "
-            f"{exc.response.text[:300]}"
-        )
+    alerts = extract_alerts(payload)
+    return [normalize_alert(alert) for alert in alerts]
 
-    except httpx.RequestError as exc:
-        print(f"[!] Koneksi IRIS gagal: {exc}")
 
-    except (json.JSONDecodeError, ValueError) as exc:
-        print(f"[!] Respons IRIS tidak valid: {exc}")
-
-    except Exception as exc:
-        print(f"[!] Gagal membaca alert IRIS: {exc}")
-
-    return []
+async def fetch_latest_alerts():
+    return await asyncio.to_thread(fetch_latest_alerts_sync)
 
 
 # ============================================================
-# KIRIM DATA KE KLIEN
+# HTTP RESPONSE
+# ============================================================
+
+async def send_http_response(
+    writer,
+    status_code,
+    reason,
+    body,
+    content_type="application/json; charset=utf-8",
+):
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+
+    headers = (
+        f"HTTP/1.1 {status_code} {reason}\r\n"
+        f"Content-Type: {content_type}\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "\r\n"
+    ).encode("ascii")
+
+    writer.write(headers + body)
+    await writer.drain()
+
+
+async def handle_http_request(reader, writer, first_data):
+    """
+    Menangani HTTP di port yang sama dengan TCP streaming.
+    Endpoint GET / mengembalikan array alert dalam JSON.
+    """
+    try:
+        request_text = first_data.decode("iso-8859-1", errors="replace")
+        request_line = request_text.splitlines()[0] if request_text else ""
+        parts = request_line.split()
+
+        if len(parts) < 2:
+            await send_http_response(
+                writer, 400, "Bad Request",
+                json.dumps({"error": "Invalid HTTP request"})
+            )
+            return
+
+        method, path = parts[0], urlparse(parts[1]).path
+
+        # Baca sisa header jika belum diterima bersama data awal.
+        while b"\r\n\r\n" not in first_data:
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=2)
+            if not chunk:
+                break
+            first_data += chunk
+            if len(first_data) > 65536:
+                raise ValueError("HTTP headers terlalu besar")
+
+        if method == "OPTIONS":
+            await send_http_response(
+                writer,
+                204,
+                "No Content",
+                b"",
+            )
+            return
+
+        if method not in ("GET", "HEAD"):
+            await send_http_response(
+                writer, 405, "Method Not Allowed",
+                json.dumps({"error": "Gunakan GET atau HEAD"})
+            )
+            return
+
+        if path not in ("/", "/alerts", "/api/alerts"):
+            await send_http_response(
+                writer, 404, "Not Found",
+                json.dumps({
+                    "error": "Endpoint tidak ditemukan",
+                    "available_endpoints": [
+                        "/", "/alerts", "/api/alerts"
+                    ]
+                })
+            )
+            return
+
+        alerts = await fetch_latest_alerts()
+        body = json.dumps(
+            alerts,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+
+        if method == "HEAD":
+            await send_http_response(
+                writer, 200, "OK", b""
+            )
+        else:
+            await send_http_response(
+                writer, 200, "OK", body
+            )
+
+    except HTTPError as exc:
+        body = json.dumps({
+            "error": "IRIS API HTTP error",
+            "status": exc.code,
+            "detail": exc.read().decode("utf-8", errors="replace"),
+        })
+        await send_http_response(
+            writer, 502, "Bad Gateway", body
+        )
+
+    except (URLError, ssl.SSLError, TimeoutError) as exc:
+        log.exception("Gagal mengambil data IRIS melalui HTTP")
+        await send_http_response(
+            writer, 502, "Bad Gateway",
+            json.dumps({
+                "error": "Tidak dapat mengambil alert dari IRIS",
+                "detail": str(exc),
+            })
+        )
+
+    except Exception as exc:
+        log.exception("HTTP handler error")
+        try:
+            await send_http_response(
+                writer, 500, "Internal Server Error",
+                json.dumps({
+                    "error": "Internal server error",
+                    "detail": str(exc),
+                })
+            )
+        except Exception:
+            pass
+
+
+# ============================================================
+# TCP STREAMING
 # ============================================================
 
 async def send_to_client(writer, payload):
-    message = json.dumps(
-        payload,
-        ensure_ascii=False,
-        default=str
-    ) + "\n"
+    data = (
+        json.dumps(payload, ensure_ascii=False, default=str) + "\n"
+    ).encode("utf-8")
 
-    writer.write(message.encode("utf-8"))
+    writer.write(data)
     await writer.drain()
 
 
 async def broadcast_alert(payload):
-    """
-    Broadcast alert ke seluruh klien yang aktif.
-    Mengembalikan jumlah klien yang berhasil menerima data.
-    """
-
     disconnected = []
-    success_count = 0
 
-    async with broadcast_lock:
-        for writer in list(clients):
-            try:
-                await send_to_client(writer, payload)
-                success_count += 1
-
-            except (ConnectionResetError, BrokenPipeError, OSError) as exc:
-                print(f"[!] Koneksi klien gagal: {exc}")
-                disconnected.append(writer)
-
-            except Exception as exc:
-                print(f"[!] Pengiriman ke klien gagal: {exc}")
-                disconnected.append(writer)
-
-        for writer in disconnected:
-            clients.discard(writer)
-            writer.close()
-
-    return success_count
-
-
-# ============================================================
-# MONITORING ALERT BARU
-# ============================================================
-
-async def iris_monitor():
-    if not IRIS_API_KEY:
-        print("[!] PERINGATAN: IRIS_API_KEY kosong.")
-
-    while True:
+    for writer in list(clients):
         try:
-            tls_verify = get_tls_verify()
+            await send_to_client(writer, payload)
+        except (ConnectionError, OSError):
+            disconnected.append(writer)
 
-            async with httpx.AsyncClient(
-                verify=tls_verify,
-                timeout=httpx.Timeout(10.0)
-            ) as client:
-
-                print("[*] Koneksi TLS IRIS berhasil dikonfigurasi.")
-
-                while True:
-                    alerts = await fetch_latest_alerts(client)
-
-                    # Proses alert lama terlebih dahulu jika API
-                    # mengembalikan data terbaru pada posisi pertama.
-                    for alert in reversed(alerts):
-                        payload = normalize_alert(alert)
-
-                        if payload is None:
-                            continue
-
-                        alert_id = str(payload["iris_alert_id"])
-
-                        # Tidak mengirim alert yang sudah pernah dikirim.
-                        if alert_id in sent_alert_ids:
-                            continue
-
-                        # Jika tidak ada klien, jangan tandai terkirim.
-                        if not clients:
-                            continue
-
-                        success_count = await broadcast_alert(payload)
-
-                        if success_count > 0:
-                            sent_alert_ids.add(alert_id)
-
-                            print(
-                                f"[+] Alert baru dikirim | "
-                                f"ID={alert_id} | "
-                                f"Judul={payload.get('alert_title')} | "
-                                f"Klien={success_count}"
-                            )
-
-                    # Jika tidak ada alert baru, tidak ada pesan
-                    # yang dikirim ke klien.
-                    await asyncio.sleep(POLL_INTERVAL)
-
-        except asyncio.CancelledError:
-            raise
-
-        except Exception as exc:
-            print(f"[!] Monitoring IRIS error: {exc}")
-            print("[*] Mencoba kembali dalam 5 detik.")
-            await asyncio.sleep(5)
+    for writer in disconnected:
+        clients.discard(writer)
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
 
 
-# ============================================================
-# TCP SERVER
-# ============================================================
+async def handle_tcp_client(reader, writer):
+    """
+    TCP client menerima JSON Lines untuk setiap alert baru.
+    Koneksi tetap terbuka sampai client memutuskan koneksi.
+    """
+    peer = writer.get_extra_info("peername")
+    log.info("TCP client terhubung: %s", peer)
 
-async def handle_client(reader, writer):
-    addr = writer.get_extra_info("peername")
-
-    print(f"[+] Klien terhubung: {addr}")
     clients.add(writer)
 
     try:
-        # TCP NDJSON: setiap pesan diakhiri newline.
-        while True:
-            data = await reader.read(1024)
-
-            if not data:
-                break
-
-    except asyncio.CancelledError:
-        raise
-
-    except (ConnectionResetError, BrokenPipeError, OSError):
+        # Tunggu sampai client menutup koneksi.
+        # Streaming tidak mensyaratkan client mengirim data.
+        while await reader.read(4096):
+            pass
+    except (ConnectionError, OSError):
         pass
-
-    except Exception as exc:
-        print(f"[!] Error klien {addr}: {exc}")
-
     finally:
         clients.discard(writer)
-
         writer.close()
 
         try:
@@ -327,7 +400,118 @@ async def handle_client(reader, writer):
         except Exception:
             pass
 
-        print(f"[-] Klien terputus: {addr}")
+        log.info("TCP client terputus: %s", peer)
+
+
+# ============================================================
+# MULTIPLEXER: HTTP + TCP ON THE SAME PORT
+# ============================================================
+
+async def handle_client(reader, writer):
+    """
+    Membedakan HTTP browser dan TCP streaming pada port 17771.
+    Browser mengirim GET/HEAD; TCP streaming biasanya menunggu
+    data tanpa mengirim request.
+    """
+    peer = writer.get_extra_info("peername")
+
+    try:
+        try:
+            first_data = await asyncio.wait_for(
+                reader.read(4096),
+                timeout=0.7,
+            )
+        except asyncio.TimeoutError:
+            first_data = b""
+
+        if not first_data:
+            # TCP streaming client biasanya langsung menunggu alert.
+            await handle_tcp_client(reader, writer)
+            return
+
+        first_line = first_data.split(b"\r\n", 1)[0]
+        is_http = first_line.startswith((
+            b"GET ",
+            b"HEAD ",
+            b"POST ",
+            b"OPTIONS ",
+        ))
+
+        if is_http:
+            log.info("HTTP request dari %s", peer)
+            await handle_http_request(reader, writer, first_data)
+        else:
+            # Client TCP mengirim payload awal: pertahankan koneksi.
+            # Data awal tidak diproses sebagai perintah aplikasi.
+            log.info("TCP client mengirim data awal: %s", peer)
+            clients.add(writer)
+
+            try:
+                while await reader.read(4096):
+                    pass
+            finally:
+                clients.discard(writer)
+
+    except Exception:
+        log.exception("Client handler gagal: %s", peer)
+
+    finally:
+        if not writer.is_closing():
+            writer.close()
+
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+# ============================================================
+# IRIS POLLING
+# ============================================================
+
+async def iris_monitor():
+    log.info("IRIS polling aktif: %s", IRIS_URL)
+
+    while True:
+        try:
+            alerts = await fetch_latest_alerts()
+
+            for alert in alerts:
+                alert_id = alert.get("iris_alert_id")
+
+                # Gunakan ID IRIS jika tersedia. Jika tidak, gunakan
+                # representasi JSON agar alert yang sama tidak terus
+                # dikirim pada setiap polling.
+                dedup_key = (
+                    str(alert_id)
+                    if alert_id is not None
+                    else json.dumps(
+                        alert, sort_keys=True, default=str
+                    )
+                )
+
+                if dedup_key in seen_alerts:
+                    continue
+
+                seen_alerts.add(dedup_key)
+
+                # Batasi memori jika API mengembalikan banyak alert.
+                if len(seen_alerts) > 10000:
+                    seen_alerts.clear()
+                    seen_alerts.add(dedup_key)
+
+                log.info(
+                    "Alert baru: id=%s title=%s",
+                    alert_id,
+                    alert.get("alert_title"),
+                )
+
+                await broadcast_alert(alert)
+
+        except Exception:
+            log.exception("Gagal polling IRIS")
+
+        await asyncio.sleep(POLL_INTERVAL)
 
 
 # ============================================================
@@ -335,61 +519,38 @@ async def handle_client(reader, writer):
 # ============================================================
 
 async def main():
-    if not IRIS_VERIFY_SSL:
-        raise RuntimeError(
-            "TLS verification wajib aktif. "
-            "Periksa IRIS_VERIFY_SSL di .env."
-        )
-
-    print("=" * 60)
-    print("[*] IRIS REAL-TIME ALERT STREAM")
-    print("=" * 60)
-    print(f"[*] IRIS URL       : {IRIS_URL}")
-    print(f"[*] API Endpoint   : {IRIS_ALERTS_ENDPOINT}")
-    print(f"[*] CA Certificate : {IRIS_CA_CERT}")
-    print(f"[*] TLS Verify     : {IRIS_VERIFY_SSL}")
-    print(f"[*] TCP Host       : {HOST}")
-    print(f"[*] TCP Port       : {PORT}")
-    print(f"[*] Poll Interval  : {POLL_INTERVAL}s")
-    print("=" * 60)
+    if IRIS_VERIFY_SSL:
+        get_tls_context()
 
     server = await asyncio.start_server(
         handle_client,
-        HOST,
-        PORT
+        host=HOST,
+        port=PORT,
     )
+
+    log.info(
+        "HTTP JSON dan TCP streaming aktif di %s:%s",
+        HOST,
+        PORT,
+    )
+    log.info("HTTP URL: http://192.168.51.39:%s/", PORT)
+    log.info("TCP endpoint: 192.168.51.39:%s", PORT)
 
     monitor_task = asyncio.create_task(iris_monitor())
 
     try:
         async with server:
-            print(f"[*] TCP streaming aktif di {HOST}:{PORT}")
             await server.serve_forever()
-
     finally:
         monitor_task.cancel()
-
-        await asyncio.gather(
-            monitor_task,
-            return_exceptions=True
-        )
-
-        for writer in list(clients):
-            writer.close()
-
-        await asyncio.gather(
-            *[
-                writer.wait_closed()
-                for writer in list(clients)
-            ],
-            return_exceptions=True
-        )
-
-        print("[*] Server streaming dihentikan.")
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n[*] Server streaming dihentikan.")
+        log.info("IRIS stream dihentikan")
