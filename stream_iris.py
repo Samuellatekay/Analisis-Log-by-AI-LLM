@@ -39,11 +39,10 @@ if not IRIS_API_KEY:
 # ============================================================
 
 async def fetch_latest_alerts():
-    """Mengambil alert terbaru dari IRIS menggunakan httpx."""
     headers = {
         "Authorization": f"Bearer {IRIS_API_KEY}",
         "Accept": "application/json",
-        "User-Agent": "IRIS-Alert-Stream/4.0",
+        "User-Agent": "IRIS-Alert-Stream/5.0",
     }
     
     async with httpx.AsyncClient(verify=False, timeout=REQUEST_TIMEOUT) as client:
@@ -85,6 +84,34 @@ async def fetch_latest_alerts():
 
 
 # ============================================================
+# PAYLOAD BUILDER (SANGAT SEDERHANA & LANGSUNG)
+# ============================================================
+
+def build_minimal_payload(alert):
+    """
+    Membangun payload HANYA dengan field yang diminta, 
+    tanpa mengubah tipe data (string tetap string, dict tetap dict).
+    """
+    payload = {
+        "alert_description": alert.get("alert_description", "")
+    }
+    
+    # 1. Ambil 'original' apa adanya (langsung assign, tanpa cek tipe data)
+    if "original" in alert:
+        payload["original"] = alert["original"]
+    elif "alert_source_content" in alert:
+        payload["original"] = alert["alert_source_content"]
+        
+    # 2. Ambil '@timestamp' apa adanya
+    if "@timestamp" in alert:
+        payload["@timestamp"] = alert["@timestamp"]
+    elif isinstance(alert.get("original"), dict) and "@timestamp" in alert["original"]:
+        payload["@timestamp"] = alert["original"]["@timestamp"]
+        
+    return payload
+
+
+# ============================================================
 # TCP STREAMING & HTTP MULTIPLEXER
 # ============================================================
 
@@ -107,43 +134,7 @@ async def broadcast_alert(payload):
         writer.close()
 
 
-def build_minimal_payload(alert):
-    """
-    Membangun payload HANYA dengan 3 field:
-    1. alert_description
-    2. original (sebagai string mentah, JANGAN di-parse)
-    3. @timestamp
-    """
-    alert_desc = alert.get("alert_description", "")
-    
-    # 1. Ambil raw string Wazuh log (Biarkan sebagai string, jangan diubah jadi dict)
-    raw_original_str = None
-    if isinstance(alert.get("original"), str):
-        raw_original_str = alert.get("original")
-    elif isinstance(alert.get("original"), dict) and isinstance(alert["original"].get("original"), str):
-        raw_original_str = alert["original"].get("original")
-        
-    # 2. Ambil @timestamp (bisa di root alert atau di dalam dict original)
-    timestamp = alert.get("@timestamp")
-    if not timestamp and isinstance(alert.get("original"), dict):
-        timestamp = alert["original"].get("@timestamp")
-
-    # 3. Susun payload akhir
-    payload = {
-        "alert_description": alert_desc
-    }
-    
-    if raw_original_str:
-        payload["original"] = raw_original_str
-        
-    if timestamp:
-        payload["@timestamp"] = timestamp
-        
-    return payload
-
-
 async def handle_client(reader, writer):
-    """Menangani koneksi masuk: HTTP GET untuk dashboard, atau TCP Stream murni."""
     peer = writer.get_extra_info('peername')
     
     try:
@@ -152,13 +143,12 @@ async def handle_client(reader, writer):
         except asyncio.TimeoutError:
             first_data = b""
 
-        # 1. HTTP REQUEST (curl / browser)
+        # 1. HTTP REQUEST
         if first_data.startswith((b"GET ", b"HEAD ")):
             log.info("HTTP request dari %s", peer)
             alerts = await fetch_latest_alerts()
             
             formatted_alerts = [build_minimal_payload(alert) for alert in alerts]
-
             body = json.dumps(formatted_alerts, ensure_ascii=False, indent=2, default=str).encode("utf-8")
             
             response = (
@@ -175,25 +165,25 @@ async def handle_client(reader, writer):
             writer.close()
             return
 
-        # 2. TCP STREAMING CLIENT (dengan INITIAL SNAPSHOT)
+        # 2. TCP STREAMING CLIENT
         log.info("TCP client terhubung (streaming): %s", peer)
         clients.add(writer)
 
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: keep-alive\r\n\r\n")
         await writer.drain()
 
-        # Kirim snapshot awal
         try:
             initial_alerts = await fetch_latest_alerts()
             if initial_alerts:
                 log.info("📦 Mengirim %d alert snapshot awal ke %s", len(initial_alerts), peer)
                 for alert in initial_alerts[:5]:
                     snapshot_payload = build_minimal_payload(alert)
+                    # DEBUG: Cetak key yang berhasil diambil ke log
+                    log.debug("Snapshot payload keys: %s", list(snapshot_payload.keys()))
                     await send_to_client(writer, snapshot_payload)
         except Exception as e:
             log.error("Gagal mengirim snapshot awal: %s", e)
 
-        # Tunggu koneksi tetap hidup
         try:
             while True:
                 await asyncio.wait_for(reader.read(4096), timeout=30.0)
@@ -222,7 +212,6 @@ async def iris_monitor():
             alerts = await fetch_latest_alerts()
 
             for alert in alerts:
-                # Deduplikasi tetap berjalan di background agar tidak spam
                 alert_id = alert.get("id") or alert.get("alert_id")
                 dedup_key = str(alert_id) if alert_id else json.dumps(alert, sort_keys=True, default=str)
 
@@ -234,10 +223,11 @@ async def iris_monitor():
                 if len(seen_alerts) > MAX_SEEN_ALERTS:
                     log.warning("Batas seen_alerts tercapai. Mempertahankan ukuran maksimum.")
 
-                # Gunakan fungsi yang sama untuk konsistensi
                 payload = build_minimal_payload(alert)
-
-                log.info("✅ Alert BARU dikirim: id=%s", alert_id)
+                
+                # LOG PENTING: Ini akan membuktikan field apa saja yang berhasil diambil
+                log.info("✅ Alert BARU dikirim (ID: %s). Field yang dikirim: %s", alert_id, list(payload.keys()))
+                
                 await broadcast_alert(payload)
 
         except Exception as e:
