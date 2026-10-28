@@ -43,7 +43,7 @@ async def fetch_latest_alerts():
     headers = {
         "Authorization": f"Bearer {IRIS_API_KEY}",
         "Accept": "application/json",
-        "User-Agent": "IRIS-Alert-Stream/3.0",
+        "User-Agent": "IRIS-Alert-Stream/4.0",
     }
     
     async with httpx.AsyncClient(verify=False, timeout=REQUEST_TIMEOUT) as client:
@@ -107,6 +107,41 @@ async def broadcast_alert(payload):
         writer.close()
 
 
+def build_minimal_payload(alert):
+    """
+    Membangun payload HANYA dengan 3 field:
+    1. alert_description
+    2. original (sebagai string mentah, JANGAN di-parse)
+    3. @timestamp
+    """
+    alert_desc = alert.get("alert_description", "")
+    
+    # 1. Ambil raw string Wazuh log (Biarkan sebagai string, jangan diubah jadi dict)
+    raw_original_str = None
+    if isinstance(alert.get("original"), str):
+        raw_original_str = alert.get("original")
+    elif isinstance(alert.get("original"), dict) and isinstance(alert["original"].get("original"), str):
+        raw_original_str = alert["original"].get("original")
+        
+    # 2. Ambil @timestamp (bisa di root alert atau di dalam dict original)
+    timestamp = alert.get("@timestamp")
+    if not timestamp and isinstance(alert.get("original"), dict):
+        timestamp = alert["original"].get("@timestamp")
+
+    # 3. Susun payload akhir
+    payload = {
+        "alert_description": alert_desc
+    }
+    
+    if raw_original_str:
+        payload["original"] = raw_original_str
+        
+    if timestamp:
+        payload["@timestamp"] = timestamp
+        
+    return payload
+
+
 async def handle_client(reader, writer):
     """Menangani koneksi masuk: HTTP GET untuk dashboard, atau TCP Stream murni."""
     peer = writer.get_extra_info('peername')
@@ -122,23 +157,7 @@ async def handle_client(reader, writer):
             log.info("HTTP request dari %s", peer)
             alerts = await fetch_latest_alerts()
             
-            formatted_alerts = []
-            for alert in alerts:
-                # Ekstrak 'original'
-                original_log = alert.get("original") or alert.get("alert_source_content", "Tidak ada data original")
-                if isinstance(original_log, str):
-                    try:
-                        parsed = json.loads(original_log)
-                        if isinstance(parsed, (dict, list)):
-                            original_log = parsed
-                    except json.JSONDecodeError:
-                        pass
-                
-                # HANYA 2 FIELD SESUAI PERMINTAAN
-                formatted_alerts.append({
-                    "alert_description": alert.get("alert_description", ""),
-                    "original": original_log
-                })
+            formatted_alerts = [build_minimal_payload(alert) for alert in alerts]
 
             body = json.dumps(formatted_alerts, ensure_ascii=False, indent=2, default=str).encode("utf-8")
             
@@ -169,20 +188,7 @@ async def handle_client(reader, writer):
             if initial_alerts:
                 log.info("📦 Mengirim %d alert snapshot awal ke %s", len(initial_alerts), peer)
                 for alert in initial_alerts[:5]:
-                    original_log = alert.get("original") or alert.get("alert_source_content", "Tidak ada data original")
-                    if isinstance(original_log, str):
-                        try:
-                            parsed = json.loads(original_log)
-                            if isinstance(parsed, (dict, list)):
-                                original_log = parsed
-                        except json.JSONDecodeError:
-                            pass
-                    
-                    # HANYA 2 FIELD SESUAI PERMINTAAN
-                    snapshot_payload = {
-                        "alert_description": alert.get("alert_description", ""),
-                        "original": original_log
-                    }
+                    snapshot_payload = build_minimal_payload(alert)
                     await send_to_client(writer, snapshot_payload)
         except Exception as e:
             log.error("Gagal mengirim snapshot awal: %s", e)
@@ -228,39 +234,8 @@ async def iris_monitor():
                 if len(seen_alerts) > MAX_SEEN_ALERTS:
                     log.warning("Batas seen_alerts tercapai. Mempertahankan ukuran maksimum.")
 
-                # ============================================================
-                # EKSTRAKSI DATA 'ORIGINAL'
-                # ============================================================
-                original_log = alert.get("original")
-                
-                if original_log is None:
-                    source_content = alert.get("alert_source_content")
-                    if isinstance(source_content, str):
-                        try:
-                            source_content = json.loads(source_content)
-                        except json.JSONDecodeError:
-                            pass
-                    
-                    if isinstance(source_content, dict):
-                        original_log = source_content.get("original", source_content)
-                    else:
-                        original_log = source_content
-
-                if isinstance(original_log, str):
-                    try:
-                        parsed_json = json.loads(original_log)
-                        if isinstance(parsed_json, (dict, list)):
-                            original_log = parsed_json
-                    except json.JSONDecodeError:
-                        pass
-
-                # ============================================================
-                # SUSUN PAYLOAD AKHIR (HANYA 2 FIELD)
-                # ============================================================
-                payload = {
-                    "alert_description": alert.get("alert_description", ""),
-                    "original": original_log
-                }
+                # Gunakan fungsi yang sama untuk konsistensi
+                payload = build_minimal_payload(alert)
 
                 log.info("✅ Alert BARU dikirim: id=%s", alert_id)
                 await broadcast_alert(payload)
