@@ -11,7 +11,6 @@ import httpx
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("IRIS_STREAM_PORT", "17771"))
 
-# Konstruksi URL yang terbukti berhasil
 BASE_IRIS_URL = os.getenv("IRIS_URL", "https://iris.example.local").rstrip("/")
 IRIS_ALERTS_ENDPOINT = f"{BASE_IRIS_URL}/api/v2/alerts"
 IRIS_API_KEY = os.getenv("IRIS_API_KEY", "")
@@ -19,10 +18,7 @@ IRIS_API_KEY = os.getenv("IRIS_API_KEY", "")
 POLL_INTERVAL = float(os.getenv("IRIS_POLL_INTERVAL", "5.0"))
 REQUEST_TIMEOUT = float(os.getenv("IRIS_REQUEST_TIMEOUT", "10.0"))
 
-# Client TCP yang sedang terhubung
 clients = set()
-
-# Deduplikasi: Hindari mengirim alert yang sama berulang kali
 seen_alerts = set()
 MAX_SEEN_ALERTS = 100000
 
@@ -38,7 +34,7 @@ if not IRIS_API_KEY:
 
 
 # ============================================================
-# IRIS API REQUEST (Menggunakan httpx)
+# IRIS API REQUEST
 # ============================================================
 
 async def fetch_latest_alerts():
@@ -46,13 +42,11 @@ async def fetch_latest_alerts():
     headers = {
         "Authorization": f"Bearer {IRIS_API_KEY}",
         "Accept": "application/json",
-        "User-Agent": "IRIS-Alert-Stream/2.0",
+        "User-Agent": "IRIS-Alert-Stream/2.1",
     }
     
-    # httpx.AsyncClient lebih efisien untuk async
     async with httpx.AsyncClient(verify=False, timeout=REQUEST_TIMEOUT) as client:
         try:
-            # Mengambil 10 alert terakhir untuk memastikan tidak ada yang terlewat
             response = await client.get(
                 IRIS_ALERTS_ENDPOINT, 
                 headers=headers,
@@ -61,7 +55,6 @@ async def fetch_latest_alerts():
             response.raise_for_status()
             data = response.json()
             
-            # Ekstraksi JSON yang aman (mendukung berbagai format respons IRIS)
             alerts = []
             if isinstance(data, list):
                 alerts = data
@@ -118,17 +111,30 @@ async def handle_client(reader, writer):
     peer = writer.get_extra_info('peername')
     
     try:
-        # Coba baca data awal untuk mendeteksi apakah ini request HTTP
         try:
             first_data = await asyncio.wait_for(reader.read(1024), timeout=1.0)
         except asyncio.TimeoutError:
             first_data = b""
 
-        # Jika diawali dengan GET/HEAD, perlakukan sebagai request HTTP biasa (untuk dashboard/curl)
+        # Jika diawali dengan GET/HEAD, perlakukan sebagai request HTTP biasa
         if first_data.startswith((b"GET ", b"HEAD ")):
             log.info("HTTP request dari %s", peer)
             alerts = await fetch_latest_alerts()
-            body = json.dumps(alerts, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+            
+            # Format ulang alerts agar konsisten dengan format streaming
+            formatted_alerts = []
+            for alert in alerts:
+                alert_id = alert.get("id") or alert.get("alert_id")
+                original_log = alert.get("original") or alert.get("alert_source_content", "Tidak ada data original")
+                
+                formatted_alerts.append({
+                    "iris_alert_id": alert_id,
+                    "alert_title": alert.get("alert_title", "Tanpa Judul"),
+                    "alert_description": alert.get("alert_description", ""),
+                    "original": original_log
+                })
+
+            body = json.dumps(formatted_alerts, ensure_ascii=False, indent=2, default=str).encode("utf-8")
             
             response = (
                 "HTTP/1.1 200 OK\r\n"
@@ -148,16 +154,14 @@ async def handle_client(reader, writer):
         log.info("TCP client terhubung (streaming): %s", peer)
         clients.add(writer)
 
-        # Kirim header opsional agar browser tidak bingung jika diakses via browser
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: keep-alive\r\n\r\n")
         await writer.drain()
 
         try:
             while True:
-                # Biarkan klien tetap terhubung, abaikan data yang mereka kirim (jika ada)
                 await asyncio.wait_for(reader.read(4096), timeout=30.0)
         except asyncio.TimeoutError:
-            pass # Tetap terhubung, lanjut ke loop berikutnya
+            pass
         except (ConnectionResetError, BrokenPipeError):
             pass
 
@@ -184,39 +188,48 @@ async def iris_monitor():
                 alert_id = alert.get("id") or alert.get("alert_id")
                 dedup_key = str(alert_id) if alert_id else json.dumps(alert, sort_keys=True, default=str)
 
-                # Lewati jika sudah pernah dikirim
                 if dedup_key in seen_alerts:
                     continue
 
                 seen_alerts.add(dedup_key)
                 
-                # Batasi pertumbuhan memori set
                 if len(seen_alerts) > MAX_SEEN_ALERTS:
                     log.warning("Batas seen_alerts tercapai. Mempertahankan ukuran maksimum.")
 
-                # Ekstraksi dan format payload (sesuai logika Anda yang sudah berhasil)
-                source_content = alert.get("alert_source_content", {})
-                if isinstance(source_content, str):
-                    try:
-                        source_content = json.loads(source_content)
-                    except json.JSONDecodeError:
-                        pass
+                # ============================================================
+                # EKSTRAKSI DATA 'ORIGINAL' YANG FLEKSIBEL & AMAN
+                # ============================================================
+                original_log = alert.get("original")
+                
+                if original_log is None:
+                    source_content = alert.get("alert_source_content")
+                    if isinstance(source_content, str):
+                        try:
+                            source_content = json.loads(source_content)
+                        except json.JSONDecodeError:
+                            pass
+                    
+                    if isinstance(source_content, dict):
+                        original_log = source_content.get("original", source_content)
+                    else:
+                        original_log = source_content
 
-                original_log = source_content.get("original", "Data original tidak ditemukan")
                 if isinstance(original_log, str):
                     try:
-                        original_log = json.loads(original_log)
+                        parsed_json = json.loads(original_log)
+                        if isinstance(parsed_json, (dict, list)):
+                            original_log = parsed_json
                     except json.JSONDecodeError:
-                        pass
+                        pass # Tetap pertahankan sebagai string teks biasa
 
                 payload = {
-                    "alert_title": alert.get("alert_title"),
-                    "alert_description": alert.get("alert_description"),
-                    "original": original_log,
-                    "iris_alert_id": alert_id
+                    "iris_alert_id": alert_id,
+                    "alert_title": alert.get("alert_title", "Tanpa Judul"),
+                    "alert_description": alert.get("alert_description", ""),
+                    "original": original_log  # <-- Data lengkap akan masuk di sini
                 }
 
-                log.info("Alert baru: id=%s title=%s", alert_id, alert.get("alert_title"))
+                log.info("Alert baru: id=%s | title=%s", alert_id, alert.get("alert_title", "N/A"))
                 await broadcast_alert(payload)
 
         except Exception as e:
