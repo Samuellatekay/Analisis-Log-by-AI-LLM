@@ -11,16 +11,21 @@ import httpx
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("IRIS_STREAM_PORT", "17771"))
 
+# Konstruksi URL yang terbukti berhasil
 BASE_IRIS_URL = os.getenv("IRIS_URL", "https://iris.example.local").rstrip("/")
 IRIS_ALERTS_ENDPOINT = f"{BASE_IRIS_URL}/api/v2/alerts"
 IRIS_API_KEY = os.getenv("IRIS_API_KEY", "")
 
 POLL_INTERVAL = float(os.getenv("IRIS_POLL_INTERVAL", "5.0"))
 REQUEST_TIMEOUT = float(os.getenv("IRIS_REQUEST_TIMEOUT", "10.0"))
+MUX_TIMEOUT = float(os.getenv("MUX_TIMEOUT", "1.0"))
 
+# State global
 clients = set()
+
+# Deduplikasi: Hindari mengirim alert yang sama berulang kali
 seen_alerts = set()
-MAX_SEEN_ALERTS = 100000
+MAX_SEEN_ALERTS = 100000  # Batas aman (~5MB RAM), mencegah memory leak
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -47,6 +52,7 @@ async def fetch_latest_alerts():
     
     async with httpx.AsyncClient(verify=False, timeout=REQUEST_TIMEOUT) as client:
         try:
+            # Mengambil 10 alert terakhir untuk memastikan tidak ada yang terlewat
             response = await client.get(
                 IRIS_ALERTS_ENDPOINT, 
                 headers=headers,
@@ -55,6 +61,7 @@ async def fetch_latest_alerts():
             response.raise_for_status()
             data = response.json()
             
+            # Ekstraksi JSON yang aman (mendukung berbagai format respons IRIS)
             alerts = []
             if isinstance(data, list):
                 alerts = data
@@ -101,6 +108,7 @@ async def broadcast_alert(payload):
         except (ConnectionError, OSError, BrokenPipeError):
             disconnected.append(writer)
 
+    # Bersihkan koneksi yang putus
     for writer in disconnected:
         clients.discard(writer)
         writer.close()
@@ -111,12 +119,13 @@ async def handle_client(reader, writer):
     peer = writer.get_extra_info('peername')
     
     try:
+        # Coba baca data awal untuk mendeteksi apakah ini request HTTP
         try:
-            first_data = await asyncio.wait_for(reader.read(1024), timeout=1.0)
+            first_data = await asyncio.wait_for(reader.read(1024), timeout=MUX_TIMEOUT)
         except asyncio.TimeoutError:
             first_data = b""
 
-        # Jika diawali dengan GET/HEAD, perlakukan sebagai request HTTP biasa
+        # Jika diawali dengan GET/HEAD, perlakukan sebagai request HTTP biasa (untuk dashboard/curl)
         if first_data.startswith((b"GET ", b"HEAD ")):
             log.info("HTTP request dari %s", peer)
             alerts = await fetch_latest_alerts()
@@ -154,14 +163,16 @@ async def handle_client(reader, writer):
         log.info("TCP client terhubung (streaming): %s", peer)
         clients.add(writer)
 
+        # Kirim header opsional agar browser tidak bingung jika diakses via browser
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: keep-alive\r\n\r\n")
         await writer.drain()
 
         try:
             while True:
+                # Biarkan klien tetap terhubung, abaikan data yang mereka kirim (jika ada)
                 await asyncio.wait_for(reader.read(4096), timeout=30.0)
         except asyncio.TimeoutError:
-            pass
+            pass # Tetap terhubung, lanjut ke loop berikutnya
         except (ConnectionResetError, BrokenPipeError):
             pass
 
@@ -185,35 +196,44 @@ async def iris_monitor():
             alerts = await fetch_latest_alerts()
 
             for alert in alerts:
+                # 1. TENTUKAN KUNCI UNIK UNTUK DEDUPLIKASI
                 alert_id = alert.get("id") or alert.get("alert_id")
                 dedup_key = str(alert_id) if alert_id else json.dumps(alert, sort_keys=True, default=str)
 
+                # 2. CEK: Jika sudah pernah dikirim, LEWATI (Mencegah pengulangan)
                 if dedup_key in seen_alerts:
                     continue
 
+                # 3. TANDAI sebagai sudah diproses
                 seen_alerts.add(dedup_key)
                 
+                # Batasi pertumbuhan memori set (100k item hanya ~5MB RAM)
                 if len(seen_alerts) > MAX_SEEN_ALERTS:
                     log.warning("Batas seen_alerts tercapai. Mempertahankan ukuran maksimum.")
 
                 # ============================================================
-                # EKSTRAKSI DATA 'ORIGINAL' YANG FLEKSIBEL & AMAN
+                # 4. EKSTRAKSI DATA 'ORIGINAL' YANG FLEKSIBEL & AMAN
                 # ============================================================
                 original_log = alert.get("original")
                 
                 if original_log is None:
                     source_content = alert.get("alert_source_content")
+                    
+                    # Jika berupa string, coba parse dulu jadi dictionary
                     if isinstance(source_content, str):
                         try:
                             source_content = json.loads(source_content)
                         except json.JSONDecodeError:
-                            pass
+                            pass # Biarkan sebagai string jika bukan JSON valid
                     
+                    # Jika sudah jadi dictionary, ambil key 'original' di dalamnya
                     if isinstance(source_content, dict):
                         original_log = source_content.get("original", source_content)
                     else:
                         original_log = source_content
 
+                # Final check: Jika masih string, coba parse sekali lagi. 
+                # Jika gagal, biarkan sebagai string teks biasa (seperti contoh Anda).
                 if isinstance(original_log, str):
                     try:
                         parsed_json = json.loads(original_log)
@@ -222,6 +242,9 @@ async def iris_monitor():
                     except json.JSONDecodeError:
                         pass # Tetap pertahankan sebagai string teks biasa
 
+                # ============================================================
+                # 5. SUSUN PAYLOAD AKHIR
+                # ============================================================
                 payload = {
                     "iris_alert_id": alert_id,
                     "alert_title": alert.get("alert_title", "Tanpa Judul"),
@@ -229,7 +252,7 @@ async def iris_monitor():
                     "original": original_log  # <-- Data lengkap akan masuk di sini
                 }
 
-                log.info("Alert baru: id=%s | title=%s", alert_id, alert.get("alert_title", "N/A"))
+                log.info("✅ Alert BARU: id=%s | title=%s", alert_id, alert.get("alert_title", "N/A")[:50])
                 await broadcast_alert(payload)
 
         except Exception as e:
@@ -246,10 +269,10 @@ async def main():
     server = await asyncio.start_server(handle_client, host=HOST, port=PORT)
     addrs = ', '.join(str(sock.getsockname()) for sock in server.sockets)
     
-    log.info("Server aktif di: %s", addrs)
-    log.info("Endpoint IRIS Target: %s", IRIS_ALERTS_ENDPOINT)
-    log.info("Tes HTTP: curl http://localhost:%s/" % PORT)
-    log.info("Tes TCP: nc localhost %s" % PORT)
+    log.info("🚀 Server aktif di: %s", addrs)
+    log.info("🎯 Endpoint IRIS Target: %s", IRIS_ALERTS_ENDPOINT)
+    log.info("🌐 Tes HTTP: curl http://localhost:%s/" % PORT)
+    log.info("🔌 Tes TCP: nc localhost %s" % PORT)
 
     monitor_task = asyncio.create_task(iris_monitor())
 
@@ -259,6 +282,7 @@ async def main():
     except asyncio.CancelledError:
         log.info("Menerima sinyal pembatalan...")
     finally:
+        log.info("Menutup server dan membersihkan koneksi...")
         monitor_task.cancel()
         for writer in list(clients):
             writer.close()
