@@ -36,14 +36,21 @@ services:
   
   # --- LAYANAN STREAMING ---
   iris-stream:
-    build: .                           # Menggunakan Dockerfile utama yang sama
-    command: ["python", "stream_iris.py"] # Menimpa perintah agar tidak menjalankan main.py
-    env_file: .env                     # Menggunakan .env yang sama
+    build: .
+    command: ["python", "stream_iris.py"]
+    env_file: .env
+    environment:
+      - IRIS_VERIFY_SSL=true
+      - IRIS_CA_CERT=/app/iris-ca.crt
     ports:
       - "17771:17771"
-    networks: 
+    networks:
       - internal
     restart: unless-stopped
+    extra_hosts:
+      - "iris.local:192.168.51.40"
+    volumes:
+      - /etc/ssl/custom/iris-ca.pem:/app/iris-ca.crt:ro
 
 #  redis:                          # hapus jika memakai Redis milik Collector yang sudah ada
 #    image: redis:7-alpine
