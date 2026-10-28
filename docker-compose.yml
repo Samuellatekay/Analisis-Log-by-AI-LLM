@@ -33,6 +33,17 @@ services:
       timeout: 3s
       retries: 10
     networks: [internal]          # sengaja tanpa 'ports' (tidak diekspos ke host)
+  
+  # --- LAYANAN STREAMING ---
+  iris-stream:
+    build: .                           # Menggunakan Dockerfile utama yang sama
+    command: ["python", "stream_iris.py"] # Menimpa perintah agar tidak menjalankan main.py
+    env_file: .env                     # Menggunakan .env yang sama
+    ports:
+      - "17771:17771"
+    networks: 
+      - internal
+    restart: unless-stopped
 
 #  redis:                          # hapus jika memakai Redis milik Collector yang sudah ada
 #    image: redis:7-alpine
