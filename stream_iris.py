@@ -9,18 +9,19 @@ from urllib.request import Request, urlopen
 from urllib.parse import urlparse
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
 HOST = "0.0.0.0"
 PORT = int(os.getenv("IRIS_STREAM_PORT", "17771"))
 
+# Harus berupa endpoint API JSON, bukan URL dashboard frontend.
 IRIS_URL = os.getenv(
     "IRIS_URL",
     "https://iris.local/api/v2/alerts",
-).rstrip("/")
+).strip().rstrip("/")
 
-IRIS_API_KEY = os.getenv("IRIS_API_KEY", "")
+IRIS_API_KEY = os.getenv("IRIS_API_KEY", "").strip()
 
 IRIS_VERIFY_SSL = os.getenv(
     "IRIS_VERIFY_SSL", "true"
@@ -30,8 +31,13 @@ IRIS_CA_CERT = os.getenv(
     "IRIS_CA_CERT", "/app/iris-ca.crt"
 )
 
-POLL_INTERVAL = float(os.getenv("IRIS_POLL_INTERVAL", "5"))
-REQUEST_TIMEOUT = float(os.getenv("IRIS_REQUEST_TIMEOUT", "30"))
+POLL_INTERVAL = max(
+    1, float(os.getenv("IRIS_POLL_INTERVAL", "5"))
+)
+
+REQUEST_TIMEOUT = max(
+    1, float(os.getenv("IRIS_REQUEST_TIMEOUT", "30"))
+)
 
 clients = set()
 seen_alerts = set()
@@ -40,7 +46,38 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(message)s",
 )
+
 log = logging.getLogger("iris-stream")
+
+
+# ============================================================
+# CONFIG VALIDATION
+# ============================================================
+
+def validate_config():
+    parsed = urlparse(IRIS_URL)
+
+    if parsed.scheme not in ("https", "http") or not parsed.netloc:
+        raise ValueError(
+            f"IRIS_URL tidak valid: {IRIS_URL!r}"
+        )
+
+    # Mencegah dashboard HTML dianggap sebagai API JSON.
+    if parsed.path in ("", "/"):
+        raise ValueError(
+            "IRIS_URL hanya menunjuk ke root/dashboard, bukan endpoint API. "
+            "Atur IRIS_URL ke endpoint API JSON DFIR-IRIS di file .env."
+        )
+
+    if not IRIS_API_KEY:
+        raise ValueError(
+            "IRIS_API_KEY kosong. Periksa konfigurasi .env."
+        )
+
+    if IRIS_VERIFY_SSL and not os.path.isfile(IRIS_CA_CERT):
+        raise FileNotFoundError(
+            f"CA certificate tidak ditemukan: {IRIS_CA_CERT}"
+        )
 
 
 # ============================================================
@@ -49,19 +86,17 @@ log = logging.getLogger("iris-stream")
 
 def get_tls_context():
     if not IRIS_VERIFY_SSL:
-        log.warning("IRIS TLS verification disabled")
-        return ssl._create_unverified_context()
-
-    if not os.path.isfile(IRIS_CA_CERT):
-        raise FileNotFoundError(
-            f"CA certificate tidak ditemukan: {IRIS_CA_CERT}"
+        log.warning(
+            "TLS verification dinonaktifkan. "
+            "Jangan gunakan konfigurasi ini di produksi."
         )
+        return ssl._create_unverified_context()
 
     return ssl.create_default_context(cafile=IRIS_CA_CERT)
 
 
 # ============================================================
-# NORMALIZATION
+# JSON HELPERS
 # ============================================================
 
 def parse_json_if_string(value):
@@ -70,6 +105,7 @@ def parse_json_if_string(value):
             return json.loads(value)
         except (json.JSONDecodeError, TypeError):
             return value
+
     return value
 
 
@@ -82,7 +118,7 @@ def extract_alerts(payload):
     if not isinstance(payload, dict):
         return []
 
-    # Format umum respons API yang membungkus daftar alert.
+    # Format respons yang umum digunakan API.
     for key in ("alerts", "data", "results", "items"):
         value = parse_json_if_string(payload.get(key))
 
@@ -92,10 +128,11 @@ def extract_alerts(payload):
         if isinstance(value, dict):
             for nested_key in ("alerts", "results", "items"):
                 nested = parse_json_if_string(value.get(nested_key))
+
                 if isinstance(nested, list):
                     return nested
 
-    # Respons berupa satu alert.
+    # Respons berupa satu objek alert.
     if any(
         key in payload
         for key in ("alert_id", "id", "alert_title", "title")
@@ -145,14 +182,11 @@ def normalize_alert(alert):
 
 
 # ============================================================
-# IRIS API
+# IRIS API REQUEST
 # ============================================================
 
 def fetch_latest_alerts_sync():
-    if not IRIS_API_KEY:
-        raise RuntimeError(
-            "IRIS_API_KEY belum diatur di file .env"
-        )
+    context = get_tls_context()
 
     request = Request(
         IRIS_URL,
@@ -163,8 +197,6 @@ def fetch_latest_alerts_sync():
         },
         method="GET",
     )
-
-    context = get_tls_context()
 
     try:
         with urlopen(
@@ -180,41 +212,56 @@ def fetch_latest_alerts_sync():
         error_body = exc.read().decode(
             "utf-8", errors="replace"
         )
+
         raise RuntimeError(
-            f"IRIS HTTP {exc.code}; URL={IRIS_URL}; "
+            f"IRIS API HTTP {exc.code}; URL={IRIS_URL}; "
+            f"Content-Type={exc.headers.get('Content-Type', '')!r}; "
             f"body={error_body[:500]!r}"
         ) from exc
 
     except URLError as exc:
         raise RuntimeError(
-            f"Gagal menghubungi IRIS: {exc}; URL={IRIS_URL}"
+            f"Tidak dapat menghubungi IRIS: {exc}; URL={IRIS_URL}"
         ) from exc
 
-    body = raw_body.decode("utf-8-sig", errors="replace").strip()
+    body = raw_body.decode(
+        "utf-8-sig", errors="replace"
+    ).strip()
 
     if not body:
         raise RuntimeError(
-            "Respons IRIS kosong; "
+            f"Respons IRIS kosong; HTTP={status}; "
+            f"Content-Type={content_type!r}; URL={IRIS_URL}"
+        )
+
+    # Dashboard biasanya merespons HTML, bukan JSON.
+    if (
+        "text/html" in content_type.lower()
+        or body[:100].lower().startswith(
+            ("<!doctype html", "<html")
+        )
+    ):
+        raise RuntimeError(
+            "IRIS_URL mengembalikan HTML dashboard, bukan JSON API. "
             f"HTTP={status}; Content-Type={content_type!r}; "
-            f"URL={IRIS_URL}"
+            f"URL={IRIS_URL}; preview={body[:250]!r}. "
+            "Periksa endpoint API DFIR-IRIS dan konfigurasi .env."
         )
 
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
-            "Respons IRIS bukan JSON valid; "
-            f"HTTP={status}; Content-Type={content_type!r}; "
-            f"URL={IRIS_URL}; body_preview={body[:500]!r}"
+            f"Respons IRIS bukan JSON valid; HTTP={status}; "
+            f"Content-Type={content_type!r}; URL={IRIS_URL}; "
+            f"body_preview={body[:500]!r}"
         ) from exc
 
     alerts = extract_alerts(payload)
 
     if not alerts and isinstance(payload, dict):
-        # Jangan menganggap setiap objek JSON tanpa daftar alert
-        # sebagai daftar kosong tanpa memberi informasi.
         log.warning(
-            "JSON IRIS valid, tetapi format daftar alert tidak dikenali. "
+            "JSON valid, tetapi struktur alert belum dikenali. "
             "Top-level keys=%s",
             list(payload.keys())[:30],
         )
@@ -227,23 +274,22 @@ async def fetch_latest_alerts():
 
 
 # ============================================================
-# HTTP JSON RESPONSE
+# HTTP JSON SERVER
 # ============================================================
 
 async def send_http_response(
     writer,
-    status_code,
+    status,
     reason,
     body,
-    content_type="application/json; charset=utf-8",
     head_only=False,
 ):
     if isinstance(body, str):
         body = body.encode("utf-8")
 
     headers = (
-        f"HTTP/1.1 {status_code} {reason}\r\n"
-        f"Content-Type: {content_type}\r\n"
+        f"HTTP/1.1 {status} {reason}\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
         f"Content-Length: {len(body)}\r\n"
         "Cache-Control: no-store\r\n"
         "Access-Control-Allow-Origin: *\r\n"
@@ -253,22 +299,21 @@ async def send_http_response(
     ).encode("ascii")
 
     writer.write(headers)
+
     if not head_only:
         writer.write(body)
 
     await writer.drain()
 
 
-async def handle_http_request(reader, writer, first_data):
+async def handle_http_request(reader, writer, initial_data):
     try:
-        request_text = first_data.decode(
+        text = initial_data.decode(
             "iso-8859-1", errors="replace"
         )
-        request_line = (
-            request_text.splitlines()[0]
-            if request_text.splitlines()
-            else ""
-        )
+
+        lines = text.splitlines()
+        request_line = lines[0] if lines else ""
         parts = request_line.split()
 
         if len(parts) < 2:
@@ -281,17 +326,20 @@ async def handle_http_request(reader, writer, first_data):
         method, target = parts[0], parts[1]
         path = urlparse(target).path
 
-        # Baca sisa header jika belum diterima.
-        while b"\r\n\r\n" not in first_data:
+        # Baca sisa HTTP headers.
+        data = initial_data
+
+        while b"\r\n\r\n" not in data:
             chunk = await asyncio.wait_for(
                 reader.read(4096), timeout=3
             )
+
             if not chunk:
                 break
 
-            first_data += chunk
+            data += chunk
 
-            if len(first_data) > 65536:
+            if len(data) > 65536:
                 raise ValueError("HTTP headers terlalu besar")
 
         if method == "OPTIONS":
@@ -311,10 +359,8 @@ async def handle_http_request(reader, writer, first_data):
             await send_http_response(
                 writer, 404, "Not Found",
                 json.dumps({
-                    "error": "Endpoint tidak ditemukan",
-                    "available_endpoints": [
-                        "/", "/alerts", "/api/alerts"
-                    ],
+                    "error": "Endpoint lokal tidak ditemukan",
+                    "available": ["/", "/alerts", "/api/alerts"],
                 }),
                 head_only=(method == "HEAD"),
             )
@@ -322,7 +368,8 @@ async def handle_http_request(reader, writer, first_data):
 
         try:
             alerts = await fetch_latest_alerts()
-            body = json.dumps(
+
+            result = json.dumps(
                 alerts,
                 ensure_ascii=False,
                 indent=2,
@@ -330,20 +377,19 @@ async def handle_http_request(reader, writer, first_data):
             )
 
             await send_http_response(
-                writer, 200, "OK", body,
+                writer, 200, "OK", result,
                 head_only=(method == "HEAD"),
             )
 
         except Exception as exc:
-            log.error("HTTP gagal mengambil alert: %s", exc)
-
-            body = json.dumps({
-                "error": "Gagal mengambil alert dari IRIS",
-                "detail": str(exc),
-            })
+            log.error("HTTP: gagal mengambil alert: %s", exc)
 
             await send_http_response(
-                writer, 502, "Bad Gateway", body,
+                writer, 502, "Bad Gateway",
+                json.dumps({
+                    "error": "Gagal mengambil data dari IRIS API",
+                    "detail": str(exc),
+                }),
                 head_only=(method == "HEAD"),
             )
 
@@ -367,15 +413,13 @@ async def handle_http_request(reader, writer, first_data):
 # ============================================================
 
 async def send_to_client(writer, payload):
-    data = (
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-            default=str,
-        ) + "\n"
-    ).encode("utf-8")
+    message = json.dumps(
+        payload,
+        ensure_ascii=False,
+        default=str,
+    ) + "\n"
 
-    writer.write(data)
+    writer.write(message.encode("utf-8"))
     await writer.drain()
 
 
@@ -390,6 +434,7 @@ async def broadcast_alert(payload):
 
     for writer in disconnected:
         clients.discard(writer)
+
         try:
             writer.close()
             await writer.wait_closed()
@@ -400,10 +445,11 @@ async def broadcast_alert(payload):
 async def handle_tcp_client(reader, writer):
     peer = writer.get_extra_info("peername")
     clients.add(writer)
+
     log.info("TCP client terhubung: %s", peer)
 
     try:
-        # TCP client cukup terhubung dan menunggu alert.
+        # Client TCP cukup terhubung untuk menerima alert.
         while await reader.read(4096):
             pass
 
@@ -412,6 +458,7 @@ async def handle_tcp_client(reader, writer):
 
     finally:
         clients.discard(writer)
+
         if not writer.is_closing():
             writer.close()
 
@@ -424,7 +471,7 @@ async def handle_tcp_client(reader, writer):
 
 
 # ============================================================
-# SAME-PORT HTTP / TCP DETECTION
+# HTTP / TCP MULTIPLEXER - ONE PORT
 # ============================================================
 
 async def handle_client(reader, writer):
@@ -432,20 +479,19 @@ async def handle_client(reader, writer):
 
     try:
         try:
-            first_data = await asyncio.wait_for(
+            initial_data = await asyncio.wait_for(
                 reader.read(4096),
                 timeout=0.7,
             )
         except asyncio.TimeoutError:
-            first_data = b""
+            initial_data = b""
 
-        if not first_data:
-            # TCP streaming client normalnya tidak mengirim request
-            # saat koneksi pertama dibuka.
+        # TCP stream client biasanya tidak mengirim request awal.
+        if not initial_data:
             await handle_tcp_client(reader, writer)
             return
 
-        first_line = first_data.split(b"\r\n", 1)[0]
+        first_line = initial_data.split(b"\r\n", 1)[0]
 
         is_http = first_line.startswith((
             b"GET ",
@@ -457,11 +503,9 @@ async def handle_client(reader, writer):
         if is_http:
             log.info("HTTP request dari %s", peer)
             await handle_http_request(
-                reader, writer, first_data
+                reader, writer, initial_data
             )
         else:
-            # Protokol TCP ini hanya untuk streaming server -> client.
-            # Data awal non-HTTP tidak dipakai sebagai perintah.
             log.info("TCP client terhubung: %s", peer)
             await handle_tcp_client(reader, writer)
 
@@ -469,7 +513,6 @@ async def handle_client(reader, writer):
         log.exception("Client handler gagal: %s", peer)
 
     finally:
-        # Handler TCP juga menutup koneksi di finally miliknya.
         if not writer.is_closing():
             writer.close()
 
@@ -480,11 +523,11 @@ async def handle_client(reader, writer):
 
 
 # ============================================================
-# POLLING
+# IRIS POLLING
 # ============================================================
 
 async def iris_monitor():
-    log.info("IRIS polling aktif: %s", IRIS_URL)
+    log.info("Polling IRIS: %s", IRIS_URL)
 
     while True:
         try:
@@ -505,7 +548,6 @@ async def iris_monitor():
 
                 seen_alerts.add(dedup_key)
 
-                # Hindari penggunaan memori tak terbatas.
                 if len(seen_alerts) > 10000:
                     seen_alerts.clear()
                     seen_alerts.add(dedup_key)
@@ -519,7 +561,6 @@ async def iris_monitor():
                 await broadcast_alert(alert)
 
         except Exception as exc:
-            # Catat pesan error, tetapi lanjutkan polling berikutnya.
             log.error(
                 "Gagal polling IRIS: %s",
                 exc,
@@ -534,17 +575,16 @@ async def iris_monitor():
 # ============================================================
 
 async def main():
-    if IRIS_VERIFY_SSL:
-        get_tls_context()
+    validate_config()
 
     server = await asyncio.start_server(
         handle_client,
-        host=HOST,
-        port=PORT,
+        HOST,
+        PORT,
     )
 
     log.info(
-        "HTTP JSON dan TCP streaming aktif pada %s:%s",
+        "HTTP JSON dan TCP streaming aktif di %s:%s",
         HOST,
         PORT,
     )
