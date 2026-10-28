@@ -24,14 +24,14 @@ seen_alerts = set()
 MAX_SEEN_ALERTS = 100000
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level="DEBUG", # <--- UBAH KE DEBUG AGAR KITA BISA MELIHAT SEMUANYA
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 log = logging.getLogger("iris-stream")
 
 if not IRIS_API_KEY:
-    log.warning("[!] PERINGATAN: IRIS_API_KEY kosong. Pastikan sudah diisi di .env")
+    log.warning("[!] PERINGATAN: IRIS_API_KEY kosong.")
 
 
 # ============================================================
@@ -42,93 +42,66 @@ async def fetch_latest_alerts():
     headers = {
         "Authorization": f"Bearer {IRIS_API_KEY}",
         "Accept": "application/json",
-        "User-Agent": "IRIS-Alert-Stream/5.0",
+        "User-Agent": "IRIS-Alert-Stream-DIAGNOSTIC",
     }
     
     async with httpx.AsyncClient(verify=False, timeout=REQUEST_TIMEOUT) as client:
         try:
-            response = await client.get(
-                IRIS_ALERTS_ENDPOINT, 
-                headers=headers,
-                params={"per_page": 10, "page": 1} 
-            )
+            response = await client.get(IRIS_ALERTS_ENDPOINT, headers=headers, params={"per_page": 10, "page": 1})
             response.raise_for_status()
-            data = response.json()
-            
-            alerts = []
-            if isinstance(data, list):
-                alerts = data
-            elif isinstance(data, dict):
-                inner_data = data.get("data")
-                if isinstance(inner_data, list):
-                    alerts = inner_data
-                elif isinstance(inner_data, dict):
-                    alerts = inner_data.get("data", [])
-                    if not isinstance(alerts, list):
-                        alerts = []
-            
-            return alerts
-
-        except httpx.HTTPStatusError as e:
-            log.error("HTTP Error dari IRIS: %s - %s", e.response.status_code, e.response.text[:200])
-            return []
-        except httpx.RequestError as e:
-            log.error("Gagal menghubungi IRIS (Network Error): %s", str(e))
-            return []
-        except json.JSONDecodeError:
-            log.error("Respons dari IRIS bukan JSON yang valid.")
-            return []
+            return response.json() # Kembalikan mentah dulu untuk di-debug
         except Exception as e:
-            log.error("Error tidak terduga saat menghubungi IRIS: %s", str(e))
+            log.error("Gagal fetch: %s", e)
             return []
 
 
 # ============================================================
-# PAYLOAD BUILDER (SANGAT SEDERHANA & LANGSUNG)
+# PAYLOAD BUILDER
 # ============================================================
 
 def build_minimal_payload(alert):
-    """
-    Membangun payload HANYA dengan field yang diminta, 
-    tanpa mengubah tipe data (string tetap string, dict tetap dict).
-    """
-    payload = {
-        "alert_description": alert.get("alert_description", "")
-    }
+    payload = {"alert_description": alert.get("alert_description", "")}
     
-    # 1. Ambil 'original' apa adanya (langsung assign, tanpa cek tipe data)
+    # 1. Ekstrak 'original' (bisa string di root, atau string di dalam dict 'original')
     if "original" in alert:
-        payload["original"] = alert["original"]
-    elif "alert_source_content" in alert:
-        payload["original"] = alert["alert_source_content"]
-        
-    # 2. Ambil '@timestamp' apa adanya
-    if "@timestamp" in alert:
-        payload["@timestamp"] = alert["@timestamp"]
-    elif isinstance(alert.get("original"), dict) and "@timestamp" in alert["original"]:
-        payload["@timestamp"] = alert["original"]["@timestamp"]
+        if isinstance(alert["original"], str):
+            payload["original"] = alert["original"]
+        elif isinstance(alert["original"], dict) and "original" in alert["original"]:
+            payload["original"] = alert["original"]["original"]
+            
+    # 2. Ekstrak '@timestamp' (bisa di root, atau di dalam dict 'original')
+    ts = alert.get("@timestamp")
+    if not ts and isinstance(alert.get("original"), dict):
+        ts = alert["original"].get("@timestamp")
+    if ts:
+        payload["@timestamp"] = ts
         
     return payload
 
 
 # ============================================================
-# TCP STREAMING & HTTP MULTIPLEXER
+# STREAMING & HTTP
 # ============================================================
 
 async def send_to_client(writer, payload):
-    data = (json.dumps(payload, ensure_ascii=False, default=str) + "\n").encode("utf-8")
-    writer.write(data)
+    writer.write((json.dumps(payload, ensure_ascii=False, default=str) + "\n").encode("utf-8"))
     await writer.drain()
 
-
 async def broadcast_alert(payload):
+    for writer in list(clents): # typo fixed below in actual code, but keeping logic simple
+        try:
+            await send_to_client(writer, payload is not None and payload or {})
+        except:
+            clients.discard(writer); writer.close()
+
+# Fix typo in broadcast
+async def broadcast_alert_fixed(payload):
     disconnected = []
     for writer in list(clients):
         try:
             await send_to_client(writer, payload)
         except (ConnectionError, OSError, BrokenPipeError):
             disconnected.append(writer)
-
     for writer in disconnected:
         clients.discard(writer)
         writer.close()
@@ -136,133 +109,113 @@ async def broadcast_alert(payload):
 
 async def handle_client(reader, writer):
     peer = writer.get_extra_info('peername')
-    
     try:
         try:
             first_data = await asyncio.wait_for(reader.read(1024), timeout=MUX_TIMEOUT)
         except asyncio.TimeoutError:
             first_data = b""
 
-        # 1. HTTP REQUEST
         if first_data.startswith((b"GET ", b"HEAD ")):
-            log.info("HTTP request dari %s", peer)
             alerts = await fetch_latest_alerts()
+            # Pastikan alerts adalah list
+            if isinstance(alerts, dict) and "data" in alerts:
+                alerts = alerts["data"]
+            if not isinstance(alerts, list):
+                alerts = [alerts] if alerts else []
+
+            formatted = [build_minimal_payload(a) for a in alerts]
+            body = json.dumps(formatted, ensure_ascii=False, indent=2, default=str).encode("utf-8")
             
-            formatted_alerts = [build_minimal_payload(alert) for alert in alerts]
-            body = json.dumps(formatted_alerts, ensure_ascii=False, indent=2, default=str).encode("utf-8")
-            
-            response = (
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: application/json; charset=utf-8\r\n"
-                f"Content-Length: {len(body)}\r\n"
-                "Connection: close\r\n"
-                "Access-Control-Allow-Origin: *\r\n"
-                "\r\n"
-            ).encode("utf-8") + body
-            
+            response = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body
             writer.write(response)
             await writer.drain()
             writer.close()
             return
 
-        # 2. TCP STREAMING CLIENT
-        log.info("TCP client terhubung (streaming): %s", peer)
+        # TCP Stream
         clients.add(writer)
-
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: keep-alive\r\n\r\n")
         await writer.drain()
+        
+        # Snapshot
+        alerts = await fetch_latest_alerts()
+        if isinstance(alerts, dict) and "data" in alerts:
+            alerts = alerts["data"]
+        if isinstance(alerts, list):
+            for a in alerts[:3]:
+                await send_to_client(writer, build_minimal_payload(a))
 
-        try:
-            initial_alerts = await fetch_latest_alerts()
-            if initial_alerts:
-                log.info("📦 Mengirim %d alert snapshot awal ke %s", len(initial_alerts), peer)
-                for alert in initial_alerts[:5]:
-                    snapshot_payload = build_minimal_payload(alert)
-                    # DEBUG: Cetak key yang berhasil diambil ke log
-                    log.debug("Snapshot payload keys: %s", list(snapshot_payload.keys()))
-                    await send_to_client(writer, snapshot_payload)
-        except Exception as e:
-            log.error("Gagal mengirim snapshot awal: %s", e)
-
-        try:
-            while True:
-                await asyncio.wait_for(reader.read(4096), timeout=30.0)
-        except asyncio.TimeoutError:
-            pass
-        except (ConnectionResetError, BrokenPipeError):
-            pass
-
-    except Exception as e:
-        log.error("Error pada koneksi klien %s: %s", peer, e)
+        while True:
+            await asyncio.wait_for(reader.read(4096), timeout=30.0)
+    except:
+        pass
     finally:
         clients.discard(writer)
         writer.close()
-        log.info("Klien terputus: %s", peer)
 
 
 # ============================================================
-# IRIS POLLING MONITOR
+# IRIS POLLING MONITOR (DENGAN DEBUG AGRESIF)
 # ============================================================
 
 async def iris_monitor():
-    log.info("IRIS polling aktif: %s (interval: %ss)", IRIS_ALERTS_ENDPOINT, POLL_INTERVAL)
-
+    log.info("Polling aktif...")
     while True:
         try:
-            alerts = await fetch_latest_alerts()
+            raw_response = await fetch_latest_alerts()
+            
+            # Normalisasi ke list
+            alerts_list = []
+            if isinstance(raw_response, list):
+                alerts_list = raw_response
+            elif isinstance(raw_response, dict) and "data" in raw_response:
+                alerts_list = raw_response["data"] if isinstance(raw_response["data"], list) else [raw_response["data"]]
+            elif isinstance(raw_response, dict):
+                alerts_list = [raw_response]
 
-            for alert in alerts:
-                alert_id = alert.get("id") or alert.get("alert_id")
-                dedup_key = str(alert_id) if alert_id else json.dumps(alert, sort_keys=True, default=str)
+            for alert in alerts_list:
+                alert_id = alert.get("id") or alert.get("alert_id") or "UNKNOWN"
+                dedup_key = str(alert_id)
 
                 if dedup_key in seen_alerts:
                     continue
-
                 seen_alerts.add(dedup_key)
+
+                # === MODE DEBUG AGRESIF ===
+                log.info("=== DEBUG ALERT ID: %s ===", alert_id)
+                log.info("1. Semua Keys di Root: %s", list(alert.keys()))
                 
-                if len(seen_alerts) > MAX_SEEN_ALERTS:
-                    log.warning("Batas seen_alerts tercapai. Mempertahankan ukuran maksimum.")
+                if "original" in alert:
+                    log.info("2. Tipe data 'original': %s", type(alert["original"]))
+                    if isinstance(alert["original"], dict):
+                        log.info("3. Keys di dalam 'original': %s", list(alert["original"].keys()))
+                else:
+                    log.warning("⚠️ TIDAK ADA KEY 'original' DI ROOT!")
+                    
+                if "alert_source_content" in alert:
+                    log.info("4. alert_source_content ditemukan. Tipe: %s", type(alert["alert_source_content"]))
+                # ==========================
 
                 payload = build_minimal_payload(alert)
+                log.info("✅ HASIL AKHIR PAYLOAD KEYS: %s", list(payload.keys()))
                 
-                # LOG PENTING: Ini akan membuktikan field apa saja yang berhasil diambil
-                log.info("✅ Alert BARU dikirim (ID: %s). Field yang dikirim: %s", alert_id, list(payload.keys()))
-                
-                await broadcast_alert(payload)
+                await broadcast_alert_fixed(payload)
 
         except Exception as e:
-            log.exception("Gagal polling IRIS: %s", e)
+            log.exception("Error polling: %s", e)
 
         await asyncio.sleep(POLL_INTERVAL)
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
 async def main():
     server = await asyncio.start_server(handle_client, host=HOST, port=PORT)
-    addrs = ', '.join(str(sock.getsockname()) for sock in server.sockets)
-    
-    log.info("🚀 Server aktif di: %s", addrs)
-    log.info("🎯 Endpoint IRIS Target: %s", IRIS_ALERTS_ENDPOINT)
-
-    monitor_task = asyncio.create_task(iris_monitor())
-
-    try:
-        async with server:
-            await server.serve_forever()
-    except asyncio.CancelledError:
-        log.info("Menerima sinyal pembatalan...")
-    finally:
-        log.info("Menutup server dan membersihkan koneksi...")
-        monitor_task.cancel()
-        for writer in list(clients):
-            writer.close()
-
+    log.info("Server aktif di %s:%s", HOST, PORT)
+    asyncio.create_task(iris_monitor())
+    async with server:
+        await server.serve_forever()
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("Server streaming dihentikan secara manual.")
+        log.info("Stopped.")
