@@ -28,9 +28,15 @@ async def fetch_latest_alert_from_iris():
             response.raise_for_status()
             data = response.json()
             
-            alerts = data.get("data", {}).get("data", [])
-            if not alerts:
-                alerts = data.get("data", []) 
+            # [PERBAIKAN 1]: Cek apakah data berupa list langsung atau dict
+            if isinstance(data, list):
+                alerts = data
+            elif isinstance(data, dict):
+                alerts = data.get("data", {}).get("data", [])
+                if not alerts:
+                    alerts = data.get("data", []) 
+            else:
+                alerts = []
                 
             if alerts and len(alerts) > 0:
                 latest_alert = alerts[0]
@@ -85,12 +91,16 @@ async def handle_client(reader, writer):
             await asyncio.sleep(5)
             
     except (ConnectionResetError, BrokenPipeError):
-        print(f"[-] Klien {addr} terputus.")
+        print(f"[-] Klien {addr} terputus (koneksi ditutup pengguna).")
     except Exception as e:
         print(f"[!] Error koneksi pada klien {addr}: {e}")
     finally:
-        writer.close()
-        await writer.wait_closed()
+        # [PERBAIKAN 2]: Abaikan error BrokenPipe saat mencoba menutup soket
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
 
 async def main():
     server = await asyncio.start_server(handle_client, '0.0.0.0', 17771)
