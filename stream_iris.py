@@ -5,25 +5,20 @@ import httpx
 import os
 
 # ============================================================
-# KONFIGURASI IRIS
+# KONFIGURASI
 # ============================================================
 
 IRIS_URL = os.getenv("IRIS_URL", "https://iris.local")
 IRIS_API_KEY = os.getenv("IRIS_API_KEY", "")
 
-# CA internal IRIS yang di-mount ke dalam container
+IRIS_VERIFY_SSL = os.getenv(
+    "IRIS_VERIFY_SSL", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
 IRIS_CA_CERT = os.getenv(
     "IRIS_CA_CERT",
     "/etc/ssl/custom/iris-ca.pem"
 )
-
-IRIS_ALERTS_ENDPOINT = (
-    f"{IRIS_URL.rstrip('/')}/api/v2/alerts"
-)
-
-# ============================================================
-# KONFIGURASI STREAMING
-# ============================================================
 
 HOST = "0.0.0.0"
 PORT = 17771
@@ -31,22 +26,24 @@ PORT = 17771
 POLL_INTERVAL = 1
 PER_PAGE = 100
 
-# Klien yang sedang terhubung
+IRIS_ALERTS_ENDPOINT = (
+    f"{IRIS_URL.rstrip('/')}/api/v2/alerts"
+)
+
+# Klien TCP aktif
 clients = set()
 
-# ID alert yang sudah dikirim
+# ID alert yang sudah berhasil dikirim selama proses berjalan
 sent_alert_ids = set()
 
-# Mencegah pengiriman alert secara bersamaan
 broadcast_lock = asyncio.Lock()
 
 
 # ============================================================
-# PARSING JSON
+# PARSING DATA
 # ============================================================
 
 def parse_json_if_string(value):
-    """Parsing JSON jika input berupa string."""
     if not isinstance(value, str):
         return value
 
@@ -57,34 +54,26 @@ def parse_json_if_string(value):
 
 
 def extract_alerts(data):
-    """Mengambil daftar alert dari respons API IRIS."""
     if isinstance(data, list):
         return data
 
     if not isinstance(data, dict):
         return []
 
-    inner_data = data.get("data")
+    inner = data.get("data")
 
-    if isinstance(inner_data, list):
-        return inner_data
+    if isinstance(inner, list):
+        return inner
 
-    if isinstance(inner_data, dict):
-        nested_data = inner_data.get("data")
-
-        if isinstance(nested_data, list):
-            return nested_data
+    if isinstance(inner, dict):
+        nested = inner.get("data")
+        if isinstance(nested, list):
+            return nested
 
     return []
 
 
-# ============================================================
-# NORMALISASI ALERT
-# ============================================================
-
 def normalize_alert(alert):
-    """Mengambil informasi alert yang akan dikirim ke klien."""
-
     if not isinstance(alert, dict):
         return None
 
@@ -94,7 +83,7 @@ def normalize_alert(alert):
         alert_id = alert.get("alert_id")
 
     if alert_id is None:
-        print("[!] Alert dilewati karena tidak memiliki ID.")
+        print("[!] Alert dilewati: ID tidak tersedia.")
         return None
 
     source_content = parse_json_if_string(
@@ -104,7 +93,7 @@ def normalize_alert(alert):
     if not isinstance(source_content, dict):
         source_content = {}
 
-    original_log = parse_json_if_string(
+    original = parse_json_if_string(
         source_content.get(
             "original",
             "Data original tidak ditemukan di alert ini"
@@ -114,22 +103,49 @@ def normalize_alert(alert):
     return {
         "alert_title": alert.get("alert_title"),
         "alert_description": alert.get("alert_description"),
-        "original": original_log,
+        "original": original,
         "iris_alert_id": alert_id
     }
 
 
 # ============================================================
-# FETCH ALERT DARI IRIS
+# KONFIGURASI TLS
+# ============================================================
+
+def get_tls_verify():
+    """
+    Verifikasi TLS selalu aktif.
+    Jika CA internal disediakan, gunakan CA tersebut.
+    Jika tidak, gunakan CA bawaan sistem.
+    """
+
+    if not IRIS_VERIFY_SSL:
+        raise RuntimeError(
+            "IRIS_VERIFY_SSL=false tidak diizinkan. "
+            "Aktifkan verifikasi TLS."
+        )
+
+    if IRIS_CA_CERT:
+        if not os.path.isfile(IRIS_CA_CERT):
+            raise FileNotFoundError(
+                f"CA IRIS tidak ditemukan: {IRIS_CA_CERT}. "
+                "Pastikan file tersedia dan di-mount ke container."
+            )
+
+        return IRIS_CA_CERT
+
+    return True
+
+
+# ============================================================
+# AMBIL ALERT DARI IRIS
 # ============================================================
 
 async def fetch_latest_alerts(client):
-    """Mengambil alert terbaru dari API IRIS."""
-
     headers = {
         "Authorization": f"Bearer {IRIS_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
+        "Accept": "application/json",
+        "Content-Type": "application/json"
     }
 
     try:
@@ -144,14 +160,11 @@ async def fetch_latest_alerts(client):
 
         response.raise_for_status()
 
-        data = response.json()
-
-        return extract_alerts(data)
+        return extract_alerts(response.json())
 
     except httpx.HTTPStatusError as exc:
         print(
-            f"[!] HTTP Error IRIS: "
-            f"{exc.response.status_code} - "
+            f"[!] HTTP IRIS {exc.response.status_code}: "
             f"{exc.response.text[:300]}"
         )
 
@@ -159,21 +172,19 @@ async def fetch_latest_alerts(client):
         print(f"[!] Koneksi IRIS gagal: {exc}")
 
     except (json.JSONDecodeError, ValueError) as exc:
-        print(f"[!] Respons JSON IRIS tidak valid: {exc}")
+        print(f"[!] Respons IRIS tidak valid: {exc}")
 
     except Exception as exc:
-        print(f"[!] Error saat mengambil alert: {exc}")
+        print(f"[!] Gagal membaca alert IRIS: {exc}")
 
     return []
 
 
 # ============================================================
-# KIRIM ALERT KE SATU KLIEN
+# KIRIM DATA KE KLIEN
 # ============================================================
 
 async def send_to_client(writer, payload):
-    """Mengirim satu objek JSON dalam satu baris NDJSON."""
-
     message = json.dumps(
         payload,
         ensure_ascii=False,
@@ -181,16 +192,14 @@ async def send_to_client(writer, payload):
     ) + "\n"
 
     writer.write(message.encode("utf-8"))
-
     await writer.drain()
 
 
-# ============================================================
-# BROADCAST KE SELURUH KLIEN
-# ============================================================
-
 async def broadcast_alert(payload):
-    """Mengirim alert baru ke semua klien yang terhubung."""
+    """
+    Broadcast alert ke seluruh klien yang aktif.
+    Mengembalikan jumlah klien yang berhasil menerima data.
+    """
 
     disconnected = []
     success_count = 0
@@ -201,16 +210,12 @@ async def broadcast_alert(payload):
                 await send_to_client(writer, payload)
                 success_count += 1
 
-            except (
-                ConnectionResetError,
-                BrokenPipeError,
-                OSError
-            ) as exc:
-                print(f"[!] Klien terputus saat pengiriman: {exc}")
+            except (ConnectionResetError, BrokenPipeError, OSError) as exc:
+                print(f"[!] Koneksi klien gagal: {exc}")
                 disconnected.append(writer)
 
             except Exception as exc:
-                print(f"[!] Gagal mengirim alert: {exc}")
+                print(f"[!] Pengiriman ke klien gagal: {exc}")
                 disconnected.append(writer)
 
         for writer in disconnected:
@@ -221,65 +226,47 @@ async def broadcast_alert(payload):
 
 
 # ============================================================
-# MONITORING REAL-TIME IRIS
+# MONITORING ALERT BARU
 # ============================================================
 
 async def iris_monitor():
-    """Polling IRIS dan mengirim alert baru saja."""
-
     if not IRIS_API_KEY:
         print("[!] PERINGATAN: IRIS_API_KEY kosong.")
 
-    # Verifikasi TLS tetap aktif menggunakan CA internal IRIS.
-    if not os.path.isfile(IRIS_CA_CERT):
-        print(
-            f"[!] Sertifikat CA tidak ditemukan: {IRIS_CA_CERT}"
-        )
-        print(
-            "[!] Pastikan CA di-mount ke container. "
-            "Monitoring akan tetap berjalan dan mencoba kembali."
-        )
-
-    timeout = httpx.Timeout(10.0)
-
     while True:
         try:
+            tls_verify = get_tls_verify()
+
             async with httpx.AsyncClient(
-                verify=IRIS_CA_CERT,
-                timeout=timeout
+                verify=tls_verify,
+                timeout=httpx.Timeout(10.0)
             ) as client:
 
-                print("[*] Monitoring API IRIS dimulai.")
+                print("[*] Koneksi TLS IRIS berhasil dikonfigurasi.")
 
                 while True:
                     alerts = await fetch_latest_alerts(client)
 
-                    # Jika API mengembalikan alert terbaru lebih dahulu,
-                    # proses secara terbalik agar alert lebih lama
-                    # dikirim terlebih dahulu.
+                    # Proses alert lama terlebih dahulu jika API
+                    # mengembalikan data terbaru pada posisi pertama.
                     for alert in reversed(alerts):
-
                         payload = normalize_alert(alert)
 
                         if payload is None:
                             continue
 
-                        alert_id = str(
-                            payload["iris_alert_id"]
-                        )
+                        alert_id = str(payload["iris_alert_id"])
 
-                        # Alert sudah pernah dikirim
+                        # Tidak mengirim alert yang sudah pernah dikirim.
                         if alert_id in sent_alert_ids:
                             continue
 
-                        # Belum ada klien: jangan tandai sebagai terkirim.
+                        # Jika tidak ada klien, jangan tandai terkirim.
                         if not clients:
                             continue
 
                         success_count = await broadcast_alert(payload)
 
-                        # Tandai jika berhasil dikirim ke setidaknya
-                        # satu klien yang terhubung.
                         if success_count > 0:
                             sent_alert_ids.add(alert_id)
 
@@ -290,7 +277,7 @@ async def iris_monitor():
                                 f"Klien={success_count}"
                             )
 
-                    # Tidak ada alert baru berarti tidak ada data
+                    # Jika tidak ada alert baru, tidak ada pesan
                     # yang dikirim ke klien.
                     await asyncio.sleep(POLL_INTERVAL)
 
@@ -299,26 +286,22 @@ async def iris_monitor():
 
         except Exception as exc:
             print(f"[!] Monitoring IRIS error: {exc}")
-            print("[*] Mencoba koneksi kembali dalam 5 detik.")
+            print("[*] Mencoba kembali dalam 5 detik.")
             await asyncio.sleep(5)
 
 
 # ============================================================
-# TCP CLIENT HANDLER
+# TCP SERVER
 # ============================================================
 
 async def handle_client(reader, writer):
-    """Menangani koneksi TCP dari klien penerima."""
-
     addr = writer.get_extra_info("peername")
 
     print(f"[+] Klien terhubung: {addr}")
-
     clients.add(writer)
 
     try:
-        # TCP streaming NDJSON.
-        # Klien membaca data per baris, bukan HTTP.
+        # TCP NDJSON: setiap pesan diakhiri newline.
         while True:
             data = await reader.read(1024)
 
@@ -328,11 +311,7 @@ async def handle_client(reader, writer):
     except asyncio.CancelledError:
         raise
 
-    except (
-        ConnectionResetError,
-        BrokenPipeError,
-        OSError
-    ):
+    except (ConnectionResetError, BrokenPipeError, OSError):
         pass
 
     except Exception as exc:
@@ -352,10 +331,27 @@ async def handle_client(reader, writer):
 
 
 # ============================================================
-# MAIN SERVER
+# MAIN
 # ============================================================
 
 async def main():
+    if not IRIS_VERIFY_SSL:
+        raise RuntimeError(
+            "TLS verification wajib aktif. "
+            "Periksa IRIS_VERIFY_SSL di .env."
+        )
+
+    print("=" * 60)
+    print("[*] IRIS REAL-TIME ALERT STREAM")
+    print("=" * 60)
+    print(f"[*] IRIS URL       : {IRIS_URL}")
+    print(f"[*] API Endpoint   : {IRIS_ALERTS_ENDPOINT}")
+    print(f"[*] CA Certificate : {IRIS_CA_CERT}")
+    print(f"[*] TLS Verify     : {IRIS_VERIFY_SSL}")
+    print(f"[*] TCP Host       : {HOST}")
+    print(f"[*] TCP Port       : {PORT}")
+    print(f"[*] Poll Interval  : {POLL_INTERVAL}s")
+    print("=" * 60)
 
     server = await asyncio.start_server(
         handle_client,
@@ -363,23 +359,11 @@ async def main():
         PORT
     )
 
-    print("=" * 60)
-    print("[*] IRIS ALERT STREAMING SERVER")
-    print("=" * 60)
-    print(f"[*] TCP Host       : {HOST}")
-    print(f"[*] TCP Port       : {PORT}")
-    print(f"[*] IRIS URL       : {IRIS_URL}")
-    print(f"[*] IRIS Endpoint  : {IRIS_ALERTS_ENDPOINT}")
-    print(f"[*] CA Certificate : {IRIS_CA_CERT}")
-    print(f"[*] Poll Interval  : {POLL_INTERVAL} detik")
-    print("[*] Mode           : Alert baru saja")
-    print("[*] TLS Verify     : Aktif")
-    print("=" * 60)
-
     monitor_task = asyncio.create_task(iris_monitor())
 
     try:
         async with server:
+            print(f"[*] TCP streaming aktif di {HOST}:{PORT}")
             await server.serve_forever()
 
     finally:
@@ -405,9 +389,7 @@ async def main():
 
 
 if __name__ == "__main__":
-
     try:
         asyncio.run(main())
-
     except KeyboardInterrupt:
         print("\n[*] Server streaming dihentikan.")
