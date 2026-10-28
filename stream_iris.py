@@ -3,7 +3,7 @@ import json
 import httpx
 import os
 
-# Mengambil konfigurasi IRIS (Otomatis disuntikkan oleh docker-compose dari .env)
+# Mengambil konfigurasi IRIS dari .env yang disuntikkan Docker
 IRIS_URL = os.getenv("IRIS_URL", "https://iris.example.local")
 IRIS_API_KEY = os.getenv("IRIS_API_KEY", "")
 
@@ -28,16 +28,20 @@ async def fetch_latest_alert_from_iris():
             response.raise_for_status()
             data = response.json()
             
-            # [PERBAIKAN 1]: Cek apakah data berupa list langsung atau dict
+            # [PERBAIKAN EKSTRAKSI JSON YANG AMAN]
+            alerts = []
             if isinstance(data, list):
                 alerts = data
             elif isinstance(data, dict):
-                alerts = data.get("data", {}).get("data", [])
-                if not alerts:
-                    alerts = data.get("data", []) 
-            else:
-                alerts = []
-                
+                inner_data = data.get("data")
+                if isinstance(inner_data, list):
+                    alerts = inner_data
+                elif isinstance(inner_data, dict):
+                    # Jika ada pagination bersarang
+                    alerts = inner_data.get("data", [])
+                    if not isinstance(alerts, list):
+                        alerts = []
+                        
             if alerts and len(alerts) > 0:
                 latest_alert = alerts[0]
                 
@@ -95,7 +99,6 @@ async def handle_client(reader, writer):
     except Exception as e:
         print(f"[!] Error koneksi pada klien {addr}: {e}")
     finally:
-        # [PERBAIKAN 2]: Abaikan error BrokenPipe saat mencoba menutup soket
         try:
             writer.close()
             await writer.wait_closed()
