@@ -3,7 +3,6 @@ import json
 import httpx
 import os
 
-# Mengambil konfigurasi IRIS (Otomatis disuntikkan oleh docker-compose)
 IRIS_URL = os.getenv("IRIS_URL", "https://iris.example.local")
 IRIS_API_KEY = os.getenv("IRIS_API_KEY", "")
 
@@ -12,7 +11,8 @@ if not IRIS_API_KEY:
 
 IRIS_ALERTS_ENDPOINT = f"{IRIS_URL.rstrip('/')}/api/v2/alerts"
 
-async def fetch_latest_alert_from_iris():
+async def fetch_latest_alerts_from_iris():
+    """Mengambil alert terbaru langsung dari IRIS secara real-time."""
     headers = {
         "Authorization": f"Bearer {IRIS_API_KEY}",
         "Content-Type": "application/json"
@@ -23,12 +23,11 @@ async def fetch_latest_alert_from_iris():
             response = await client.get(
                 IRIS_ALERTS_ENDPOINT, 
                 headers=headers,
-                params={"per_page": 1, "page": 1} 
+                params={"per_page": 5, "page": 1} 
             )
             response.raise_for_status()
             data = response.json()
             
-            # [PERBAIKAN EKSTRAKSI JSON YANG AMAN]
             alerts = []
             if isinstance(data, list):
                 alerts = data
@@ -41,10 +40,11 @@ async def fetch_latest_alert_from_iris():
                     if not isinstance(alerts, list):
                         alerts = []
                         
-            if alerts and len(alerts) > 0:
-                latest_alert = alerts[0]
+            payloads = []
+            for alert in alerts:
+                alert_id = alert.get("id")
                 
-                source_content = latest_alert.get("alert_source_content", {})
+                source_content = alert.get("alert_source_content", {})
                 if isinstance(source_content, str):
                     try:
                         source_content = json.loads(source_content)
@@ -59,32 +59,28 @@ async def fetch_latest_alert_from_iris():
                         pass
                 
                 payload = {
-                    "alert_title": latest_alert.get("alert_title"),
-                    "alert_description": latest_alert.get("alert_description"),
+                    "alert_title": alert.get("alert_title"),
+                    "alert_description": alert.get("alert_description"),
                     "original": original_log,
-                    "iris_alert_id": latest_alert.get("id")
+                    "iris_alert_id": alert_id
                 }
-                return payload
-            else:
-                return {"error": "Tidak ada alert yang ditemukan di server IRIS."}
+                payloads.append(payload)
                 
-        except httpx.HTTPStatusError as e:
-            return {"error": f"HTTP Error dari IRIS: {e.response.status_code} - {e.response.text}"}
-        except Exception as e:
-            return {"error": f"Gagal menghubungi IRIS: {str(e)}"}
+            return payloads
+                
+        except Exception:
+            return []
 
 async def handle_client(reader, writer):
     addr = writer.get_extra_info('peername')
     print(f"[+] Klien terkoneksi dari {addr}")
     
     try:
-        # [TAMBAHAN UNTUK WEB] Baca request GET awal dari browser agar buffer bersih
         try:
             await asyncio.wait_for(reader.read(1024), timeout=1.0)
         except Exception:
             pass
             
-        # [TAMBAHAN UNTUK WEB] Kirim HTTP Header ke browser
         http_header = (
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/plain; charset=utf-8\r\n"
@@ -96,22 +92,20 @@ async def handle_client(reader, writer):
         await writer.drain()
 
         while True:
-            payload = await fetch_latest_alert_from_iris()
+            payloads = await fetch_latest_alerts_from_iris()
             
-            data_to_send = json.dumps(payload) + "\n"
-            writer.write(data_to_send.encode('utf-8'))
-            await writer.drain()
+            # HANYA KIRIM JIKA DATA ADA
+            if payloads:
+                for payload in payloads:
+                    data_to_send = json.dumps(payload) + "\n"
+                    writer.write(data_to_send.encode('utf-8'))
+                    await writer.drain()
             
-            if "error" in payload:
-                print(f" [!] {payload['error']}")
-            else:
-                alert_id = payload.get('iris_alert_id', 'N/A')
-                print(f" -> Data alert (ID: {alert_id}) berhasil di-stream ke {addr}")
-            
+            # Cek berkala setiap 5 detik tanpa mencetak apa pun jika kosong
             await asyncio.sleep(5)
             
     except (ConnectionResetError, BrokenPipeError):
-        print(f"[-] Klien {addr} terputus (koneksi ditutup pengguna/browser).")
+        print(f"[-] Klien {addr} terputus.")
     except Exception as e:
         print(f"[!] Error koneksi pada klien {addr}: {e}")
     finally:
@@ -123,10 +117,7 @@ async def handle_client(reader, writer):
 
 async def main():
     server = await asyncio.start_server(handle_client, '0.0.0.0', 17771)
-    
-    addrs = ', '.join(str(sock.getsockname()) for sock in server.sockets)
-    print(f"[*] Server streaming aktif di {addrs} (TCP port 17771)")
-    print(f"[*] Target Endpoint IRIS: {IRIS_URL}")
+    print(f"[*] Server streaming aktif di port 17771")
 
     async with server:
         await server.serve_forever()
@@ -135,4 +126,4 @@ if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nServer streaming dihentikan oleh pengguna.")
+        print("\nServer streaming dihentikan.")
