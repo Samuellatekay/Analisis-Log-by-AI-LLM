@@ -339,7 +339,7 @@ class IrisClient:
                         enriched_ips.append(val)
 
         if enriched_ips:
-            lines.append(f"- IOC IP yang dianalisis (Terdeteksi OpenCTI): {', '.join(enriched_ips)}")
+            lines.append(f"- IP: {', '.join(enriched_ips)}")
         elif source_ip:
             lines.append(f"- IP Sumber: {source_ip} (Tidak ditemukan dalam database OpenCTI/Threat Intel)")
 
