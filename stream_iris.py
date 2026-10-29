@@ -54,7 +54,7 @@ async def fetch_alert_list():
             return []
 
 async def fetch_alert_detail(alert_id):
-    """Mengambil detail lengkap 1 alert (berat) untuk mendapatkan 'original' dan '@timestamp'."""
+    """Mengambil detail lengkap 1 alert untuk mendapatkan 'original' dan '@timestamp'."""
     url = f"{BASE_IRIS_URL}/api/v2/alerts/{alert_id}"
     headers = {"Authorization": f"Bearer {IRIS_API_KEY}", "Accept": "application/json"}
     async with httpx.AsyncClient(verify=False, timeout=REQUEST_TIMEOUT) as client:
@@ -68,11 +68,11 @@ async def fetch_alert_detail(alert_id):
 
 
 # ============================================================
-# PAYLOAD BUILDER
+# PAYLOAD BUILDER (DIPAKAI DI SEMUA TEMPAT)
 # ============================================================
 
 def build_minimal_payload(detail_data):
-    """Membangun payload dari data DETAIL yang lengkap."""
+    """Membangun payload HANYA dengan 3 field dari data DETAIL yang lengkap."""
     if not detail_data or not isinstance(detail_data, dict):
         return {"alert_description": "Gagal mengambil detail"}
 
@@ -125,21 +125,47 @@ async def handle_client(reader, writer):
         except asyncio.TimeoutError:
             first_data = b""
 
-        # HTTP Request
+        # ========================================================
+        # 1. HTTP REQUEST (CURL / BROWSER) - DIPERBAIKI TOTAL
+        # ========================================================
         if first_data.startswith((b"GET ", b"HEAD ")):
             log.info("HTTP request dari %s", peer)
-            # Untuk HTTP, kita ambil list saja agar cepat, atau bisa dimodifikasi jika perlu detail
-            alerts = await fetch_alert_list()
-            formatted = [{"alert_description": a.get("alert_description", "")} for a in alerts]
-            body = json.dumps(formatted, ensure_ascii=False, indent=2, default=str).encode("utf-8")
             
-            response = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body
+            # Ambil daftar alert dulu
+            alerts_list = await fetch_alert_list()
+            formatted_alerts = []
+            
+            # PERBAIKAN: Loop untuk mengambil DETAIL LENGKAP setiap alert
+            # agar field 'original' dan '@timestamp' pasti muncul di HTTP
+            for alert_summary in alerts_list:
+                alert_id = alert_summary.get("id") or alert_summary.get("alert_id")
+                if alert_id:
+                    detail_data = await fetch_alert_detail(alert_id)
+                    if detail_data:
+                        formatted_alerts.append(build_minimal_payload(detail_data))
+                    else:
+                        # Fallback jika detail gagal diambil
+                        formatted_alerts.append({"alert_description": alert_summary.get("alert_description", "")})
+
+            body = json.dumps(formatted_alerts, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+            
+            response = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json; charset=utf-8\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "\r\n"
+            ).encode("utf-8") + body
+            
             writer.write(response)
             await writer.drain()
             writer.close()
             return
 
-        # TCP Stream
+        # ========================================================
+        # 2. TCP STREAMING CLIENT
+        # ========================================================
         log.info("TCP client terhubung: %s", peer)
         clients.add(writer)
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: keep-alive\r\n\r\n")
@@ -158,7 +184,7 @@ async def handle_client(reader, writer):
 
 
 # ============================================================
-# IRIS POLLING MONITOR (STRATEGI BARU: FETCH DETAIL)
+# IRIS POLLING MONITOR
 # ============================================================
 
 async def iris_monitor():
@@ -180,11 +206,9 @@ async def iris_monitor():
                 seen_alerts.add(dedup_key)
                 log.info("🔍 Alert baru terdeteksi (ID: %s). Mengambil detail lengkap...", alert_id)
                 
-                # 1. Fetch detail lengkap
                 detail_data = await fetch_alert_detail(alert_id)
                 
                 if detail_data:
-                    # 2. Bangun payload dari data lengkap
                     payload = build_minimal_payload(detail_data)
                     log.info("✅ Berhasil mengirim alert %s. Field: %s", alert_id, list(payload.keys()))
                     await broadcast_alert(payload)
