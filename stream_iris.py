@@ -148,7 +148,7 @@ async def handle_client(reader, writer):
     peer = writer.get_extra_info('peername')
     try:
         try:
-            first_data = await asyncio.wait_for(reader.read1(1024), timeout=MUX_TIMEOUT)
+            first_data = await asyncio.wait_for(reader.read(1024), timeout=MUX_TIMEOUT)
         except Exception:
             first_data = b""
 
@@ -178,14 +178,16 @@ async def handle_client(reader, writer):
 
             body = json.dumps(formatted_alerts, ensure_ascii=False, indent=2, default=str).encode("utf-8")
             
-            response = (
-                b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: application/json; charset=utf-8\r\n"
-                f"Content-Length: {len(body)}\r\n".encode() +
-                b"Connection: close\r\n"
-                b"Access-Control-Allow-Origin: *\r\n"
-                b"\r\n" + body
+            # PERBAIKAN SYNTAX: Buat header sebagai string dulu, baru di-encode ke bytes
+            headers_str = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json; charset=utf-8\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "\r\n"
             )
+            response = headers_str.encode("utf-8") + body
             
             writer.write(response)
             await writer.drain()
