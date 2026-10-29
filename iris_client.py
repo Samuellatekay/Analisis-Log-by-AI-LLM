@@ -298,8 +298,13 @@ class IrisClient:
             "# Threat Intelligence Enrichment",
         ]
         
-        # LOGIKA DINAMIS: Hanya tampilkan IP jika benar-benar memiliki data OpenCTI
+        # LOGIKA DINAMIS: Hanya tampilkan IP yang memiliki data OpenCTI/Reputation
         enriched_ips = []
+        reputation_data = _d(doc.get("reputation"))
+        
+        # Ambil IP utama yang memiliki reputation data (jika ada di root reputation)
+        rep_ip = reputation_data.get("ip") or reputation_data.get("value") or reputation_data.get("indicator")
+        
         if isinstance(observables, list):
             for obs in observables:
                 if not isinstance(obs, dict):
@@ -310,18 +315,27 @@ class IrisClient:
                 is_ip = obs.get("entity_type") in ("IPv4", "IPv6", "Ip") or (val and val.replace(".", "").replace(":", "").isdigit())
                 
                 if is_ip:
-                    # Cek apakah observabel ini memiliki data OpenCTI yang valid
+                    has_reputation = False
+                    
+                    # Cek 1: Apakah IP ini ada di root reputation data?
+                    if rep_ip and val == rep_ip:
+                        has_reputation = True
+                    
+                    # Cek 2: Apakah observable ini memiliki nested opencti data?
                     opencti_data = obs.get("opencti")
-                    has_opencti = False
-                    if isinstance(opencti_data, dict):
-                        # Punya indikator, score, atau verdict
-                        if opencti_data.get("indicators") or opencti_data.get("score") or opencti_data.get("verdict"):
-                            has_opencti = True
-                    # Fallback jika struktur datanya flat (langsung di root observable)
-                    elif obs.get("opencti_score") or obs.get("verdict"):
-                        has_opencti = True
-                        
-                    if has_opencti and val not in enriched_ips:
+                    if isinstance(opencti_data, dict) and (opencti_data.get("indicators") or opencti_data.get("score") or opencti_data.get("verdict")):
+                        has_reputation = True
+                    
+                    # Cek 3: Apakah observable memiliki score/verdict langsung?
+                    if obs.get("opencti_score") or obs.get("verdict") or obs.get("score"):
+                        has_reputation = True
+                    
+                    # Cek 4: Apakah IP ini muncul di indicators dari root reputation?
+                    rep_indicators = reputation_data.get("indicators", [])
+                    if isinstance(rep_indicators, list) and val in rep_indicators:
+                        has_reputation = True
+                    
+                    if has_reputation and val not in enriched_ips:
                         enriched_ips.append(val)
 
         if enriched_ips:
@@ -366,7 +380,6 @@ class IrisClient:
             "alert_source_content": safe_doc,
             "alert_severity_id": self.severity_map.get(level, 4),
             "alert_customer_id": self.customer_id,
-            # PERBAIKAN: Format waktu ISO 8601 yang valid dengan indikator timezone 'Z'
             "alert_source_event_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "alert_tags": ",".join(tags),
         }
@@ -505,7 +518,6 @@ class IrisClient:
                 {"case_description": updated_description},
             )
         else:
-            # PERBAIKAN: Fallback classification_id yang aman untuk nilai 0
             await self._post(
                 self.paths["case_update"].format(id=case_id),
                 {
@@ -576,7 +588,6 @@ class IrisClient:
     async def escalate_alert(self, alert_id: int, doc: dict) -> int | None:
         p = self.build_payload(doc)
         body = {"iocs_import_list": [], "assets_import_list": [], "import_as_event": False,
-                # PERBAIKAN: Typo "Dieskalasi" -> "Diekskalasi"
                 "note": "Diekskalasi otomatis oleh Analisis_Log (risk tinggi).",
                 "case_title": p["alert_title"][:250], "case_tags": p["alert_tags"]}
         d = await self._post(self.paths["escalate"].format(id=alert_id), body)
