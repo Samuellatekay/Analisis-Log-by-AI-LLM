@@ -97,7 +97,6 @@ def _format_reputation(value: Any, observables: list | None = None) -> list[str]
     """Format reputasi dengan fallback ke observables jika doc.reputation kosong."""
     reputation = _d(value)
     
-    # FALLBACK: Jika tidak ada reputation di level doc, ekstrak dari observables yang punya data OpenCTI
     if not reputation and isinstance(observables, list):
         for obs in observables:
             if not isinstance(obs, dict):
@@ -175,7 +174,7 @@ def _format_geolocation(value: Any) -> list[str]:
 
 
 def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[str]:
-    # PERBAIKAN: Deteksi aset GLPI lebih fleksibel
+    # Deteksi aset GLPI lebih fleksibel
     is_glpi_asset = (
         asset.get("inventory_source") == "GLPI" or 
         asset.get("found") is True or
@@ -213,10 +212,8 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[st
         if not isinstance(item, dict): continue
         asset_id = _display(item.get("id"), 80)
         lines.append(f"- Aset GLPI #{asset_id or index}:")
-        if index == 1 and asset.get("matched_by") == "hostname":
-            matched_host = _display(asset.get("matched_value"), 120)
-            if matched_host:
-                lines.append(f"- Dicocokkan melalui hostname agent: {matched_host}")
+        
+        # PERBAIKAN: Baris "Dicocokkan melalui hostname agent" dihapus agar lebih bersih
         
         fields = (
             ("Nama", item.get("name")),
@@ -285,7 +282,6 @@ class IrisClient:
         return obj
 
     def allows(self, doc: dict) -> bool:
-        """Filter level alert Wazuh (event.wazuh_level)."""
         lvl = _d(doc.get("event")).get("wazuh_level")
         try:
             lvl = int(lvl)
@@ -296,7 +292,6 @@ class IrisClient:
         return not (self.max_wazuh_level and lvl > self.max_wazuh_level)
 
     def build_payload(self, doc: dict) -> dict:
-        """Merakit dictionary payload sesuai desain bersih yang diinginkan."""
         if hasattr(doc, "doc") and isinstance(doc.doc, dict):
             doc = doc.doc
         if not isinstance(doc, dict):
@@ -315,8 +310,6 @@ class IrisClient:
         who = _md_escape(src.get("ip") or asset.get("name") or "unknown", 80)
         
         destination = _d(doc.get("destination"))
-        source_asset = _d(src.get("asset")) or (asset if src.get("ip") else {})
-        destination_asset = _d(destination.get("asset"))
         observables = _d(doc.get("enrichment")).get("observables") or []
         is_wazuh = doc.get("data_source") == "wazuh" or "wazuh_level" in ev
         
@@ -324,6 +317,17 @@ class IrisClient:
         source_ip = _display(src.get("ip"), 80)
         source_label = source_ip or "Tidak tersedia di event"
         destination_label = destination_ip or "Tidak tersedia di event"
+
+        # PERBAIKAN: Logika pemetaan aset untuk event lokal (FIM, Syscheck, Privilege Escalation)
+        # Jika tidak ada IP sumber eksternal, aset host (GLPI) adalah Target (Destination)
+        is_local_event = not src.get("ip") and not destination.get("ip")
+        
+        if is_local_event:
+            source_asset = {}
+            destination_asset = _d(destination.get("asset")) or asset
+        else:
+            source_asset = _d(src.get("asset"))
+            destination_asset = _d(destination.get("asset"))
 
         lines = [
             "# Risiko",
@@ -343,7 +347,6 @@ class IrisClient:
             "# Threat Intelligence Enrichment",
         ]
         
-        # LOGIKA DINAMIS: Kelompokkan IOC berdasarkan tipe (IP, Domain, Hash)
         enriched_iocs = {"IP": [], "Domain": [], "Hash/File": []}
         reputation_data = _d(doc.get("reputation"))
         rep_ip = reputation_data.get("ip") or reputation_data.get("value")
@@ -398,7 +401,8 @@ class IrisClient:
                 if not isinstance(obs, dict): continue
                 e_type = _display(obs.get("entity_type"), 40)
                 e_val = _display(obs.get("value"), 180)
-                if e_type and e_val:
+                # PERBAIKAN: Jangan tampilkan Host-Name sebagai IOC
+                if e_type and e_val and e_type.lower() not in ("host-name", "hostname", "host"):
                     lines.append(f"- {e_type}: {e_val}")
                     shown_ioc = True
                     
@@ -487,7 +491,6 @@ class IrisClient:
         return {}
 
     async def _delete(self, path: str) -> dict | bool:
-        """Helper untuk HTTP DELETE."""
         for attempt in range(3):
             try:
                 r = await self._client.delete(path)
@@ -499,7 +502,6 @@ class IrisClient:
             if r.status_code in RETRY_STATUS and attempt < 2:
                 await asyncio.sleep(1 + attempt)
                 continue
-            
             if r.status_code in (200, 204):
                 return True
             return self._parse(r, path)
@@ -526,7 +528,6 @@ class IrisClient:
             await self._put(path, update)
 
     async def delete_alert(self, alert_id: int) -> bool:
-        """Menghapus alert berdasarkan ID."""
         path = self.paths["alert_delete"].format(id=alert_id)
         if self.api_version == "v2":
             return await self._delete(path) is True
@@ -547,40 +548,27 @@ class IrisClient:
         if not isinstance(current_description, str):
             current_description = current.get("description")
         if not isinstance(current_description, str):
-            raise IrisError(
-                f"IRIS tidak mengembalikan deskripsi case {case_id}; pembaruan dibatalkan"
-            )
+            raise IrisError(f"IRIS tidak mengembalikan deskripsi case {case_id}; pembaruan dibatalkan")
 
         updated_description = self.build_payload(doc)["alert_description"]
         if updated_description == current_description:
             return False
 
         if self.api_version == "v2":
-            await self._put(
-                self.paths["case_update"].format(id=case_id),
-                {"case_description": updated_description},
-            )
+            await self._put(self.paths["case_update"].format(id=case_id), {"case_description": updated_description})
         else:
-            await self._post(
-                self.paths["case_update"].format(id=case_id),
-                {
-                    "case_name": current.get("case_name") or current.get("name"),
-                    "case_soc_id": current.get("case_soc_id") or current.get("soc_id") or "",
-                    "case_description": updated_description,
-                    "classification_id": (
-                        current.get("classification_id")
-                        if current.get("classification_id") is not None
-                        else current.get("case_classification_id")
-                    ),
-                    "custom_attributes": current.get("custom_attributes") or {},
-                    "owner_id": current.get("owner_id") or current.get("case_owner_id"),
-                    "case_tags": current.get("case_tags") or "",
-                },
-            )
+            await self._post(self.paths["case_update"].format(id=case_id), {
+                "case_name": current.get("case_name") or current.get("name"),
+                "case_soc_id": current.get("case_soc_id") or current.get("soc_id") or "",
+                "case_description": updated_description,
+                "classification_id": current.get("classification_id") if current.get("classification_id") is not None else current.get("case_classification_id"),
+                "custom_attributes": current.get("custom_attributes") or {},
+                "owner_id": current.get("owner_id") or current.get("case_owner_id"),
+                "case_tags": current.get("case_tags") or "",
+            })
         return True
 
     async def delete_case(self, case_id: int) -> bool:
-        """Menghapus case berdasarkan ID."""
         path = self.paths["case_delete"].format(id=case_id)
         if self.api_version == "v2":
             return await self._delete(path) is True
@@ -598,23 +586,13 @@ class IrisClient:
                 directories = directories.get("data")
             if not isinstance(directories, list):
                 raise IrisError("IRIS tidak mengembalikan daftar direktori catatan case")
-            valid_directories = [
-                directory for directory in directories
-                if isinstance(directory, dict) and isinstance(directory.get("id"), int)
-            ]
-            directory = next(
-                (item for item in valid_directories if item.get("parent_id") is None),
-                valid_directories[0] if valid_directories else None,
-            )
+            valid_directories = [directory for directory in directories if isinstance(directory, dict) and isinstance(directory.get("id"), int)]
+            directory = next((item for item in valid_directories if item.get("parent_id") is None), valid_directories[0] if valid_directories else None)
             if directory is None:
-                created = await self._post(directories_path, {
-                    "name": "Analisis_Log Updates",
-                })
+                created = await self._post(directories_path, {"name": "Analisis_Log Updates"})
                 directory = created
                 if not isinstance(directory, dict) or not isinstance(directory.get("id"), int):
-                    raise IrisError(
-                        f"IRIS gagal membuat direktori catatan untuk case {case_id}"
-                    )
+                    raise IrisError(f"IRIS gagal membuat direktori catatan untuk case {case_id}")
             directory_id = directory["id"]
         else:
             directory_id = None
@@ -640,8 +618,7 @@ class IrisClient:
         risk = _d(doc.get("risk"))
         body = {"target_case_id": case_id, "iocs_import_list": [], "assets_import_list": [],
                 "import_as_event": False,
-                "note": f"Alert terkait dari sumber yang sama (risk {risk.get('score')}, "
-                        f"{risk.get('level')}) digabung otomatis. log_uuid={doc.get('log_uuid')}"}
+                "note": f"Alert terkait dari sumber yang sama (risk {risk.get('score')}, {risk.get('level')}) digabung otomatis. log_uuid={doc.get('log_uuid')}"}
         await self._post(self.paths["merge"].format(id=alert_id), body)
 
     async def _list(self, paths: list[str]) -> list[tuple[int, str]]:
@@ -667,8 +644,7 @@ class IrisClient:
             for it in items or []:
                 if not isinstance(it, dict):
                     continue
-                _id = it.get("id") if isinstance(it.get("id"), int) else next(
-                    (v for k, v in it.items() if k.endswith("_id") and isinstance(v, int)), None)
+                _id = it.get("id") if isinstance(it.get("id"), int) else next((v for k, v in it.items() if k.endswith("_id") and isinstance(v, int)), None)
                 name = next((str(v) for k, v in it.items() if k == "name" or k.endswith("_name")), "")
                 if _id is not None:
                     out.append((int(_id), name))
@@ -688,8 +664,7 @@ class IrisClient:
             try:
                 if self.status_id is None:
                     sts = await self._list(self.paths["status_list"])
-                    pick = next((i for i, n in sts if n.strip().lower() == "new"), None) \
-                        or next((i for i, n in sts if "new" in n.lower()), None)
+                    pick = next((i for i, n in sts if n.strip().lower() == "new"), None) or next((i for i, n in sts if "new" in n.lower()), None)
                     if pick is not None:
                         self.status_id = pick
                         log.info("IRIS: alert_status_id otomatis = %s", pick)
@@ -709,8 +684,7 @@ class IrisClient:
         probe = self.paths["probe"]
         r = await self._client.get(probe)
         if "html" in r.headers.get("content-type", ""):
-            hint = ("server ini IRIS v3: set IRIS_API_VERSION=v2" if self.api_version == "legacy"
-                    else "IRIS_URL salah / path API tidak dilayani (proxy lain?)")
+            hint = ("server ini IRIS v3: set IRIS_API_VERSION=v2" if self.api_version == "legacy" else "IRIS_URL salah / path API tidak dilayani (proxy lain?)")
             return "GAGAL", f"{probe} mengembalikan HTML: {hint}"
         if r.status_code in (401, 403):
             return "GAGAL", f"HTTP {r.status_code} di {probe}: API key salah / user tanpa izin"
