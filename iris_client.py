@@ -384,7 +384,7 @@ class IrisClient:
             summary_parts.append(f"Hash/File: {', '.join(enriched_iocs['Hash/File'][:3])}")
 
         if summary_parts:
-            lines.append(f"- IOC Terdeteksi OpenCTI: {' | '.join(summary_parts)}")
+            lines.append(f"- IOC : {' | '.join(summary_parts)}")
         elif source_ip:
             lines.append(f"- IP Sumber: {source_ip} (Tidak ditemukan dalam database OpenCTI)")
 
