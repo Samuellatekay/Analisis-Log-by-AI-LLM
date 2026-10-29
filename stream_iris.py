@@ -26,10 +26,19 @@ Variabel lingkungan (selain IRIS_URL, IRIS_API_KEY, REDIS_URL yang sudah ada di 
   IRIS_STREAM_DETAIL_MAX_FAILS=5        setelah N siklus gagal ambil detail, kirim ringkasan saja
   IRIS_STREAM_ORDER=auto                auto | asc | desc (urutan daftar alert dari API IRIS)
   IRIS_STREAM_LIST_PARAMS=              query tambahan untuk daftar alert, mis. "sort=desc"
+
+Endpoint HTTP read-only (opsional, untuk dilihat/di-poll dari luar; TIDAK memanggil IRIS):
+  IRIS_STREAM_HTTP_PORT=0               0 = nonaktif; mis. 17771 untuk mengaktifkan
+  IRIS_STREAM_HTTP_HOST=0.0.0.0         alamat bind di dalam container
+  IRIS_STREAM_TOKEN=                    WAJIB bila HTTP aktif (header "Authorization: Bearer <token>" atau ?token=)
+  IRIS_STREAM_HTTP_ALLOW_ANON=false     true = tanpa token (tidak disarankan)
+  IRIS_STREAM_RECENT=500                jumlah alert terbaru yang disimpan untuk endpoint HTTP
+  Endpoint:  GET /  atau /alerts[?since_id=N&limit=100]  -> JSON array;   GET /health -> status
 """
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import math
@@ -40,7 +49,7 @@ import sys
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Mapping
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 import httpx
 import redis.asyncio as aioredis
@@ -82,6 +91,13 @@ class Config:
     order: str = "auto"
     extra_params: dict = field(default_factory=dict)
     retry_base_s: float = 1.0
+    http_port: int = 0
+    http_host: str = "0.0.0.0"
+    token: str = ""
+    allow_anon: bool = False
+    recent_key: str = "iris-alerts-recent"
+    recent_len: int = 500
+    http_timeout_s: float = 5.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] = os.environ) -> "Config":
@@ -93,8 +109,17 @@ class Config:
         order = env.get("IRIS_STREAM_ORDER", "auto").strip().lower()
         if order not in {"auto", "asc", "desc"}:
             raise StreamError("IRIS_STREAM_ORDER harus: auto | asc | desc")
+        http_port = int(env.get("IRIS_STREAM_HTTP_PORT", "0") or 0)
+        token = env.get("IRIS_STREAM_TOKEN", "").strip()
+        allow_anon = env.get("IRIS_STREAM_HTTP_ALLOW_ANON", "false").strip().lower() == "true"
+        if http_port and not token and not allow_anon:
+            raise StreamError("IRIS_STREAM_HTTP_PORT diisi tetapi IRIS_STREAM_TOKEN kosong. Isi token "
+                              "(mis. openssl rand -hex 24), atau set IRIS_STREAM_HTTP_ALLOW_ANON=true (tidak disarankan)")
         return cls(
             iris_url=url, api_key=key,
+            http_port=http_port, token=token, allow_anon=allow_anon,
+            http_host=env.get("IRIS_STREAM_HTTP_HOST", "0.0.0.0").strip() or "0.0.0.0",
+            recent_len=max(10, int(env.get("IRIS_STREAM_RECENT", "500") or 500)),
             redis_url=env.get("REDIS_URL", "redis://localhost:6379/0"),
             list_key=env.get("IRIS_STREAM_LIST", "iris-alerts-out").strip() or "iris-alerts-out",
             poll_s=max(0.5, float(env.get("IRIS_POLL_INTERVAL", "5") or 5)),
@@ -207,6 +232,7 @@ class Streamer:
         self.stop = asyncio.Event()
         self.instance = f"{os.uname().nodename}-{uuid.uuid4().hex[:6]}"
         self.fails: dict[int, int] = {}
+        self._http_slots = asyncio.Semaphore(20)
 
     async def _sleep(self, seconds: float) -> None:
         try:
@@ -319,6 +345,97 @@ class Streamer:
                         if self._has_next(page, current, last_page) else "")
         return found
 
+    # ---- HTTP read-only (membaca Redis saja, tidak memanggil IRIS)
+    @staticmethod
+    def _response(status: int, body: bytes, head_only: bool = False,
+                  ctype: str = "application/json; charset=utf-8", extra: str = "") -> bytes:
+        reason = {200: "OK", 400: "Bad Request", 401: "Unauthorized", 404: "Not Found",
+                  405: "Method Not Allowed"}.get(status, "Error")
+        head = (f"HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {len(body)}\r\n"
+                f"Cache-Control: no-store\r\nConnection: close\r\n{extra}\r\n").encode()
+        return head if head_only else head + body
+
+    def _authorized(self, headers: dict, query: dict) -> bool:
+        if not self.cfg.token:
+            return self.cfg.allow_anon
+        supplied = headers.get("x-api-key", "")
+        auth = headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            supplied = auth[7:].strip()
+        supplied = supplied or (query.get("token") or [""])[0]
+        return hmac.compare_digest(supplied.encode(), self.cfg.token.encode())
+
+    async def _route(self, head: bytes) -> bytes:
+        lines = head.decode("latin-1").split("\r\n")
+        try:
+            method, target, _ = lines[0].split(" ", 2)
+        except ValueError:
+            return self._response(400, b'{"error":"bad request"}')
+        head_only = method == "HEAD"
+        if method not in ("GET", "HEAD"):
+            return self._response(405, b'{"error":"method not allowed"}', extra="Allow: GET, HEAD\r\n")
+        headers = {k.strip().lower(): v.strip() for k, _, v in (ln.partition(":") for ln in lines[1:]) if k}
+        url = urlsplit(target)
+        query = parse_qs(url.query)
+        path = url.path.rstrip("/") or "/"
+        if path == "/health":
+            body = json.dumps({"status": "ok", "last_id": await self.redis.get(CURSOR_KEY),
+                               "recent": await self.redis.llen(self.cfg.recent_key)}).encode()
+            return self._response(200, body, head_only)
+        if not self._authorized(headers, query):
+            return self._response(401, b'{"error":"unauthorized"}', head_only,
+                                  extra='WWW-Authenticate: Bearer realm="iris-stream"\r\n')
+        if path not in ("/", "/alerts"):
+            return self._response(404, b'{"error":"not found"}', head_only)
+        try:
+            since = int((query.get("since_id") or ["0"])[0])
+            limit = min(self.cfg.recent_len, max(1, int((query.get("limit") or ["100"])[0])))
+        except ValueError:
+            return self._response(400, b'{"error":"since_id/limit harus angka"}', head_only)
+        items = []
+        for raw in await self.redis.lrange(self.cfg.recent_key, -self.cfg.recent_len, -1):
+            try:
+                item = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(item, dict) and int(item.get("iris_alert_id") or 0) > since:
+                items.append(item)
+        body = json.dumps(items[-limit:], ensure_ascii=False, indent=2, default=str).encode()
+        return self._response(200, body, head_only)
+
+    async def handle_http(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        async with self._http_slots:
+            response = None
+            try:
+                head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), self.cfg.http_timeout_s)
+                response = await self._route(head)
+            except (asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError,
+                    ConnectionError, OSError):
+                pass                                       # klien diam/rusak/menutup: cukup tutup koneksi
+            except Exception:
+                log.exception("Error HTTP")
+                response = self._response(400, b'{"error":"internal"}')
+            try:
+                if response:
+                    writer.write(response)
+                    await writer.drain()
+            except (ConnectionError, OSError):
+                pass
+            finally:
+                writer.close()
+
+    async def start_http(self) -> asyncio.AbstractServer | None:
+        if not self.cfg.http_port:
+            return None
+        try:
+            server = await asyncio.start_server(self.handle_http, self.cfg.http_host,
+                                                self.cfg.http_port, limit=16384)
+        except OSError as exc:
+            raise StreamError(f"Tidak bisa membuka {self.cfg.http_host}:{self.cfg.http_port}: {exc}") from exc
+        log.info("HTTP read-only aktif di %s:%d (token %s)", self.cfg.http_host, self.cfg.http_port,
+                 "diwajibkan" if self.cfg.token else "TIDAK ADA - terbuka untuk siapa saja")
+        return server
+
     # ---- Redis
     async def am_leader(self) -> bool:
         ttl = max(15, int(self.cfg.poll_s * 3))
@@ -329,9 +446,13 @@ class Streamer:
         return bool(await self.redis.set(LOCK_KEY, self.instance, nx=True, ex=ttl))
 
     async def push(self, payload: dict, cursor: int | None) -> None:
+        line = json.dumps(payload, ensure_ascii=False, default=str)
         pipe = self.redis.pipeline(transaction=True)
-        pipe.rpush(self.cfg.list_key, json.dumps(payload, ensure_ascii=False, default=str))
+        pipe.rpush(self.cfg.list_key, line)
         pipe.ltrim(self.cfg.list_key, -self.cfg.maxlen, -1)
+        if self.cfg.http_port:                            # salinan untuk endpoint HTTP (tidak ikut dikonsumsi Logstash)
+            pipe.rpush(self.cfg.recent_key, line)
+            pipe.ltrim(self.cfg.recent_key, -self.cfg.recent_len, -1)
         if cursor is not None:
             pipe.set(CURSOR_KEY, cursor)
         await pipe.execute()
@@ -390,6 +511,7 @@ class Streamer:
     async def run(self) -> None:
         log.info("Mulai: IRIS=%s list=%s interval=%.1fs instance=%s",
                  self.cfg.iris_url, self.cfg.list_key, self.cfg.poll_s, self.instance)
+        server = await self.start_http()
         failures = 0
         while not self.stop.is_set():
             try:
@@ -408,6 +530,9 @@ class Streamer:
                 delay = min(60.0, self.cfg.poll_s * 2 ** min(failures, 5))
                 log.error("Polling gagal: %s: %s (coba lagi %.0fs)", type(exc).__name__, str(exc)[:200], delay)
             await self._sleep(delay)
+        if server:
+            server.close()
+            await server.wait_closed()
 
 
 # ------------------------------------------------------------------------------ main
@@ -426,6 +551,9 @@ async def amain() -> int:
         loop.add_signal_handler(sig, streamer.stop.set)
     try:
         await streamer.run()
+    except StreamError as exc:
+        log.error("%s", exc)
+        return 2
     finally:
         await http.aclose()
         await redis.aclose()

@@ -51,6 +51,14 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     networks: [internal]
+    # Endpoint HTTP read-only. Bind ke IP server saja (IRIS_STREAM_BIND di .env), bukan 0.0.0.0.
+    ports:
+      - "${IRIS_STREAM_BIND:-127.0.0.1}:${IRIS_STREAM_HTTP_PORT:-17771}:${IRIS_STREAM_HTTP_PORT:-17771}"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('IRIS_STREAM_HTTP_PORT','17771'), timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     volumes:
       - /etc/ssl/custom/iris-ca.pem:/app/iris-ca.crt:ro
 
