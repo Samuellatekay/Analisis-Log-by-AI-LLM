@@ -1,6 +1,7 @@
 services:
   app:
     build: .
+    image: analisis-log:local
     env_file: .env
     environment:
       - IRIS_CA_CERT=/app/iris-ca.crt
@@ -33,23 +34,23 @@ services:
       timeout: 3s
       retries: 10
     networks: [internal]          # sengaja tanpa 'ports' (tidak diekspos ke host)
-  
-  # --- LAYANAN STREAMING ---
+
+  # --- Polling alert IRIS -> list Redis (dibaca Logstash). Tanpa port terbuka. ---
   iris-stream:
     build: .
+    image: analisis-log:local
     command: ["python", "stream_iris.py"]
     env_file: .env
     environment:
-      IRIS_VERIFY_SSL: "true"
-      IRIS_CA_CERT: /app/iris-ca.crt
-      IRIS_STREAM_PORT: "17771"
-    ports:
-      - "17771:17771"
-    networks:
-      - internal
+      - IRIS_CA_CERT=/app/iris-ca.crt
     restart: unless-stopped
     extra_hosts:
       - "iris.local:192.168.51.40"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [internal]
     volumes:
       - /etc/ssl/custom/iris-ca.pem:/app/iris-ca.crt:ro
 
