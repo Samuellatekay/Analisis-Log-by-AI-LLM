@@ -199,8 +199,6 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[st
         error = _display(asset.get("error"), 160)
         if error:
             lines.append(f"- Catatan pencarian GLPI: {error}")
-        else:
-            lines.append("- (Pastikan pipeline enrichment GLPI berjalan untuk hostname/IP ini)")
         return lines
     
     assets = asset.get("items")
