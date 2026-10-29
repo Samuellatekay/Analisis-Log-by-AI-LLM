@@ -104,7 +104,6 @@ def _format_reputation(value: Any, observables: list | None = None) -> list[str]
                 continue
             opencti = obs.get("opencti")
             if isinstance(opencti, dict) and (opencti.get("score") or opencti.get("verdict") or opencti.get("indicators") or opencti.get("labels")):
-                # Bangun reputation dari data opencti
                 reputation = {
                     "opencti_score": opencti.get("score"),
                     "verdict": opencti.get("verdict"),
@@ -112,7 +111,6 @@ def _format_reputation(value: Any, observables: list | None = None) -> list[str]
                     "indicators": opencti.get("indicators", []),
                 }
                 break
-            # Fallback: jika score/verdict ada langsung di root observable
             if obs.get("opencti_score") or obs.get("verdict"):
                 reputation = {
                     "opencti_score": obs.get("opencti_score"),
@@ -138,7 +136,6 @@ def _format_reputation(value: Any, observables: list | None = None) -> list[str]
             lines.append(f"- Label: {', '.join(shown)}.")
             
     authors = []
-    # Ambil author dari indicators di reputation
     inds = reputation.get("indicators") or []
     if isinstance(inds, list):
         for ind in inds:
@@ -147,7 +144,6 @@ def _format_reputation(value: Any, observables: list | None = None) -> list[str]
                 if isinstance(author, dict): author = author.get("name")
                 if author and author not in authors: authors.append(str(author))
     
-    # Fallback: ambil author dari observables jika belum ada
     if not authors and isinstance(observables, list):
         for obs in observables:
             if not isinstance(obs, dict): continue
@@ -179,10 +175,19 @@ def _format_geolocation(value: Any) -> list[str]:
 
 
 def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[str]:
-    is_glpi_asset = (asset.get("inventory_source") == "GLPI" or asset.get("found") is True)
+    # PERBAIKAN: Deteksi aset GLPI lebih fleksibel
+    is_glpi_asset = (
+        asset.get("inventory_source") == "GLPI" or 
+        asset.get("found") is True or
+        isinstance(asset.get("id"), int) or 
+        bool(asset.get("glpi_id")) or
+        isinstance(asset.get("items"), list)
+    )
+
     if not is_glpi_asset:
         searched_ip = _display(asset.get("ip") or source_ip, 80)
         searched_host = _display(asset.get("host_name") or host_name, 80)
+        
         if searched_ip and searched_host:
             lines = [f"- Tidak ada aset GLPI yang cocok dengan IP {searched_ip} maupun hostname {searched_host}."]
         elif searched_ip:
@@ -191,9 +196,12 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[st
             lines = [f"- Tidak ada aset GLPI yang cocok dengan hostname {searched_host}."]
         else:
             lines = ["- Tidak ada aset GLPI yang cocok: event tidak memuat IP maupun hostname."]
+            
         error = _display(asset.get("error"), 160)
         if error:
             lines.append(f"- Catatan pencarian GLPI: {error}")
+        else:
+            lines.append("- (Pastikan pipeline enrichment GLPI berjalan untuk hostname/IP ini)")
         return lines
     
     assets = asset.get("items")
@@ -347,7 +355,6 @@ class IrisClient:
                 val = str(obs.get("value", ""))
                 e_type = str(obs.get("entity_type", ""))
                 
-                # Cek apakah punya data OpenCTI
                 has_opencti = False
                 if rep_ip and val == rep_ip: 
                     has_opencti = True
@@ -357,7 +364,6 @@ class IrisClient:
                     has_opencti = True
                 
                 if has_opencti:
-                    # Kategorikan IOC
                     if e_type in ("IPv4", "IPv6", "Ip") or (val and val.replace(".","").replace(":","").isdigit()):
                         if val not in enriched_iocs["IP"]: 
                             enriched_iocs["IP"].append(val)
@@ -368,7 +374,6 @@ class IrisClient:
                         if val not in enriched_iocs["Hash/File"]: 
                             enriched_iocs["Hash/File"].append(val)
 
-        # Tampilkan ringkasan IOC yang terdeteksi
         summary_parts = []
         if enriched_iocs["IP"]: 
             summary_parts.append(f"IP: {', '.join(enriched_iocs['IP'])}")
@@ -404,7 +409,6 @@ class IrisClient:
 
         tags = ["analisis_log", f"risk:{level}"]
         
-        # SAFEGUARD: Batasi ukuran payload source_content agar tidak membebani IRIS (Maks ~500KB)
         doc_json_str = orjson.dumps(doc).decode('utf-8')
         if len(doc_json_str) > 500_000:
             safe_doc = {"error": "Payload terlalu besar (>500KB), dipangkas untuk keamanan IRIS", "log_uuid": doc.get("log_uuid")}
