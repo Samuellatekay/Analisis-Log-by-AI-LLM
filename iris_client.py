@@ -94,7 +94,34 @@ def _join_list(val: Any) -> str:
 
 
 def _format_reputation(value: Any, observables: list | None = None) -> list[str]:
+    """Format reputasi dengan fallback ke observables jika doc.reputation kosong."""
     reputation = _d(value)
+    
+    # FALLBACK: Jika tidak ada reputation di level doc, ekstrak dari observables yang punya data OpenCTI
+    if not reputation and isinstance(observables, list):
+        for obs in observables:
+            if not isinstance(obs, dict):
+                continue
+            opencti = obs.get("opencti")
+            if isinstance(opencti, dict) and (opencti.get("score") or opencti.get("verdict") or opencti.get("indicators") or opencti.get("labels")):
+                # Bangun reputation dari data opencti
+                reputation = {
+                    "opencti_score": opencti.get("score"),
+                    "verdict": opencti.get("verdict"),
+                    "labels": opencti.get("labels", []),
+                    "indicators": opencti.get("indicators", []),
+                }
+                break
+            # Fallback: jika score/verdict ada langsung di root observable
+            if obs.get("opencti_score") or obs.get("verdict"):
+                reputation = {
+                    "opencti_score": obs.get("opencti_score"),
+                    "verdict": obs.get("verdict"),
+                    "labels": obs.get("labels", []),
+                    "indicators": [],
+                }
+                break
+    
     if not reputation:
         return ["- Data reputasi belum tersedia."]
     
@@ -111,11 +138,21 @@ def _format_reputation(value: Any, observables: list | None = None) -> list[str]
             lines.append(f"- Label: {', '.join(shown)}.")
             
     authors = []
-    if isinstance(observables, list):
+    # Ambil author dari indicators di reputation
+    inds = reputation.get("indicators") or []
+    if isinstance(inds, list):
+        for ind in inds:
+            if isinstance(ind, dict):
+                author = ind.get("created_by") or ind.get("author")
+                if isinstance(author, dict): author = author.get("name")
+                if author and author not in authors: authors.append(str(author))
+    
+    # Fallback: ambil author dari observables jika belum ada
+    if not authors and isinstance(observables, list):
         for obs in observables:
             if not isinstance(obs, dict): continue
-            inds = _d(obs.get("opencti")).get("indicators", [])
-            for ind in inds if isinstance(inds, list) else []:
+            inds_obs = _d(obs.get("opencti")).get("indicators", [])
+            for ind in inds_obs if isinstance(inds_obs, list) else []:
                 if isinstance(ind, dict):
                     author = ind.get("created_by") or ind.get("author")
                     if isinstance(author, dict): author = author.get("name")
@@ -338,7 +375,7 @@ class IrisClient:
         if enriched_iocs["Domain"]: 
             summary_parts.append(f"Domain: {', '.join(enriched_iocs['Domain'])}")
         if enriched_iocs["Hash/File"]: 
-            summary_parts.append(f"Hash/File: {', '.join(enriched_iocs['Hash/File'][:3])}") # Batasi 3 hash agar tidak kepanjangan
+            summary_parts.append(f"Hash/File: {', '.join(enriched_iocs['Hash/File'][:3])}")
 
         if summary_parts:
             lines.append(f"- IOC Terdeteksi OpenCTI: {' | '.join(summary_parts)}")
@@ -382,7 +419,6 @@ class IrisClient:
             "alert_source_content": safe_doc,
             "alert_severity_id": self.severity_map.get(level, 4),
             "alert_customer_id": self.customer_id,
-            # PERBAIKAN: Format waktu ISO 8601 yang valid dengan indikator timezone 'Z'
             "alert_source_event_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "alert_tags": ",".join(tags),
         }
@@ -521,7 +557,6 @@ class IrisClient:
                 {"case_description": updated_description},
             )
         else:
-            # PERBAIKAN: Fallback classification_id yang aman untuk nilai 0
             await self._post(
                 self.paths["case_update"].format(id=case_id),
                 {
@@ -592,7 +627,6 @@ class IrisClient:
     async def escalate_alert(self, alert_id: int, doc: dict) -> int | None:
         p = self.build_payload(doc)
         body = {"iocs_import_list": [], "assets_import_list": [], "import_as_event": False,
-                # PERBAIKAN: Typo "Dieskalasi" -> "Diekskalasi"
                 "note": "Diekskalasi otomatis oleh Analisis_Log (risk tinggi).",
                 "case_title": p["alert_title"][:250], "case_tags": p["alert_tags"]}
         d = await self._post(self.paths["escalate"].format(id=alert_id), body)
