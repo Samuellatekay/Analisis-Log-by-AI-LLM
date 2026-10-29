@@ -8,7 +8,9 @@ import httpx
 # CONFIGURATION
 # ============================================================
 
-HOST = os.getenv("IRIS_STREAM_BIND", os.getenv("HOST", "0.0.0.0"))
+# PERBAIKAN KRUSIAL: Di dalam container, kita HARUS bind ke 0.0.0.0.
+# IRIS_STREAM_BIND hanya digunakan di sisi HOST (docker-compose.yml), bukan di dalam container.
+HOST = "0.0.0.0"
 PORT = int(os.getenv("IRIS_STREAM_HTTP_PORT", os.getenv("IRIS_STREAM_PORT", "17771")))
 
 BASE_IRIS_URL = os.getenv("IRIS_URL", "https://iris.local").rstrip("/")
@@ -71,11 +73,11 @@ async def fetch_alert_detail(alert_id):
 
 
 # ============================================================
-# PAYLOAD BUILDER (BULLETPROOF)
+# PAYLOAD BUILDER
 # ============================================================
 
 def build_minimal_payload(detail_data):
-    # 1. Handle IRIS quirk: response might be wrapped in {"data": {...}}
+    # Handle IRIS quirk: response might be wrapped in {"data": {...}}
     if isinstance(detail_data, dict) and "data" in detail_data:
         detail_data = detail_data["data"]
 
@@ -86,17 +88,15 @@ def build_minimal_payload(detail_data):
         "alert_description": detail_data.get("alert_description", "")
     }
     
-    # 2. Aggressive search for 'original'
+    # Aggressive search for 'original'
     raw_original = None
     
-    # Cek di root 'original'
     if "original" in detail_data:
         if isinstance(detail_data["original"], str):
             raw_original = detail_data["original"]
         elif isinstance(detail_data["original"], dict) and "original" in detail_data["original"]:
             raw_original = detail_data["original"]["original"]
             
-    # Fallback: cek 'alert_source_content'
     if not raw_original and "alert_source_content" in detail_data:
         asc = detail_data["alert_source_content"]
         if isinstance(asc, str):
@@ -109,9 +109,8 @@ def build_minimal_payload(detail_data):
         log.info("✅ Alert %s: Field 'original' BERHASIL diekstrak.", detail_data.get("id"))
     else:
         log.warning("⚠️ Alert %s: Field 'original' TIDAK DITEMUKAN di respons API.", detail_data.get("id"))
-        log.debug("Keys yang tersedia di detail_data: %s", list(detail_data.keys()))
 
-    # 3. Aggressive search for '@timestamp'
+    # Aggressive search for '@timestamp'
     ts = detail_data.get("@timestamp")
     if not ts and isinstance(detail_data.get("original"), dict):
         ts = detail_data["original"].get("@timestamp")
@@ -178,7 +177,6 @@ async def handle_client(reader, writer):
 
             body = json.dumps(formatted_alerts, ensure_ascii=False, indent=2, default=str).encode("utf-8")
             
-            # PERBAIKAN SYNTAX: Buat header sebagai string dulu, baru di-encode ke bytes
             headers_str = (
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: application/json; charset=utf-8\r\n"
