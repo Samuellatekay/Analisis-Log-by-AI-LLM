@@ -5,10 +5,9 @@ import os
 import httpx
 
 # ============================================================
-# CONFIGURATION (Disesuaikan dengan docker-compose.yml)
+# CONFIGURATION
 # ============================================================
 
-# Mendukung IRIS_STREAM_BIND (dari compose) atau fallback ke HOST / 0.0.0.0
 HOST = os.getenv("IRIS_STREAM_BIND", os.getenv("HOST", "0.0.0.0"))
 PORT = int(os.getenv("IRIS_STREAM_HTTP_PORT", os.getenv("IRIS_STREAM_PORT", "17771")))
 
@@ -26,7 +25,7 @@ seen_alerts = set()
 MAX_SEEN_ALERTS = 100000
 
 logging.basicConfig(
-    level="DEBUG", # Aktifkan DEBUG penuh untuk forensik
+    level="INFO", 
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
@@ -42,7 +41,6 @@ if not IRIS_API_KEY:
 
 async def fetch_alert_list():
     headers = {"Authorization": f"Bearer {IRIS_API_KEY}", "Accept": "application/json"}
-    # Gunakan verify=IRIS_CA_CERT jika file ada, else False
     ssl_verify = IRIS_CA_CERT if os.path.exists(IRIS_CA_CERT) else False
     
     async with httpx.AsyncClient(verify=ssl_verify, timeout=REQUEST_TIMEOUT) as client:
@@ -73,10 +71,14 @@ async def fetch_alert_detail(alert_id):
 
 
 # ============================================================
-# PAYLOAD BUILDER (FORENSIK TINGKAT TINGGI)
+# PAYLOAD BUILDER (BULLETPROOF)
 # ============================================================
 
 def build_minimal_payload(detail_data):
+    # 1. Handle IRIS quirk: response might be wrapped in {"data": {...}}
+    if isinstance(detail_data, dict) and "data" in detail_data:
+        detail_data = detail_data["data"]
+
     if not detail_data or not isinstance(detail_data, dict):
         return {"alert_description": "Gagal mengambil detail"}
 
@@ -84,58 +86,41 @@ def build_minimal_payload(detail_data):
         "alert_description": detail_data.get("alert_description", "")
     }
     
-    # --- FORENSIK: Lihat struktur data sebenarnya ---
-    log.debug("=== FORENSIK ALERT ID: %s ===", detail_data.get("id"))
-    log.debug("Top-level keys: %s", list(detail_data.keys()))
-
-    # 1. Ekstrak 'original'
+    # 2. Aggressive search for 'original'
     raw_original = None
+    
+    # Cek di root 'original'
     if "original" in detail_data:
-        orig = detail_data["original"]
-        log.debug("Key 'original' ditemukan. Tipe data: %s", type(orig))
-        
-        if isinstance(orig, str):
-            raw_original = orig
-            log.debug("✅ 'original' adalah string langsung.")
-        elif isinstance(orig, dict):
-            log.debug("Keys di dalam dict 'original': %s", list(orig.keys()))
-            # Cari string yang merupakan log Wazuh
-            for k, v in orig.items():
-                if isinstance(v, str) and ("rule" in v or "full_log" in v):
-                    raw_original = v
-                    log.debug("✅ Ditemukan string Wazuh di dalam key: '%s'", k)
-                    break
+        if isinstance(detail_data["original"], str):
+            raw_original = detail_data["original"]
+        elif isinstance(detail_data["original"], dict) and "original" in detail_data["original"]:
+            raw_original = detail_data["original"]["original"]
             
-            # Fallback: jika ada key 'original' di dalam dict 'original'
-            if not raw_original and "original" in orig:
-                raw_original = orig["original"]
-                log.debug("✅ Ditemukan di orig['original']")
-
-    # Fallback: cek alert_source_content
+    # Fallback: cek 'alert_source_content'
     if not raw_original and "alert_source_content" in detail_data:
         asc = detail_data["alert_source_content"]
-        if isinstance(asc, str) and "rule" in asc:
+        if isinstance(asc, str):
             raw_original = asc
         elif isinstance(asc, dict) and "original" in asc:
             raw_original = asc["original"]
 
     if raw_original:
         payload["original"] = raw_original
+        log.info("✅ Alert %s: Field 'original' BERHASIL diekstrak.", detail_data.get("id"))
     else:
-        log.warning("⚠️ GAGAL MENEMUKAN DATA 'original' WAZUH DI MANAPUN!")
+        log.warning("⚠️ Alert %s: Field 'original' TIDAK DITEMUKAN di respons API.", detail_data.get("id"))
+        log.debug("Keys yang tersedia di detail_data: %s", list(detail_data.keys()))
 
-    # 2. Ekstrak '@timestamp'
+    # 3. Aggressive search for '@timestamp'
     ts = detail_data.get("@timestamp")
     if not ts and isinstance(detail_data.get("original"), dict):
         ts = detail_data["original"].get("@timestamp")
-    
+    if not ts and isinstance(detail_data.get("alert_source_content"), dict):
+        ts = detail_data["alert_source_content"].get("@timestamp")
+        
     if ts:
         payload["@timestamp"] = ts
-        log.debug("✅ Ditemukan '@timestamp': %s", ts)
-    else:
-        log.debug("⚠️ '@timestamp' tidak ditemukan.")
 
-    log.info("✅ Field yang berhasil dibuat: %s", list(payload.keys()))
     return payload
 
 
@@ -163,23 +148,20 @@ async def handle_client(reader, writer):
     peer = writer.get_extra_info('peername')
     try:
         try:
-            first_data = await asyncio.wait_for(reader.read1(1024), timeout=MUX_TIMEOUT) # read1 lebih aman untuk HTTP
-        except asyncio.TimeoutError:
-            first_data = b""
+            first_data = await asyncio.wait_for(reader.read1(1024), timeout=MUX_TIMEOUT)
         except Exception:
             first_data = b""
 
         first_line = first_data.split(b"\r\n", 1)[0].decode("utf-8", errors="ignore") if first_data else ""
 
-        # --- ENDPOINT HEALTHCHECK (PENTING UNTUK DOCKER COMPOSE) ---
-        if first_line.startswith("GET /health") or first_line.startswith("HEAD /health"):
-            response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
-            writer.write(response)
+        # Healthcheck endpoint
+        if first_line.startswith(("GET /health", "HEAD /health")):
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
             await writer.drain()
             writer.close()
             return
 
-        # --- HTTP REQUEST BIASA ---
+        # HTTP Request
         if first_line.startswith(("GET ", "HEAD ")):
             log.info("HTTP request dari %s", peer)
             alerts_list = await fetch_alert_list()
@@ -210,7 +192,7 @@ async def handle_client(reader, writer):
             writer.close()
             return
 
-        # --- TCP STREAMING ---
+        # TCP Stream
         log.info("TCP client terhubung: %s", peer)
         clients.add(writer)
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: keep-alive\r\n\r\n")
@@ -253,8 +235,6 @@ async def iris_monitor():
                 if detail_data:
                     payload = build_minimal_payload(detail_data)
                     await broadcast_alert(payload)
-                else:
-                    log.warning("⚠️ Gagal mengambil detail untuk alert %s", alert_id)
 
             if len(seen_alerts) > MAX_SEEN_ALERTS:
                 seen_alerts.clear()
