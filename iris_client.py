@@ -138,7 +138,19 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[st
     is_glpi_asset = (asset.get("inventory_source") == "GLPI" or asset.get("found") is True)
     if not is_glpi_asset:
         searched_ip = _display(asset.get("ip") or source_ip, 80)
-        return [f"- Tidak ada aset GLPI yang cocok dengan IP {searched_ip}."]
+        searched_host = _display(asset.get("host_name") or host_name, 80)
+        if searched_ip and searched_host:
+            lines = [f"- Tidak ada aset GLPI yang cocok dengan IP {searched_ip} maupun hostname {searched_host}."]
+        elif searched_ip:
+            lines = [f"- Tidak ada aset GLPI yang cocok dengan IP {searched_ip}."]
+        elif searched_host:
+            lines = [f"- Tidak ada aset GLPI yang cocok dengan hostname {searched_host}."]
+        else:
+            lines = ["- Tidak ada aset GLPI yang cocok: event tidak memuat IP maupun hostname."]
+        error = _display(asset.get("error"), 160)
+        if error:  # bedakan "tidak ada" dari "pencarian bermasalah"
+            lines.append(f"- Catatan pencarian GLPI: {error}")
+        return lines
     
     assets = asset.get("items")
     if not isinstance(assets, list) or not assets:
@@ -149,6 +161,10 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[st
         if not isinstance(item, dict): continue
         asset_id = _display(item.get("id"), 80)
         lines.append(f"- Aset GLPI #{asset_id or index}:")
+        if index == 1 and asset.get("matched_by") == "hostname":
+            matched_host = _display(asset.get("matched_value"), 120)
+            if matched_host:
+                lines.append(f"- Dicocokkan melalui hostname agent: {matched_host}")
         
         fields = (
             ("Nama", item.get("name")),
@@ -238,6 +254,9 @@ class IrisClient:
         ev = _d(doc.get("event"))
         src = _d(doc.get("source"))
         asset = _d(doc.get("asset"))
+        agent_info = _d(doc.get("agent"))
+        agent_host = _display(_d(doc.get("host")).get("name") or agent_info.get("name"), 80)
+        agent_ip = _display(agent_info.get("ip"), 80)
         
         level = str(risk.get("level", "medium")).lower()
         what = _md_escape(ev.get("action") or ev.get("category") or "event", 80)
@@ -265,9 +284,11 @@ class IrisClient:
             *([f"- Wazuh Level: {_display(ev.get('wazuh_level'), 30)}"] if is_wazuh else []),
             f"- IP tujuan (host yang diserang): {destination_label}",
             "# Source",
-            *_format_asset(source_asset, src.get("ip")),
+            # tanpa IP sumber -> hostname agent; tanpa hostname -> hanya IP
+            *_format_asset(source_asset, src.get("ip"), None if src.get("ip") else agent_host),
             "# Destination",
-            *_format_asset(destination_asset, destination.get("ip")),
+            *_format_asset(destination_asset, destination.get("ip"),
+                           agent_host if (not destination_ip or destination_ip == agent_ip) else None),
             "# Threat Intelligence Enrichment",
             *([f"- IP : {source_ip}"] if source_ip else []),
             *_format_reputation(doc.get("reputation"), observables),

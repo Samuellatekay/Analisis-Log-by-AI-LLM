@@ -258,7 +258,14 @@ def merge_enrichment(target: dict, event: dict) -> None:
             side = dict(side) if isinstance(side, dict) else {}
             side["ip"] = value
             if side_asset is not None:
-                side["asset"] = side_asset
+                existing = side.get("asset")
+                existing = existing if isinstance(existing, dict) else {}
+                if existing.get("found") is True and side_asset.get("found") is not True:
+                    pass  # aset sudah ketemu (mis. lewat hostname): jangan ditimpa hasil "tidak ditemukan"
+                elif side_asset.get("found") is False and existing.get("host_name"):
+                    side["asset"] = {**side_asset, "host_name": existing["host_name"]}
+                else:
+                    side["asset"] = side_asset
             target[side_name] = side
 
         if glpi_asset and "source" in matched_sides:
@@ -329,30 +336,65 @@ def merge_enrichment(target: dict, event: dict) -> None:
                         "error": asset_result.get("error"),
                     }
                 target["agent"] = agent
-            if not source.get("ip") and (
-                not destination_ip or (agent_ip and destination_ip == agent_ip)
-            ):
+            if not destination_ip or (agent_ip and destination_ip == agent_ip):
+                # Host tujuan = host agent. Hasil lewat IP (lebih spesifik) tidak ditimpa hostname;
+                # hostname hanya mengisi bila IP belum menemukan aset.
+                existing = destination.get("asset")
+                existing = existing if isinstance(existing, dict) else {}
                 if glpi_asset:
-                    details = {
-                        key: glpi_asset[key]
-                        for key in GLPI_ASSET_FIELDS
-                        if glpi_asset.get(key) not in (None, "")
-                    }
-                    destination["asset"] = {
-                        "found": True,
-                        "inventory_source": "GLPI",
-                        "matched_by": "hostname",
-                        "matched_value": value,
-                        "items": [details],
-                        **details,
-                    }
+                    if existing.get("found") is not True:
+                        details = {
+                            key: glpi_asset[key]
+                            for key in GLPI_ASSET_FIELDS
+                            if glpi_asset.get(key) not in (None, "")
+                        }
+                        destination["asset"] = {
+                            "found": True,
+                            "inventory_source": "GLPI",
+                            "matched_by": "hostname",
+                            "matched_value": value,
+                            "items": [details],
+                            **details,
+                        }
                 elif isinstance(asset_result, dict) and asset_result.get("found") is False:
-                    destination["asset"] = {
-                        "found": False,
-                        "host_name": value,
-                        "error": asset_result.get("error"),
-                    }
+                    if existing.get("found") is not True:
+                        destination["asset"] = {
+                            **existing,
+                            "found": False,
+                            "host_name": value,
+                            "error": existing.get("error") or asset_result.get("error"),
+                        }
                 target["destination"] = destination
+            if not source.get("ip"):
+                # Event tanpa IP sumber (mis. FIM/auditd lokal): hostname agent dipakai untuk Source.
+                source_side = dict(source)
+                existing = source_side.get("asset")
+                existing = existing if isinstance(existing, dict) else {}
+                if glpi_asset:
+                    if existing.get("found") is not True:
+                        details = {
+                            key: glpi_asset[key]
+                            for key in GLPI_ASSET_FIELDS
+                            if glpi_asset.get(key) not in (None, "")
+                        }
+                        source_side["asset"] = {
+                            "found": True,
+                            "inventory_source": "GLPI",
+                            "matched_by": "hostname",
+                            "matched_value": value,
+                            "items": [details],
+                            **details,
+                        }
+                elif isinstance(asset_result, dict) and asset_result.get("found") is False:
+                    if existing.get("found") is not True:
+                        source_side["asset"] = {
+                            **existing,
+                            "found": False,
+                            "host_name": value,
+                            "error": existing.get("error") or asset_result.get("error"),
+                        }
+                if source_side.get("asset"):
+                    target["source"] = source_side
 
     elif entity_type == "domain-name" and value:
         domain = target.get("domain")
