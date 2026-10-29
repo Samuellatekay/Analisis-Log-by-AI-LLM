@@ -1,5 +1,4 @@
 """
-
 iris_client.py - Integrasi DFIR-IRIS (REST API: POST {IRIS_URL}/alerts/add, auth Bearer API key).
 
 Alert dibuat dari log berisiko tinggi dan konteks enrichment. Severity IRIS ditentukan
@@ -20,21 +19,25 @@ log = logging.getLogger("iris")
 RETRY_STATUS = {429, 500, 502, 503, 504}
 
 PATHS = {
-    "legacy": {"alert": "/alerts/add", "alert_update": "/alerts/update/{id}",
-               "escalate": "/alerts/escalate/{id}", "merge": "/alerts/merge/{id}",
-               "case": "/manage/cases/add", "case_read": "/manage/cases/{id}",
-               "case_update": "/manage/cases/update/{id}", "case_note": "/case/notes/add",
-               "probe": "/manage/cases/list",
-               "severity_list": ["/manage/severities/list"], "status_list": ["/manage/alert-status/list"]},
-    "v2": {"alert": "/api/v2/alerts", "alert_update": "/api/v2/alerts/{id}",
-           "escalate": "/api/v2/alerts/escalate/{id}",
-           "merge": "/api/v2/alerts/merge/{id}", "case": "/api/v2/cases",
-           "case_read": "/api/v2/cases/{id}", "case_update": "/api/v2/cases/{id}",
-           "case_note": "/api/v2/cases/{id}/notes",
-           "case_note_directories": "/api/v2/cases/{id}/notes-directories",
-           "probe": "/api/v2/cases",
-           "severity_list": ["/api/v2/manage/severities"],
-           "status_list": ["/api/v2/manage/alert-statuses", "/api/v2/manage/alert-status"]},
+    "legacy": {
+        "alert": "/alerts/add", "alert_update": "/alerts/update/{id}",
+        "escalate": "/alerts/escalate/{id}", "merge": "/alerts/merge/{id}",
+        "case": "/manage/cases/add", "case_read": "/manage/cases/{id}",
+        "case_update": "/manage/cases/update/{id}", "case_note": "/case/notes/add",
+        "probe": "/manage/cases/list",
+        "severity_list": ["/manage/severities/list"], "status_list": ["/manage/alert-status/list"]
+    },
+    "v2": {
+        "alert": "/api/v2/alerts", "alert_update": "/api/v2/alerts/{id}",
+        "escalate": "/api/v2/alerts/escalate/{id}",
+        "merge": "/api/v2/alerts/merge/{id}", "case": "/api/v2/cases",
+        "case_read": "/api/v2/cases/{id}", "case_update": "/api/v2/cases/{id}",
+        "case_note": "/api/v2/cases/{id}/notes",
+        "case_note_directories": "/api/v2/cases/{id}/notes-directories",
+        "probe": "/api/v2/cases",
+        "severity_list": ["/api/v2/manage/severities"],
+        "status_list": ["/api/v2/manage/alert-statuses", "/api/v2/manage/alert-status"]
+    },
 }
 
 
@@ -148,7 +151,7 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[st
         else:
             lines = ["- Tidak ada aset GLPI yang cocok: event tidak memuat IP maupun hostname."]
         error = _display(asset.get("error"), 160)
-        if error:  # bedakan "tidak ada" dari "pencarian bermasalah"
+        if error:
             lines.append(f"- Catatan pencarian GLPI: {error}")
         return lines
     
@@ -284,18 +287,33 @@ class IrisClient:
             *([f"- Wazuh Level: {_display(ev.get('wazuh_level'), 30)}"] if is_wazuh else []),
             f"- IP tujuan (host yang diserang): {destination_label}",
             "# Source",
-            # tanpa IP sumber -> hostname agent; tanpa hostname -> hanya IP
             *_format_asset(source_asset, src.get("ip"), None if src.get("ip") else agent_host),
             "# Destination",
             *_format_asset(destination_asset, destination.get("ip"),
                            agent_host if (not destination_ip or destination_ip == agent_ip) else None),
             "# Threat Intelligence Enrichment",
-            *([f"- IP : {source_ip}"] if source_ip else []),
-            *_format_reputation(doc.get("reputation"), observables),
-            "# Geolokasi",
-            *_format_geolocation(doc.get("geolocation")),
-            "# IOC terkait"
         ]
+        
+        # LOGIKA DINAMIS: Hanya tampilkan IP jika benar-benar ada di dalam observables (di-enrich)
+        enriched_ips = []
+        if isinstance(observables, list):
+            for obs in observables:
+                if isinstance(obs, dict):
+                    val = str(obs.get("value", ""))
+                    # Cek jika entity_type adalah IP atau format stringnya mirip alamat IP
+                    if obs.get("entity_type") in ("IPv4", "IPv6", "Ip") or (val and val.replace(".", "").replace(":", "").isdigit()):
+                        if val not in enriched_ips:
+                            enriched_ips.append(val)
+
+        if enriched_ips:
+            lines.append(f"- IOC IP yang dianalisis: {', '.join(enriched_ips)}")
+        elif source_ip:
+            lines.append(f"- IP Sumber: {source_ip} (Tidak ditemukan dalam data enrichment Threat Intel)")
+
+        lines.extend(_format_reputation(doc.get("reputation"), observables))
+        lines.append("# Geolokasi")
+        lines.extend(_format_geolocation(doc.get("geolocation")))
+        lines.append("# IOC terkait")
         
         shown_ioc = False
         if isinstance(observables, list) and observables:
@@ -313,15 +331,24 @@ class IrisClient:
         lines.append(f"log_uuid: {doc.get('log_uuid')}")
 
         tags = ["analisis_log", f"risk:{level}"]
+        
+        # SAFEGUARD: Batasi ukuran payload source_content agar tidak membebani IRIS (Maks ~500KB)
+        doc_json_str = orjson.dumps(doc).decode('utf-8')
+        if len(doc_json_str) > 500_000:
+            safe_doc = {"error": "Payload terlalu besar (>500KB), dipangkas untuk keamanan IRIS", "log_uuid": doc.get("log_uuid")}
+        else:
+            safe_doc = doc
+
         payload: dict[str, Any] = {
             "alert_title": f"[{level.upper()}] {what} - {who}"[:250],
             "alert_description": "\n".join(lines)[:8000],
             "alert_source": "Analisis_Log",
             "alert_source_ref": str(doc.get("log_uuid")),
-            "alert_source_content": doc,
+            "alert_source_content": safe_doc,
             "alert_severity_id": self.severity_map.get(level, 4),
             "alert_customer_id": self.customer_id,
-            "alert_source_event_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+            # PERBAIKAN: Format waktu ISO 8601 yang valid dengan indikator timezone 'Z'
+            "alert_source_event_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "alert_tags": ",".join(tags),
         }
         if self.source_link_tpl:
@@ -431,6 +458,7 @@ class IrisClient:
                 {"case_description": updated_description},
             )
         else:
+            # PERBAIKAN: Fallback classification_id yang aman untuk nilai 0
             await self._post(
                 self.paths["case_update"].format(id=case_id),
                 {
@@ -439,7 +467,8 @@ class IrisClient:
                     "case_description": updated_description,
                     "classification_id": (
                         current.get("classification_id")
-                        or current.get("case_classification_id")
+                        if current.get("classification_id") is not None
+                        else current.get("case_classification_id")
                     ),
                     "custom_attributes": current.get("custom_attributes") or {},
                     "owner_id": current.get("owner_id") or current.get("case_owner_id"),
@@ -470,7 +499,8 @@ class IrisClient:
                 created = await self._post(directories_path, {
                     "name": "Analisis_Log Updates",
                 })
-                directory = created.get("data", created)
+                # PERBAIKAN: _post sudah melakukan _unwrap, jadi 'created' sudah berupa dict data inti
+                directory = created
                 if not isinstance(directory, dict) or not isinstance(directory.get("id"), int):
                     raise IrisError(
                         f"IRIS gagal membuat direktori catatan untuk case {case_id}"
@@ -478,6 +508,7 @@ class IrisClient:
             directory_id = directory["id"]
         else:
             directory_id = None
+            
         body: dict[str, Any] = {
             "note_title": f"Enrichment update - {doc.get('log_uuid')}"[:154],
             "note_content": payload["alert_description"],
@@ -490,7 +521,8 @@ class IrisClient:
     async def escalate_alert(self, alert_id: int, doc: dict) -> int | None:
         p = self.build_payload(doc)
         body = {"iocs_import_list": [], "assets_import_list": [], "import_as_event": False,
-                "note": "Dieskalasi otomatis oleh Analisis_Log (risk tinggi).",
+                # PERBAIKAN: Typo "Dieskalasi" -> "Diekskalasi"
+                "note": "Diekskalasi otomatis oleh Analisis_Log (risk tinggi).",
                 "case_title": p["alert_title"][:250], "case_tags": p["alert_tags"]}
         d = await self._post(self.paths["escalate"].format(id=alert_id), body)
         return d.get("case_id") or d.get("id")
