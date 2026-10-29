@@ -21,17 +21,21 @@ RETRY_STATUS = {429, 500, 502, 503, 504}
 PATHS = {
     "legacy": {
         "alert": "/alerts/add", "alert_update": "/alerts/update/{id}",
+        "alert_delete": "/alerts/delete/{id}",
         "escalate": "/alerts/escalate/{id}", "merge": "/alerts/merge/{id}",
         "case": "/manage/cases/add", "case_read": "/manage/cases/{id}",
-        "case_update": "/manage/cases/update/{id}", "case_note": "/case/notes/add",
+        "case_update": "/manage/cases/update/{id}", "case_delete": "/manage/cases/delete/{id}",
+        "case_note": "/case/notes/add",
         "probe": "/manage/cases/list",
         "severity_list": ["/manage/severities/list"], "status_list": ["/manage/alert-status/list"]
     },
     "v2": {
         "alert": "/api/v2/alerts", "alert_update": "/api/v2/alerts/{id}",
+        "alert_delete": "/api/v2/alerts/{id}",
         "escalate": "/api/v2/alerts/escalate/{id}",
         "merge": "/api/v2/alerts/merge/{id}", "case": "/api/v2/cases",
         "case_read": "/api/v2/cases/{id}", "case_update": "/api/v2/cases/{id}",
+        "case_delete": "/api/v2/cases/{id}",
         "case_note": "/api/v2/cases/{id}/notes",
         "case_note_directories": "/api/v2/cases/{id}/notes-directories",
         "probe": "/api/v2/cases",
@@ -294,21 +298,36 @@ class IrisClient:
             "# Threat Intelligence Enrichment",
         ]
         
-        # LOGIKA DINAMIS: Hanya tampilkan IP jika benar-benar ada di dalam observables (di-enrich)
+        # LOGIKA DINAMIS: Hanya tampilkan IP jika benar-benar memiliki data OpenCTI
         enriched_ips = []
         if isinstance(observables, list):
             for obs in observables:
-                if isinstance(obs, dict):
-                    val = str(obs.get("value", ""))
-                    # Cek jika entity_type adalah IP atau format stringnya mirip alamat IP
-                    if obs.get("entity_type") in ("IPv4", "IPv6", "Ip") or (val and val.replace(".", "").replace(":", "").isdigit()):
-                        if val not in enriched_ips:
-                            enriched_ips.append(val)
+                if not isinstance(obs, dict):
+                    continue
+                
+                val = str(obs.get("value", ""))
+                # Cek apakah ini adalah IP
+                is_ip = obs.get("entity_type") in ("IPv4", "IPv6", "Ip") or (val and val.replace(".", "").replace(":", "").isdigit())
+                
+                if is_ip:
+                    # Cek apakah observabel ini memiliki data OpenCTI yang valid
+                    opencti_data = obs.get("opencti")
+                    has_opencti = False
+                    if isinstance(opencti_data, dict):
+                        # Punya indikator, score, atau verdict
+                        if opencti_data.get("indicators") or opencti_data.get("score") or opencti_data.get("verdict"):
+                            has_opencti = True
+                    # Fallback jika struktur datanya flat (langsung di root observable)
+                    elif obs.get("opencti_score") or obs.get("verdict"):
+                        has_opencti = True
+                        
+                    if has_opencti and val not in enriched_ips:
+                        enriched_ips.append(val)
 
         if enriched_ips:
-            lines.append(f"- IOC IP yang dianalisis: {', '.join(enriched_ips)}")
+            lines.append(f"- IOC IP yang dianalisis (Terdeteksi OpenCTI): {', '.join(enriched_ips)}")
         elif source_ip:
-            lines.append(f"- IP Sumber: {source_ip} (Tidak ditemukan dalam data enrichment Threat Intel)")
+            lines.append(f"- IP Sumber: {source_ip} (Tidak ditemukan dalam database OpenCTI/Threat Intel)")
 
         lines.extend(_format_reputation(doc.get("reputation"), observables))
         lines.append("# Geolokasi")
@@ -411,6 +430,25 @@ class IrisClient:
             return self._parse(r, path)
         return {}
 
+    async def _delete(self, path: str) -> dict | bool:
+        """Helper untuk HTTP DELETE."""
+        for attempt in range(3):
+            try:
+                r = await self._client.delete(path)
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(1 + attempt)
+                continue
+            if r.status_code in RETRY_STATUS and attempt < 2:
+                await asyncio.sleep(1 + attempt)
+                continue
+            
+            if r.status_code in (200, 204):
+                return True
+            return self._parse(r, path)
+        return False
+
     async def create_alert(self, doc: dict) -> int | None:
         await self._ensure_ids()
         d = await self._post(self.paths["alert"], self.build_payload(doc))
@@ -430,6 +468,15 @@ class IrisClient:
             await self._post(path, update)
         else:
             await self._put(path, update)
+
+    async def delete_alert(self, alert_id: int) -> bool:
+        """Menghapus alert berdasarkan ID."""
+        path = self.paths["alert_delete"].format(id=alert_id)
+        if self.api_version == "v2":
+            return await self._delete(path) is True
+        else:
+            res = await self._post(path, {})
+            return bool(res)
 
     async def create_case(self, doc: dict) -> int | None:
         p = self.build_payload(doc)
@@ -477,6 +524,15 @@ class IrisClient:
             )
         return True
 
+    async def delete_case(self, case_id: int) -> bool:
+        """Menghapus case berdasarkan ID."""
+        path = self.paths["case_delete"].format(id=case_id)
+        if self.api_version == "v2":
+            return await self._delete(path) is True
+        else:
+            res = await self._post(path, {})
+            return bool(res)
+
     async def add_case_note(self, case_id: int, doc: dict) -> None:
         payload = self.build_payload(doc)
         if self.api_version == "v2":
@@ -499,7 +555,6 @@ class IrisClient:
                 created = await self._post(directories_path, {
                     "name": "Analisis_Log Updates",
                 })
-                # PERBAIKAN: _post sudah melakukan _unwrap, jadi 'created' sudah berupa dict data inti
                 directory = created
                 if not isinstance(directory, dict) or not isinstance(directory.get("id"), int):
                     raise IrisError(
