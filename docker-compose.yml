@@ -5,12 +5,17 @@ services:
     env_file: .env
     environment:
       - IRIS_CA_CERT=/app/iris-ca.crt
+      # TAMBAHKAN 2 BARIS INI UNTUK RISK ENGINE:
+      - RISK_ENGINE_URL=http://soc-risk-engine:8000
+      - RISK_STRATEGY=ahp_2026
     restart: unless-stopped
     depends_on:
       postgres: { condition: service_healthy }
-#      redis: { condition: service_started }
+      redis: { condition: service_started }
     extra_hosts:
       - "iris.local:192.168.51.40"
+      # TAMBAHKAN BARIS INI (Ganti IP dengan IP server host tempat soc-risk-engine berjalan):
+      - "soc-risk-engine:192.168.51.40"
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]
@@ -39,23 +44,23 @@ services:
   iris-stream:
     build: .
     image: analisis-log:local
-    command: ["python", "stream_iris.py"]
+    command: [ "python ",  "stream_iris.py "]
     env_file: .env
     environment:
       - IRIS_CA_CERT=/app/iris-ca.crt
     restart: unless-stopped
     extra_hosts:
-      - "iris.local:192.168.51.40"
+      -  "iris.local:192.168.51.40 "
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
+    security_opt: [ "no-new-privileges:true "]
     networks: [internal]
     # Endpoint HTTP read-only. Bind ke IP server saja (IRIS_STREAM_BIND di .env), bukan 0.0.0.0.
     ports:
-      - "${IRIS_STREAM_BIND:-127.0.0.1}:${IRIS_STREAM_HTTP_PORT:-17771}:${IRIS_STREAM_HTTP_PORT:-17771}"
+      -  "${IRIS_STREAM_BIND:-127.0.0.1}:${IRIS_STREAM_HTTP_PORT:-17771}:${IRIS_STREAM_HTTP_PORT:-17771} "
     healthcheck:
-      test: ["CMD", "python", "-c", "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('IRIS_STREAM_HTTP_PORT','17771'), timeout=3)"]
+      test: [ "CMD ",  "python ",  "-c ",  "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ.get('IRIS_STREAM_HTTP_PORT','17771'), timeout=3) "]
       interval: 30s
       timeout: 5s
       retries: 3

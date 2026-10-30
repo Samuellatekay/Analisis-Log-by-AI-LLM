@@ -1,17 +1,14 @@
 """
 main.py - Orchestrator Analisis_Log
-
-Redis Stream/list -> hitung risk -> PostgreSQL (temp) -> Logstash -> DFIR-IRIS
-
+Redis Stream/list -> hitung risk (via soc-risk-engine) -> PostgreSQL (temp) -> Logstash -> DFIR-IRIS
 Ketahanan terhadap burst:
-- Redis Streams + consumer group (at-least-once, bisa scale horizontal, XAUTOCLAIM untuk pesan nyangkut)
-- Pemrosesan per-batch (1 pipeline Redis, 1 executemany DB, 1 POST Logstash)
-- Connection pool (asyncpg, httpx, redis)
-- UUID deterministik (uuid5 dari ID pesan stream) => redelivery idempoten
-- Dead-letter stream untuk pesan rusak / gagal kirim ke Logstash
+Redis Streams + consumer group (at-least-once, bisa scale horizontal, XAUTOCLAIM untuk pesan nyangkut)
+Pemrosesan per-batch (1 pipeline Redis, 1 executemany DB, 1 POST Logstash)
+Connection pool (asyncpg, httpx, redis)
+UUID deterministik (uuid5 dari ID pesan stream) => redelivery idempoten
+Dead-letter stream untuk pesan rusak / gagal kirim ke Logstash
 """
 from __future__ import annotations
-
 import asyncio
 import hashlib
 import ipaddress
@@ -24,16 +21,14 @@ import uuid
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 from datetime import datetime, timezone
-
 import asyncpg
 import httpx
 import orjson
 import redis.asyncio as aioredis
 from redis.exceptions import ResponseError
-
 from iris_client import IrisClient
 from normalizer import normalize
-from risk_calculator import assess_event
+# HAPUS: from risk_calculator import assess_event
 
 try:
     import uvloop
@@ -45,7 +40,6 @@ UUID_NS = uuid.UUID("6f1c2f0e-8c1e-4e0a-9d52-3b1f7a5e9c11")
 LATENCY_BUDGET_S = 1.0
 ENRICHMENT_LOOKUP_DEDUP_TTL_S = 1
 
-
 def _error_label(exc: Exception) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         return f"HTTP{exc.response.status_code}"
@@ -54,11 +48,9 @@ def _error_label(exc: Exception) -> str:
         return str(public_message)[:200]
     return type(exc).__name__
 
-
 # ----------------------------------------------------------------- Konfigurasi
 def _e(name: str, default: str) -> str:
     return os.environ.get(name, default)
-
 
 @dataclass(frozen=True)
 class Settings:
@@ -92,6 +84,9 @@ class Settings:
     iris_case_window_s: int
     risk_normalize: bool
     shutdown_grace_s: float
+    # TAMBAHKAN 2 BARIS INI UNTUK RISK ENGINE:
+    risk_engine_url: str
+    risk_strategy: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -126,8 +121,10 @@ class Settings:
             iris_case_window_s=int(_e("IRIS_CASE_WINDOW_S", "3600")),
             risk_normalize=_e("RISK_NORMALIZE", "false").lower() == "true",
             shutdown_grace_s=float(_e("SHUTDOWN_GRACE_S", "20")),
+            # INISIALISASI VARIABEL BARU DARI .env:
+            risk_engine_url=_e("RISK_ENGINE_URL", "http://soc-risk-engine:8000"),
+            risk_strategy=_e("RISK_STRATEGY", "ahp_2026"),
         )
-
 
 # ------------------------------------------------------------------ Data model
 @dataclass(slots=True)
@@ -139,14 +136,12 @@ class Record:
     risk_score: float
     doc: dict
 
-
 @dataclass(slots=True)
 class Item:
     msg_id: str          # ID stream, atau hash konten (mode list) -> UUID deterministik
     source: str          # nama list/stream asal
     raw: str | None      # payload JSON mentah
     ts_ms: int | None    # waktu masuk Redis (hanya stream) untuk latensi e2e
-
 
 SCHEMA_SQL = """
 CREATE UNLOGGED TABLE IF NOT EXISTS log_events (
@@ -168,11 +163,9 @@ GLPI_ASSET_FIELDS = (
     "created_at", "updated_at", "purchase_date",
 )
 
-
 def merge_enrichment(target: dict, event: dict) -> None:
     entity_type = str(event.get("entity_type") or "").lower()
     value = event.get("value")
-
     if entity_type in {"ipv4-addr", "ipv6-addr"}:
         reputation = event.get("reputation")
         if isinstance(reputation, dict):
@@ -182,11 +175,9 @@ def merge_enrichment(target: dict, event: dict) -> None:
             if reputation.get("opencti_score") is not None:
                 current["ioc_match"] = True
             target["reputation"] = current
-
         geolocation = event.get("geolocation")
         if isinstance(geolocation, dict):
             target["geolocation"] = geolocation
-
         asset_result = event.get("asset")
         asset_candidates: list[dict] = []
         if isinstance(asset_result, dict):
@@ -199,7 +190,6 @@ def merge_enrichment(target: dict, event: dict) -> None:
                 asset_candidates.append(asset_result)
         elif isinstance(asset_result, list):
             asset_candidates.extend(item for item in asset_result if isinstance(item, dict))
-
         glpi_assets = [
             item for item in asset_candidates
             if any(item.get(k) not in (None, "") for k in (
@@ -217,11 +207,9 @@ def merge_enrichment(target: dict, event: dict) -> None:
                     side_ips[side_name] = str(ipaddress.ip_address(side_ip))
                 except ValueError:
                     pass
-
         matched_sides = [side for side, side_ip in side_ips.items() if side_ip == value]
         if not matched_sides and not side_ips and isinstance(value, str):
             matched_sides = ["source"]
-
         if glpi_asset:
             glpi_details = {
                 key: glpi_asset[key]
@@ -252,7 +240,6 @@ def merge_enrichment(target: dict, event: dict) -> None:
             }
         else:
             side_asset = None
-
         for side_name in matched_sides:
             side = target.get(side_name)
             side = dict(side) if isinstance(side, dict) else {}
@@ -261,13 +248,12 @@ def merge_enrichment(target: dict, event: dict) -> None:
                 existing = side.get("asset")
                 existing = existing if isinstance(existing, dict) else {}
                 if existing.get("found") is True and side_asset.get("found") is not True:
-                    pass  # aset sudah ketemu (mis. lewat hostname): jangan ditimpa hasil "tidak ditemukan"
+                    pass
                 elif side_asset.get("found") is False and existing.get("host_name"):
                     side["asset"] = {**side_asset, "host_name": existing["host_name"]}
                 else:
                     side["asset"] = side_asset
             target[side_name] = side
-
         if glpi_asset and "source" in matched_sides:
             asset = target.get("asset")
             asset = dict(asset) if isinstance(asset, dict) else {}
@@ -278,7 +264,6 @@ def merge_enrichment(target: dict, event: dict) -> None:
             asset.update(glpi_details)
             asset["inventory_source"] = "GLPI"
             target["asset"] = asset
-
     elif entity_type == "host-name" and value:
         asset_result = event.get("asset")
         candidates = (
@@ -337,8 +322,6 @@ def merge_enrichment(target: dict, event: dict) -> None:
                     }
                 target["agent"] = agent
             if not destination_ip or (agent_ip and destination_ip == agent_ip):
-                # Host tujuan = host agent. Hasil lewat IP (lebih spesifik) tidak ditimpa hostname;
-                # hostname hanya mengisi bila IP belum menemukan aset.
                 existing = destination.get("asset")
                 existing = existing if isinstance(existing, dict) else {}
                 if glpi_asset:
@@ -366,7 +349,6 @@ def merge_enrichment(target: dict, event: dict) -> None:
                         }
                 target["destination"] = destination
             if not source.get("ip"):
-                # Event tanpa IP sumber (mis. FIM/auditd lokal): hostname agent dipakai untuk Source.
                 source_side = dict(source)
                 existing = source_side.get("asset")
                 existing = existing if isinstance(existing, dict) else {}
@@ -395,7 +377,6 @@ def merge_enrichment(target: dict, event: dict) -> None:
                         }
                 if source_side.get("asset"):
                     target["source"] = source_side
-
     elif entity_type == "domain-name" and value:
         domain = target.get("domain")
         domain = dict(domain) if isinstance(domain, dict) else {}
@@ -404,7 +385,6 @@ def merge_enrichment(target: dict, event: dict) -> None:
         if isinstance(age, dict):
             domain.update(age)
         target["domain"] = domain
-
     section = target.get("enrichment")
     if not isinstance(section, dict):
         section = {}
@@ -510,7 +490,6 @@ def merge_enrichment(target: dict, event: dict) -> None:
             return
     observables.append(entry)
 
-
 def normalize_ioc_value(entity_type: str, value: str) -> str:
     normalized = value.strip()
     kind = entity_type.lower()
@@ -528,7 +507,6 @@ def normalize_ioc_value(entity_type: str, value: str) -> str:
         return normalized.lower()
     return normalized
 
-
 # -------------------------------------------------------------------- Database
 class Database:
     def __init__(self, s: Settings):
@@ -536,7 +514,7 @@ class Database:
         self.pool: asyncpg.Pool | None = None
 
     async def start(self) -> None:
-        for attempt in range(10):  # tunggu DB siap
+        for attempt in range(10):
             try:
                 self.pool = await asyncpg.create_pool(
                     self.s.pg_dsn, min_size=self.s.pg_pool_min,
@@ -551,12 +529,10 @@ class Database:
             await conn.execute(SCHEMA_SQL)
 
     async def insert_many(self, records: list[Record]) -> list[Record]:
-        """Insert batch. Baris yang ditolak PostgreSQL (DataError) dikembalikan -> DLQ,
-        agar satu payload aneh tidak membuat seluruh batch gagal selamanya."""
         sql = ("INSERT INTO log_events (log_uuid, received_at, risk_score, payload) "
                "VALUES ($1,$2,$3,$4::jsonb) ON CONFLICT (log_uuid) DO NOTHING")
         rows = [(r.log_uuid, r.received_at, r.risk_score,
-                 orjson.dumps(r.doc).decode().replace("\\u0000", "")) for r in records]
+                 orjson.dumps(r.doc).decode().replace("\u0000", "")) for r in records]
         async with self.pool.acquire() as conn:
             try:
                 await conn.executemany(sql, rows)
@@ -572,12 +548,10 @@ class Database:
             return failed
 
     async def attach_enrichment(self, event: dict, retention_minutes: int) -> list[Record]:
-        """Attach one IOC enrichment event to matching recent Wazuh alerts."""
         entity_type = str(event.get("entity_type") or "").lower()
         value = normalize_ioc_value(entity_type, str(event.get("value") or ""))
         if not value:
             return []
-
         ip_value = value if entity_type in {"ipv4-addr", "ipv6-addr"} else None
         host_name = value if entity_type == "host-name" else None
         domain_value = value if entity_type == "domain-name" else None
@@ -615,7 +589,6 @@ class Database:
             hash_indexes = {"md5": 0, "sha1": 1, "sha256": 2, "sha512": 2}
             if algorithm in hash_indexes:
                 hash_args[hash_indexes[algorithm]] = hash_value
-
         records: list[Record] = []
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -629,9 +602,8 @@ class Database:
                         payload = orjson.loads(payload)
                     if not isinstance(payload, dict):
                         continue
-
                     merge_enrichment(payload, event)
-                    encoded = orjson.dumps(payload).decode().replace("\\u0000", "")
+                    encoded = orjson.dumps(payload).decode().replace("\u0000", "")
                     await conn.execute(
                         "UPDATE log_events SET payload=$2::jsonb WHERE log_uuid=$1",
                         row["log_uuid"], encoded,
@@ -663,11 +635,6 @@ class Database:
         return (row["iris_alert_id"], row["iris_case_id"]) if row else (None, None)
 
     async def bump_risk(self, log_uuid: uuid.UUID, risk: dict, risk_score: float) -> dict | None:
-        """Perbarui blok risk (skor, pengulangan) pada record asli yang sudah punya alert IRIS.
-
-        Mengembalikan payload terbaru (beserta enrichment yang sudah digabung), atau None bila
-        record sudah dihapus retensi atau skor barunya lebih rendah dari yang tersimpan.
-        """
         async with self.pool.acquire() as conn:
             payload = await conn.fetchval(
                 "UPDATE log_events SET payload = jsonb_set(payload, '{risk}', $2::jsonb), "
@@ -679,7 +646,6 @@ class Database:
         return payload if isinstance(payload, dict) else None
 
     async def purge_old(self, minutes: int) -> int:
-        """Retensi: hapus log yang umurnya > N menit (default 60)."""
         async with self.pool.acquire() as conn:
             res = await conn.execute(
                 "DELETE FROM log_events WHERE received_at < now() - make_interval(mins => $1)", minutes)
@@ -689,11 +655,8 @@ class Database:
         if self.pool:
             await self.pool.close()
 
-
 # -------------------------------------------------------------------- Logstash
 class LogstashClient:
-    """Logstash http input (codec json): array JSON dipecah menjadi banyak event."""
-
     def __init__(self, s: Settings):
         auth = (s.logstash_user, s.logstash_password) if s.logstash_user else None
         self._client = httpx.AsyncClient(
@@ -720,7 +683,6 @@ class LogstashClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-
 # ------------------------------------------------------------------------- App
 class App:
     def __init__(self, s: Settings):
@@ -733,9 +695,15 @@ class App:
                                        socket_connect_timeout=5)
         if s.iris_mode not in ("alert", "alert_case", "case"):
             raise ValueError("IRIS_MODE harus: alert | alert_case | case")
-        self.iris = IrisClient.from_env(os.environ)  # None jika IRIS_ENABLED!=true
+        self.iris = IrisClient.from_env(os.environ)
         self.iris_queue: asyncio.Queue = asyncio.Queue(maxsize=s.iris_queue_max)
         self._host = socket.gethostname()
+        
+        # TAMBAHKAN INI: Client HTTP untuk Risk Engine Microservice
+        self.risk_client = httpx.AsyncClient(
+            base_url=s.risk_engine_url, 
+            timeout=httpx.Timeout(2.0, connect=1.0)
+        )
 
     # ---- lifecycle
     async def run(self) -> None:
@@ -751,7 +719,6 @@ class App:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self.stop.set)
-
         iris_tasks = [asyncio.create_task(self._iris_worker()) for _ in range(s.iris_workers if self.iris else 0)]
         loops = [asyncio.create_task(self._consumer_loop(f"{self._host}-{os.getpid()}-{i}", src))
                  for src in self._sources() for i in range(s.consumer_workers)]
@@ -759,7 +726,6 @@ class App:
         log.info("Started: mode=%s sources=%s, %d worker/sumber, %d worker IRIS",
                  s.redis_mode, self._sources(), s.consumer_workers,
                  s.iris_workers if self.iris else 0)
-
         await self.stop.wait()
         log.info("Shutdown: menghentikan consumer...")
         await asyncio.gather(*loops, return_exceptions=True)
@@ -770,9 +736,11 @@ class App:
         for t in iris_tasks:
             t.cancel()
         await asyncio.gather(*iris_tasks, return_exceptions=True)
+        # TAMBAHKAN self.risk_client.aclose() DI SINI:
         await asyncio.gather(self.logstash.aclose(), self.db.close(),
                              *([self.iris.aclose()] if self.iris else []),
-                             self.redis.aclose(), return_exceptions=True)
+                             self.redis.aclose(),
+                             self.risk_client.aclose(), return_exceptions=True)
 
     async def _wait_redis(self) -> None:
         for attempt in range(1, 11):
@@ -782,10 +750,9 @@ class App:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.warning("Redis belum bisa dihubungi (%s) percobaan %d/10. Cek REDIS_URL (IP/port/password), "
-                            "firewall, dan 'bind' di redis.conf", type(exc).__name__, attempt)
+                log.warning("Redis belum bisa dihubungi (%s) percobaan %d/10.", type(exc).__name__, attempt)
                 await asyncio.sleep(3)
-        raise RuntimeError("Tidak bisa terhubung ke Redis; periksa REDIS_URL dan firewall")
+        raise RuntimeError("Tidak bisa terhubung ke Redis")
 
     async def _ensure_group(self) -> None:
         try:
@@ -800,7 +767,6 @@ class App:
         except asyncio.TimeoutError:
             pass
 
-    # ---- ingestion
     def _sources(self) -> list[str]:
         if self.s.redis_mode != "list":
             return [self.s.stream_key]
@@ -812,13 +778,13 @@ class App:
         while not self.stop.is_set():
             try:
                 if s.redis_mode == "list":
-                    await self.redis.set(lease, "1", ex=60)  # tanda "worker ini masih hidup"
+                    await self.redis.set(lease, "1", ex=60)
                     items = await self._fetch_list(src, proc)
                     if items:
                         try:
                             await self._handle_batch(items, lambda: self.redis.delete(proc))
                         except Exception:
-                            n = await self._requeue(proc, src)  # kembalikan ke antrean, jangan hilang
+                            n = await self._requeue(proc, src)
                             log.warning("Batch gagal; %d item dikembalikan ke %s", n, src)
                             raise
                 else:
@@ -836,8 +802,6 @@ class App:
                 backoff = min(backoff * 2, 5.0)
 
     async def _fetch_list(self, src: str, proc: str) -> list[Item]:
-        """Pop andal: pindahkan atomik list -> processing list (BLMOVE/LMOVE), bukan BLPOP,
-        sehingga data tidak hilang jika proses mati di tengah jalan."""
         first = await self.redis.blmove(src, proc, max(1, self.s.block_ms // 1000), "LEFT", "RIGHT")
         if first is None:
             return []
@@ -851,7 +815,7 @@ class App:
 
     async def _requeue(self, proc: str, src: str) -> int:
         n = 0
-        while await self.redis.lmove(proc, src, "RIGHT", "LEFT") is not None:  # urutan asli terjaga
+        while await self.redis.lmove(proc, src, "RIGHT", "LEFT") is not None:
             n += 1
         return n
 
@@ -871,8 +835,6 @@ class App:
         return lambda: self.redis.xack(self.s.stream_key, self.s.group, *ids)
 
     async def _reclaim_loop(self) -> None:
-        """Mode stream: XAUTOCLAIM pesan pending. Mode list: kembalikan processing list
-        milik worker yang sudah mati (lease habis)."""
         s = self.s
         while not self.stop.is_set():
             await self._sleep(s.reclaim_idle_ms / 2000)
@@ -891,7 +853,7 @@ class App:
             async for key in self.redis.scan_iter(match=f"{src}:processing:*", count=100):
                 name = key.rsplit(":", 1)[1]
                 if await self.redis.exists(f"{src}:lease:{name}"):
-                    continue  # worker masih hidup
+                    continue
                 n = await self._requeue(key, src)
                 if n:
                     log.warning("Reclaim: %d item dari worker mati (%s) dikembalikan ke %s", n, name, src)
@@ -915,10 +877,9 @@ class App:
         if items and all(item.source == "enrichment-events" for item in items):
             await self._handle_enrichment_batch(items, ack)
             return
-
         s, t0 = self.s, time.perf_counter()
         parsed: list[tuple[Item, dict]] = []
-        dlq: list[tuple[str, str, str]] = []  # (msg_id, reason, payload)
+        dlq: list[tuple[str, str, str]] = []
         for it in items:
             try:
                 if it.raw is None:
@@ -929,16 +890,19 @@ class App:
                 parsed.append((it, normalize(it.source, data)))
             except Exception as exc:
                 dlq.append((it.msg_id, f"parse_error:{type(exc).__name__}", (it.raw or "")[:20000]))
-
         records_ok: list[Record] = []
         sent_s = 0.0
         if parsed:
             await self._apply_cached_enrichment(parsed)
             extras = await self._enrich([d for _, d in parsed])
             now = datetime.now(timezone.utc)
-            records = [self._build_record(it.msg_id, data, repeat, crit, now)
-                       for (it, data), (repeat, crit) in zip(parsed, extras)]
-            # Error koneksi DB -> exception -> batch dikembalikan & diulang (idempoten)
+            
+            # UBAH DARI LIST COMPREHENSION MENJADI ASYNCIO.GATHER
+            records = await asyncio.gather(*[
+                self._build_record(it.msg_id, data, repeat, crit, now)
+                for (it, data), (repeat, crit) in zip(parsed, extras)
+            ])
+            
             rejected = {r.msg_id for r in await self.db.insert_many(records)}
             for r in records:
                 if r.msg_id in rejected:
@@ -952,14 +916,11 @@ class App:
             if not ok:
                 for r in records:
                     dlq.append((r.msg_id, "logstash_failed", orjson.dumps(r.doc).decode()))
-                log.error("Logstash tidak tersedia; %d alert tetap diteruskan ke antrean IRIS",
-                          len(records))
+                log.error("Logstash tidak tersedia; %d alert tetap diteruskan ke antrean IRIS", len(records))
             records_ok = records
-
         if dlq:
             await self._send_dlq(dlq)
         await ack()
-
         if records_ok:
             self._enqueue_iris(records_ok)
             ts = [i.ts_ms for i in items if i.ts_ms]
@@ -983,9 +944,7 @@ class App:
         digest = hashlib.sha256(identity.encode()).hexdigest()
         return f"analysis:glpi-asset-refresh:{digest}"
 
-    async def _handle_enrichment_batch(
-        self, items: list[Item], ack: Callable[[], Awaitable]
-    ) -> None:
+    async def _handle_enrichment_batch(self, items: list[Item], ack: Callable[[], Awaitable]) -> None:
         parsed: list[tuple[Item, dict]] = []
         dlq: list[tuple[str, str, str]] = []
         for item in items:
@@ -1004,7 +963,6 @@ class App:
             except Exception as exc:
                 dlq.append((item.msg_id, f"enrichment_parse_error:{type(exc).__name__}",
                             (item.raw or "")[:20000]))
-
         matched: dict[uuid.UUID, Record] = {}
         for _, event in parsed:
             cache_key = self._enrichment_cache_key(event["entity_type"], str(event["value"]))
@@ -1029,7 +987,6 @@ class App:
                 )
             for record in await self.db.attach_enrichment(event, self.s.retention_minutes):
                 matched[record.log_uuid] = record
-
         records = list(matched.values())
         if records:
             if not await self.logstash.send([record.doc for record in records]):
@@ -1042,7 +999,6 @@ class App:
             log.info("Enrichment dicocokkan ke %d alert", len(records))
         elif parsed:
             log.info("Enrichment disimpan untuk pencocokan; alert terkait belum ditemukan")
-
         if dlq:
             await self._send_dlq(dlq)
         await ack()
@@ -1060,13 +1016,11 @@ class App:
                     iocs.add((entity_type, str(parsed_ip)))
                 except ValueError:
                     pass
-
         host = data.get("host") if isinstance(data.get("host"), dict) else {}
         agent = data.get("agent") if isinstance(data.get("agent"), dict) else {}
         host_name = host.get("name") or agent.get("name")
         if isinstance(host_name, str) and host_name.strip():
             iocs.add(("Host-Name", host_name.strip()))
-
         file_data = data.get("file") if isinstance(data.get("file"), dict) else {}
         hashes = file_data.get("hash") if isinstance(file_data.get("hash"), dict) else {}
         hash_lengths = {"md5": 32, "sha1": 40, "sha256": 64, "sha512": 128}
@@ -1114,7 +1068,6 @@ class App:
                 merge_enrichment(data, event)
 
     async def _queue_glpi_asset_lookups(self, events: list[dict]) -> None:
-        """Queue GLPI asset and OpenCTI IOC lookups for Wazuh alerts."""
         for event in events:
             if event.get("data_source") != "wazuh":
                 continue
@@ -1128,7 +1081,6 @@ class App:
                     addresses.add(ipaddress.ip_address(value))
                 except ValueError:
                     continue
-
             for address in sorted(addresses, key=lambda item: (item.version, int(item))):
                 ip = str(address)
                 entity_type = "IPv4-Addr" if address.version == 4 else "IPv6-Addr"
@@ -1147,7 +1099,6 @@ class App:
                     except Exception:
                         await self.redis.delete(lookup_key)
                         log.exception("Gagal mengantrekan pencarian aset GLPI untuk IP %s", ip)
-
             for entity_type, value in self._alert_iocs(event):
                 if entity_type == "Host-Name":
                     continue
@@ -1180,7 +1131,6 @@ class App:
                     await self.redis.delete(opencti_key)
                     log.exception("Gagal mengantrekan lookup OpenCTI type=%s value=%s",
                                   entity_type, value)
-
             host = event.get("host") if isinstance(event.get("host"), dict) else {}
             agent = event.get("agent") if isinstance(event.get("agent"), dict) else {}
             host_name = host.get("name") or agent.get("name")
@@ -1191,7 +1141,6 @@ class App:
             refresh_key = self._glpi_asset_refresh_key(entity_type, host_name)
             if await self.redis.get(refresh_key):
                 continue
-
             lookup_key = f"analysis:glpi-host-lookup:{host_name.casefold()}"
             if await self.redis.set(
                 lookup_key, "1", nx=True, ex=ENRICHMENT_LOOKUP_DEDUP_TTL_S
@@ -1210,11 +1159,6 @@ class App:
                                   host_name)
 
     async def _enrich(self, events: list[dict]) -> list[tuple[int, float | None]]:
-        """1 pipeline Redis per batch: counter pengulangan (+ fallback asset criticality).
-
-        Criticality dicari di Redis hash asset:<kunci>, field "criticality", berurutan:
-        asset.id / nama host, lalu IP tujuan, lalu IP sumber. Nilai pertama yang ada dipakai.
-        """
         s = self.s
         pipe = self.redis.pipeline(transaction=False)
         asset_keys: list[list[str]] = []
@@ -1260,12 +1204,53 @@ class App:
         what = str(ev.get("action") or ev.get("category") or "unknown")[:80]
         return f"repeat:{who}:{what}"
 
-    def _build_record(self, msg_id: str, data: dict, repeat: int, crit: float | None,
-                      now: datetime) -> Record:
-        risk = assess_event(data, repeat, crit, self.s.risk_normalize)
-        log_uuid = uuid.uuid5(UUID_NS, msg_id)  # deterministik => idempoten
+    # UBAH FUNGSI INI MENJADI ASYNC DAN GUNAKAN HTTP POST KE RISK ENGINE
+    async def _build_record(self, msg_id: str, data: dict, repeat: int, crit: float | None,
+                            now: datetime) -> Record:
+        # 1. Siapkan payload untuk soc-risk-engine
         ev = data.get("event") if isinstance(data.get("event"), dict) else {}
+        category = ev.get("category", ["network"])
+        if isinstance(category, list):
+            category = category[0] if category else "network"
+        
+        payload = {
+            "strategy": self.s.risk_strategy,
+            "asset": {
+                "criticality": crit if crit is not None else 3.0,
+                "business_value": data.get("asset", {}).get("business_value", "support"),
+                "data_sensitivity": data.get("asset", {}).get("data_sensitivity", "internal")
+            },
+            "event": {
+                "severity": float(ev.get("severity", 1)),
+                "outcome": 1 if str(ev.get("outcome", "alert")).lower() not in ("deny", "blocked", "failure", "fail", "denied", "drop", "dropped", "reject", "rejected") else 0,
+                "category": str(category).lower()
+            },
+            "threat": {
+                "base_weight": 2.0,
+                "ioc_match": bool(data.get("reputation", {}).get("ioc_match", False)),
+                "reputation_score": data.get("reputation", {}).get("score"),
+                "domain_age_days": data.get("domain", {}).get("age_days"),
+                "repeat_count": repeat
+            },
+            "environment": {"external_multiplier": 1.0, "internal_multiplier": 1.0}
+        }
+
+        # 2. Panggil Microservice (dengan fallback jika error)
+        risk_score, risk_level, risk_breakdown = 0.0, "low", {}
+        try:
+            response = await self.risk_client.post("/calculate", json=payload)
+            response.raise_for_status()
+            res_data = response.json()
+            risk_score = res_data.get("score", 0.0)
+            risk_level = res_data.get("level", "low")
+            risk_breakdown = res_data.get("breakdown", {})
+        except Exception as e:
+            log.error("Gagal menghubungi Risk Engine (%s). Menggunakan skor 0.", _error_label(e))
+
+        # 3. Bangun Record (Mapping agar iris_client.py tidak error)
+        log_uuid = uuid.uuid5(UUID_NS, msg_id)
         log_day = now.strftime("%Y.%m.%d")
+        
         doc = {
             "event_type": "raw",
             "log_uuid": str(log_uuid),
@@ -1282,12 +1267,22 @@ class App:
             "asset": data.get("asset"),
             "domain": data.get("domain"),
             "enrichment": data.get("enrichment"),
-            "risk": {**risk.as_dict(), "repeat_count": repeat},
+            "risk": {
+                "score": risk_score, 
+                "level": risk_level, 
+                "breakdown": risk_breakdown,
+                # Mapping backward compatibility untuk iris_client.py
+                "asset_criticality": risk_breakdown.get("target", crit or 3.0),
+                "event_severity": payload["event"]["severity"],
+                "event_outcome": payload["event"]["outcome"],
+                "threat_weight": risk_breakdown.get("intel", 2.0),
+                "repeat_count": repeat
+            },
         }
-        for k in ("destination", "file"):  # opsional dari normalizer (mis. Wazuh dstip / hash syscheck)
-            if data.get(k):
-                doc[k] = data[k]
-        return Record(msg_id, log_uuid, now, log_day, risk.score, doc)
+        for k in ("destination", "file"):
+            if data.get(k): doc[k] = data[k]
+            
+        return Record(msg_id, log_uuid, now, log_day, risk_score, doc)
 
     async def _send_dlq(self, items: list[tuple[str, str, str]]) -> None:
         pipe = self.redis.pipeline(transaction=False)
@@ -1304,7 +1299,7 @@ class App:
 
     def _to_iris(self, r: Record) -> None:
         if r.doc.get("data_source") in {"opencti", "glpi"}:
-            return  # threat-intel and collector feedback enrich alerts; they are not alerts
+            return
         if not self.iris or r.risk_score < self.s.iris_min_risk or not self.iris.allows(r.doc):
             return
         try:
@@ -1325,21 +1320,19 @@ class App:
         return f"iris:dedup:{cls._who(doc)}:{what}"
 
     async def _case_for(self, r: Record, alert_id: int) -> int | None:
-        """Alert risk tinggi -> case. Alert dari sumber yang sama dalam jendela waktu digabung
-        ke case yang sudah ada (bukan membuat case baru tiap alert)."""
         who = self._who(r.doc)
         case_key, lock = f"iris:case:{who}", f"iris:case-lock:{who}"
         got_lock = False
         try:
             got_lock = bool(await self.redis.set(lock, "1", nx=True, ex=30))
             if not got_lock:
-                await asyncio.sleep(1.5)  # worker lain sedang membuat case untuk sumber ini
+                await asyncio.sleep(1.5)
             existing = await self.redis.get(case_key)
             if existing:
                 try:
                     await self.iris.merge_alert(alert_id, int(existing), r.doc)
                     return int(existing)
-                except httpx.HTTPStatusError:  # mis. case sudah ditutup -> buat case baru
+                except httpx.HTTPStatusError:
                     await self.redis.delete(case_key)
             case_id = await self.iris.escalate_alert(alert_id, r.doc)
             if case_id is not None:
@@ -1351,7 +1344,7 @@ class App:
             raise
         except Exception as exc:
             log.error("Gagal eskalasi alert %s ke case: %s", alert_id, _error_label(exc))
-            return None  # alert tetap ada, analis bisa eskalasi manual
+            return None
         finally:
             if got_lock:
                 await self.redis.delete(lock)
@@ -1371,20 +1364,12 @@ class App:
         )
 
     async def _update_deduped_alert(self, key: str, r: Record) -> None:
-        """Event berulang yang kena dedup: perbarui alert dan case IRIS yang sudah ada.
-
-        Yang diperbarui: skor dan pengulangan pada alert, serta deskripsi case (bila alert sudah
-        dieskalasi) dengan laporan alert terbaru, sama seperti pembaruan dari enrichment.
-        Nilai key dedup berisi "<alert_id>:<log_uuid record asli>" ("0" bila mode case). Pembaruan dibatasi
-        IRIS_UPDATE_MIN_S detik per (sumber, aksi) agar burst tidak membanjiri API IRIS.
-        Set IRIS_UPDATE_MIN_S=0 untuk menonaktifkan.
-        """
         s = self.s
         if s.iris_update_s <= 0:
             return
         alert_part, _, uuid_part = str(await self.redis.get(key) or "").partition(":")
         if not alert_part.isdigit() or not uuid_part:
-            return  # alert/case belum selesai dibuat
+            return
         throttle = key.replace("iris:dedup:", "iris:upd:", 1)
         if not await self.redis.set(throttle, "1", nx=True, ex=s.iris_update_s):
             return
@@ -1437,7 +1422,6 @@ class App:
                     if self._has_enrichment_update(r.doc):
                         await self._update_case_from_enrichment(int(case_id), r)
                     continue
-                # cegah banjir: 1 item / (source, action) / window
                 if not await self.redis.set(key, "1", nx=True, ex=s.iris_dedup_s):
                     await self._update_deduped_alert(key, r)
                     continue
@@ -1450,12 +1434,12 @@ class App:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    await self.redis.delete(key)  # izinkan retry oleh event berikutnya
+                    await self.redis.delete(key)
                     log.error("Gagal membuat %s IRIS %s: %s", "case" if s.iris_mode == "case" else "alert",
                               r.log_uuid, _error_label(exc))
                     continue
                 if alert_id is not None or case_id is not None:
-                    try:  # simpan ID alert di key dedup (TTL tetap) agar event berulang bisa memperbaruinya
+                    try:
                         await self.redis.set(key, f"{alert_id or 0}:{r.log_uuid}", xx=True, keepttl=True)
                     except Exception:
                         log.warning("Gagal menyimpan ID alert di key dedup %s", key)
@@ -1483,14 +1467,12 @@ class App:
                 log.exception("Retensi gagal")
             await self._sleep(self.s.retention_interval_s)
 
-
 def main() -> None:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     if uvloop:
         uvloop.install()
     asyncio.run(App(Settings.from_env()).run())
-
 
 if __name__ == "__main__":
     main()
