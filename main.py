@@ -1271,11 +1271,12 @@ class App:
                 "score": risk_score, 
                 "level": risk_level, 
                 "breakdown": risk_breakdown,
-                # Mapping backward compatibility untuk iris_client.py
-                "asset_criticality": risk_breakdown.get("target", crit or 3.0),
+                # Mapping baru yang lebih deskriptif untuk analis manusia
+                "asset_criticality": crit if crit is not None else 3.0, # Tampilkan nilai asli 1-5 dari GLPI
                 "event_severity": payload["event"]["severity"],
                 "event_outcome": payload["event"]["outcome"],
-                "threat_weight": risk_breakdown.get("intel", 2.0),
+                # Gabungkan intel & persistence agar terlihat seperti "threat_weight" yang wajar
+                "threat_weight": round(max(1.0, (risk_breakdown.get("intel", 0) * 2) + (risk_breakdown.get("persist", 0) * 2) + 1), 2),
                 "repeat_count": repeat
             },
         }
