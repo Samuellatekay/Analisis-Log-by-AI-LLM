@@ -10,7 +10,7 @@ services:
     restart: unless-stopped
     depends_on:
       postgres: { condition: service_healthy }
-      redis: { condition: service_started }
+      # redis: { condition: service_started }
     extra_hosts:
       - "iris.local:192.168.51.40"
       - "soc-risk-engine:192.168.51.40"
