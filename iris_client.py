@@ -211,8 +211,6 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[st
         asset_id = _display(item.get("id"), 80)
         lines.append(f"- Aset GLPI #{asset_id or index}:")
         
-        # PERBAIKAN: Baris "Dicocokkan melalui hostname agent" dihapus agar lebih bersih
-        
         fields = (
             ("Nama", item.get("name")),
             ("IP privat", _join_list(item.get("private_ip_addresses"))),
@@ -316,8 +314,6 @@ class IrisClient:
         source_label = source_ip or "Tidak tersedia di event"
         destination_label = destination_ip or "Tidak tersedia di event"
 
-        # PERBAIKAN: Logika pemetaan aset untuk event lokal (FIM, Syscheck, Privilege Escalation)
-        # Jika tidak ada IP sumber eksternal, aset host (GLPI) adalah Target (Destination)
         is_local_event = not src.get("ip") and not destination.get("ip")
         
         if is_local_event:
@@ -399,7 +395,6 @@ class IrisClient:
                 if not isinstance(obs, dict): continue
                 e_type = _display(obs.get("entity_type"), 40)
                 e_val = _display(obs.get("value"), 180)
-                # PERBAIKAN: Jangan tampilkan Host-Name sebagai IOC
                 if e_type and e_val and e_type.lower() not in ("host-name", "hostname", "host"):
                     lines.append(f"- {e_type}: {e_val}")
                     shown_ioc = True
@@ -540,30 +535,55 @@ class IrisClient:
         d = await self._post(self.paths["case"], body)
         return d.get("case_id") or d.get("id")
 
+    # ============================================================
+    # PERBAIKAN UTAMA DI SINI
+    # ============================================================
     async def update_case_description(self, case_id: int, doc: dict) -> bool:
         current = await self._get(self.paths["case_read"].format(id=case_id))
-        current_description = current.get("case_description")
+        
+        # Ambil deskripsi saat ini (IRIS kadang menggunakan 'case_description' atau 'description')
+        current_description = current.get("case_description") or current.get("description", "")
         if not isinstance(current_description, str):
-            current_description = current.get("description")
-        if not isinstance(current_description, str):
-            raise IrisError(f"IRIS tidak mengembalikan deskripsi case {case_id}; pembaruan dibatalkan")
+            current_description = ""
 
         updated_description = self.build_payload(doc)["alert_description"]
-        if updated_description == current_description:
+        
+        # Normalisasi spasi agar perbandingan lebih akurat
+        if updated_description.strip() == current_description.strip():
+            log.info("Case %s: Deskripsi tidak berubah, skip update untuk menghemat resource.", case_id)
             return False
 
+        log.info("Case %s: Memulai pembaruan deskripsi...", case_id)
+
         if self.api_version == "v2":
-            await self._put(self.paths["case_update"].format(id=case_id), {"case_description": updated_description})
+            # PERBAIKAN: Sertakan field-field penting agar API v2 tidak menolak request PUT
+            update_payload = {
+                "case_description": updated_description,
+                "case_name": current.get("case_name") or current.get("name", "Unnamed Case"),
+                "case_customer": current.get("case_customer") or self.customer_id,
+                "case_soc_id": current.get("case_soc_id") or current.get("soc_id") or "",
+                "case_tags": current.get("case_tags") or "",
+            }
+            # Tambahkan field opsional jika ada di response 'current'
+            if "classification_id" in current:
+                update_payload["classification_id"] = current["classification_id"]
+            if "owner_id" in current:
+                update_payload["owner_id"] = current["owner_id"]
+                
+            await self._put(self.paths["case_update"].format(id=case_id), update_payload)
         else:
+            # Payload untuk legacy (sudah benar di kode asli Anda)
             await self._post(self.paths["case_update"].format(id=case_id), {
-                "case_name": current.get("case_name") or current.get("name"),
+                "case_name": current.get("case_name") or current.get("name", "Unnamed Case"),
                 "case_soc_id": current.get("case_soc_id") or current.get("soc_id") or "",
                 "case_description": updated_description,
-                "classification_id": current.get("classification_id") if current.get("classification_id") is not None else current.get("case_classification_id"),
+                "classification_id": current.get("classification_id") or current.get("case_classification_id"),
                 "custom_attributes": current.get("custom_attributes") or {},
                 "owner_id": current.get("owner_id") or current.get("case_owner_id"),
                 "case_tags": current.get("case_tags") or "",
             })
+        
+        log.info("✅ Case %s: Deskripsi berhasil diperbarui.", case_id)
         return True
 
     async def delete_case(self, case_id: int) -> bool:
