@@ -27,7 +27,9 @@ POLL_INTERVAL = float(os.getenv("IRIS_POLL_INTERVAL", "5.0"))
 REQUEST_TIMEOUT = float(os.getenv("IRIS_REQUEST_TIMEOUT", "10.0"))
 EXTERNAL_POLL_INTERVAL = float(os.getenv("EXTERNAL_POLL_INTERVAL", "10.0"))
 
-clients = set()
+# State global untuk berbagai jenis klien
+tcp_clients = set()         # Untuk koneksi TCP mentah (netcat)
+http_stream_clients = set() # Untuk koneksi HTTP Keep-Alive (/stream)
 seen_alerts = set()
 MAX_SEEN_ALERTS = 100000
 
@@ -139,101 +141,122 @@ def build_minimal_payload(detail_data):
 
 
 # ============================================================
-# STREAMING & HTTP HANDLER
+# HYBRID HANDLER (TCP + HTTP)
 # ============================================================
 
-async def broadcast_alert(payload):
-    """Kirim JSON mentah ke semua klien TCP/Stream yang terhubung"""
-    disconnected = []
+async def broadcast_all(payload):
+    """Kirim JSON ke semua klien (TCP mentah, HTTP Stream, dan Eksternal)"""
     data_bytes = (json.dumps(payload, ensure_ascii=False, default=str) + "\n").encode("utf-8")
     
-    for writer in list(clients):
+    # 1. Kirim ke Raw TCP Clients
+    disconnected_tcp = []
+    for writer in list(tcp_clients):
         try:
             writer.write(data_bytes)
             await writer.drain()
         except (ConnectionError, OSError, BrokenPipeError):
-            disconnected.append(writer)
-    for writer in disconnected:
-        clients.discard(writer)
-        try: writer.close()
-        except: pass
+            disconnected_tcp.append(writer)
+    for w in disconnected_tcp:
+        tcp_clients.discard(w); w.close()
+
+    # 2. Kirim ke HTTP Stream Clients (Keep-Alive)
+    disconnected_http = []
+    for writer in list(http_stream_clients):
+        try:
+            writer.write(data_bytes)
+            await writer.drain()
+        except (ConnectionError, OSError, BrokenPipeError):
+            disconnected_http.append(writer)
+    for w in disconnected_http:
+        http_stream_clients.discard(w); w.close()
 
 async def handle_client(reader, writer):
     peer = writer.get_extra_info('peername')
+    
+    # Coba baca data awal untuk mendeteksi jenis koneksi
     try:
+        first_data = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+    except asyncio.TimeoutError:
+        first_data = b""
+    except Exception:
+        first_data = b""
+
+    # --- SKENARIO 1: RAW TCP (Netcat / Socket mentah) ---
+    if not first_data:
+        log.info("🔌 Raw TCP client terhubung (pasif): %s", peer)
+        tcp_clients.add(writer)
         try:
-            first_data = await asyncio.wait_for(reader.read(4096), timeout=5.0)
-        except asyncio.TimeoutError:
-            first_data = b""
-        except Exception:
-            first_data = b""
+            while True:
+                data = await reader.read(4096)
+                if not data: break
+        except Exception: pass
+        finally:
+            tcp_clients.discard(writer)
+            writer.close()
+        return
 
-        # Jika tidak ada data, anggap TCP streaming pasif
-        if not first_data:
-            clients.add(writer)
-            # Kirim header NDJSON
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: keep-alive\r\n\r\n")
-            await writer.drain()
-            try:
-                while True: await asyncio.wait_for(reader.read(4096), timeout=30.0)
-            except (asyncio.TimeoutError, ConnectionError, OSError): pass
-            finally:
-                clients.discard(writer)
-                try: writer.close()
-                except: pass
-            return
+    # Deteksi apakah ini HTTP Request
+    try:
+        request_text = first_data.decode('utf-8', errors='ignore')
+        first_line = request_text.split('\r\n')[0].split('\n')[0].upper()
+        path = request_text.split('\r\n')[0].split('\n')[0].split(' ')[1] if ' ' in request_text.split('\r\n')[0] else '/'
+    except Exception:
+        first_line = ""; path = "/"
 
-        try:
-            request_text = first_data.decode("utf-8", errors="ignore")
-            first_line = request_text.split("\r\n", 1)[0].split("\n", 1)[0].lower()
-            path = first_line.split(" ")[1] if len(first_line.split(" ")) > 1 else "/"
-        except Exception:
-            first_line = ""; path = "/"
-
-        # 1. HEALTHCHECK
-        if "/health" in first_line:
+    # --- SKENARIO 2: HTTP REQUEST ---
+    if first_line.startswith(('GET ', 'POST ', 'HEAD ', 'PUT ', 'DELETE ')):
+        
+        # A. Healthcheck (Untuk Docker)
+        if "/HEALTH" in first_line:
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
             await writer.drain(); writer.close(); return
 
-        # 2. REAL-TIME STREAM (Untuk Browser / Script)
+        # B. HTTP Stream Real-time (/stream)
         if path == "/stream":
-            log.info("Stream client terhubung: %s", peer)
-            clients.add(writer)
-            # Gunakan text/plain agar browser menampilkan teks JSON mentah, bukan download file
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: keep-alive\r\n\r\n")
+            log.info("🌐 HTTP Stream client terhubung: %s", peer)
+            http_stream_clients.add(writer)
+            # Kirim header HTTP, biarkan koneksi terbuka (Keep-Alive)
+            header = b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: keep-alive\r\n\r\n"
+            writer.write(header)
             await writer.drain()
             try:
-                while True: await asyncio.wait_for(reader.read(4096), timeout=30.0)
-            except (asyncio.TimeoutError, ConnectionError, OSError): pass
+                while True:
+                    data = await reader.read(4096)
+                    if not data: break
+            except Exception: pass
             finally:
-                clients.discard(writer)
-                try: writer.close()
-                except: pass
+                http_stream_clients.discard(writer)
+                writer.close()
             return
 
-        # 3. JSON SNAPSHOT (Untuk Browser / curl)
-        if first_line.startswith("get ") or first_line.startswith("head "):
-            log.info("HTTP request (Snapshot JSON) dari %s", peer)
+        # C. HTTP Snapshot JSON (/)
+        if path == "/" or path.startswith("/?"):
+            log.info("🌐 HTTP Snapshot request dari %s", peer)
             alerts_list = await fetch_alert_list()
-            formatted_alerts = []
+            formatted = []
             for alert_summary in alerts_list:
                 alert_id = alert_summary.get("id") or alert_summary.get("alert_id")
                 if alert_id:
                     detail_data = await fetch_alert_detail(alert_id)
-                    if detail_data: formatted_alerts.append(build_minimal_payload(detail_data))
-                    else: formatted_alerts.append({"alert_description": alert_summary.get("alert_description", "")})
+                    if detail_data: formatted.append(build_minimal_payload(detail_data))
+                    else: formatted.append({"alert_description": alert_summary.get("alert_description", "")})
             
-            body = json.dumps(formatted_alerts, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+            body = json.dumps(formatted, ensure_ascii=False, indent=2, default=str).encode("utf-8")
             response = f"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("utf-8") + body
             writer.write(response); await writer.drain(); writer.close(); return
 
-    except Exception as e:
-        log.error("Error klien %s: %s", peer, e)
+    # --- SKENARIO 3: TCP DENGAN DATA AWAL (Non-HTTP) ---
+    log.info("🔌 Raw TCP client terhubung (dengan data awal): %s", peer)
+    tcp_clients.add(writer)
+    try:
+        # Proses first_data jika perlu, lalu lanjutkan loop
+        while True:
+            data = await reader.read(4096)
+            if not data: break
+    except Exception: pass
     finally:
-        clients.discard(writer)
-        try:
-            if not writer.is_closing(): writer.close(); await writer.wait_closed()
-        except Exception: pass
+        tcp_clients.discard(writer)
+        writer.close()
 
 
 # ============================================================
@@ -256,7 +279,7 @@ async def iris_monitor():
                 detail_data = await fetch_alert_detail(alert_id)
                 if detail_data:
                     payload = build_minimal_payload(detail_data)
-                    await broadcast_alert(payload) # Kirim JSON ke semua klien stream
+                    await broadcast_all(payload) # Kirim ke TCP, HTTP Stream, dll
                     await send_to_external_server(payload)
                     log.info("✅ Alert %s diproses & dikirim.", alert_id)
             if len(seen_alerts) > MAX_SEEN_ALERTS: seen_alerts.clear()
@@ -283,9 +306,10 @@ async def external_data_poller():
 async def main():
     try:
         server = await asyncio.start_server(handle_client, host=HOST, port=PORT)
-        log.info("🚀 Server aktif di %s:%s", HOST, PORT)
-        log.info("💡 Buka http://%s:%s/ untuk JSON Snapshot", HOST.replace("0.0.0.0", "127.0.0.1"), PORT)
-        log.info("💡 Buka http://%s:%s/stream untuk JSON Real-time", HOST.replace("0.0.0.0", "127.0.0.1"), PORT)
+        log.info("🚀 Hybrid TCP/HTTP Server aktif di %s:%s", HOST, PORT)
+        log.info("💡 TCP: nc 127.0.0.1 %s", PORT)
+        log.info("💡 HTTP Snapshot: curl http://127.0.0.1:%s/", PORT)
+        log.info("💡 HTTP Stream: curl -N http://127.0.0.1:%s/stream", PORT)
         
         asyncio.create_task(iris_monitor())
         asyncio.create_task(external_data_poller())
