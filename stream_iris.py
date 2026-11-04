@@ -28,7 +28,6 @@ REQUEST_TIMEOUT = float(os.getenv("IRIS_REQUEST_TIMEOUT", "10.0"))
 EXTERNAL_POLL_INTERVAL = float(os.getenv("EXTERNAL_POLL_INTERVAL", "10.0"))
 
 clients = set()
-sse_clients = set()
 seen_alerts = set()
 MAX_SEEN_ALERTS = 100000
 
@@ -41,19 +40,6 @@ log = logging.getLogger("iris-stream")
 
 if not IRIS_API_KEY:
     log.warning("[!] PERINGATAN: IRIS_API_KEY kosong.")
-
-# Tampilan Terminal Minimalis untuk Browser
-TERMINAL_HTML = """<!DOCTYPE html>
-<html><head><title>IRIS Raw Stream</title>
-<style>body{background:#000;color:#0f0;font-family:monospace;padding:10px;margin:0;font-size:12px;} pre{white-space:pre-wrap;word-wrap:break-word;}</style></head>
-<body><pre id="log">Menunggu data real-time...</pre>
-<script>
-const s=new EventSource('/stream');
-const l=document.getElementById('log');
-s.onopen=()=>l.innerText='Terhubung. Menunggu data...\n\n';
-s.onmessage=e=>{l.innerText+=e.data+'\n\n----------------------------------------\n\n'; window.scrollTo(0,document.body.scrollHeight);};
-s.onerror=()=>l.innerText+='⚠️ Koneksi terputus. Mencoba reconnect...\n\n';
-</script></body></html>"""
 
 
 # ============================================================
@@ -156,37 +142,21 @@ def build_minimal_payload(detail_data):
 # STREAMING & HTTP HANDLER
 # ============================================================
 
-async def send_to_client(writer, payload):
-    writer.write((json.dumps(payload, ensure_ascii=False, default=str) + "\n").encode("utf-8"))
-    await writer.drain()
-
 async def broadcast_alert(payload):
+    """Kirim JSON mentah ke semua klien TCP/Stream yang terhubung"""
     disconnected = []
+    data_bytes = (json.dumps(payload, ensure_ascii=False, default=str) + "\n").encode("utf-8")
+    
     for writer in list(clients):
         try:
-            await send_to_client(writer, payload)
+            writer.write(data_bytes)
+            await writer.drain()
         except (ConnectionError, OSError, BrokenPipeError):
             disconnected.append(writer)
     for writer in disconnected:
-        clients.discard(writer); writer.close()
-    
-    disconnected_sse = []
-    for writer in list(sse_clients):
-        try:
-            sse_data = f"data: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
-            writer.write(sse_data.encode("utf-8"))
-            await writer.drain()
-        except (ConnectionError, OSError, BrokenPipeError):
-            disconnected_sse.append(writer)
-    for writer in disconnected_sse:
-        sse_clients.discard(writer); writer.close()
-
-    if WEBHOOK_URL:
-        try:
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-                await client.post(WEBHOOK_URL, json=payload)
-        except Exception as e:
-            log.error("❌ Gagal webhook lokal: %s", e)
+        clients.discard(writer)
+        try: writer.close()
+        except: pass
 
 async def handle_client(reader, writer):
     peer = writer.get_extra_info('peername')
@@ -198,62 +168,50 @@ async def handle_client(reader, writer):
         except Exception:
             first_data = b""
 
+        # Jika tidak ada data, anggap TCP streaming pasif
         if not first_data:
             clients.add(writer)
+            # Kirim header NDJSON
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: keep-alive\r\n\r\n")
             await writer.drain()
             try:
                 while True: await asyncio.wait_for(reader.read(4096), timeout=30.0)
             except (asyncio.TimeoutError, ConnectionError, OSError): pass
             finally:
-                clients.discard(writer); writer.close()
+                clients.discard(writer)
+                try: writer.close()
+                except: pass
             return
 
         try:
             request_text = first_data.decode("utf-8", errors="ignore")
             first_line = request_text.split("\r\n", 1)[0].split("\n", 1)[0].lower()
             path = first_line.split(" ")[1] if len(first_line.split(" ")) > 1 else "/"
-            
-            # Deteksi apakah ini Browser atau Script (curl/python)
-            is_browser = "text/html" in request_text.lower() and "application/json" not in request_text.lower()
         except Exception:
-            first_line = ""; path = "/"; is_browser = False
+            first_line = ""; path = "/"
 
         # 1. HEALTHCHECK
         if "/health" in first_line:
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
             await writer.drain(); writer.close(); return
 
-        # 2. TERMINAL VIEW (Jika Browser membuka /stream atau /)
-        if is_browser and (path == "/stream" or path == "/"):
-            log.info("🖥️ Browser terdeteksi, mengirim Terminal View ke %s", peer)
-            body = TERMINAL_HTML.encode("utf-8")
-            response = f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("utf-8") + body
-            writer.write(response); await writer.drain(); writer.close(); return
-
-        # 3. RAW SSE STREAM (Jika Script/EventSource membuka /stream)
+        # 2. REAL-TIME STREAM (Untuk Browser / Script)
         if path == "/stream":
-            log.info("SSE client terhubung (Raw Stream): %s", peer)
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n")
+            log.info("Stream client terhubung: %s", peer)
+            clients.add(writer)
+            # Gunakan text/plain agar browser menampilkan teks JSON mentah, bukan download file
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: keep-alive\r\n\r\n")
             await writer.drain()
-            sse_clients.add(writer)
             try:
-                alerts_list = await fetch_alert_list()
-                for alert_summary in alerts_list[:5]:
-                    alert_id = alert_summary.get("id") or alert_summary.get("alert_id")
-                    if alert_id:
-                        detail_data = await fetch_alert_detail(alert_id)
-                        if detail_data:
-                            payload = build_minimal_payload(detail_data)
-                            sse_data = f"data: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
-                            writer.write(sse_data.encode("utf-8")); await writer.drain()
                 while True: await asyncio.wait_for(reader.read(4096), timeout=30.0)
             except (asyncio.TimeoutError, ConnectionError, OSError): pass
             finally:
-                sse_clients.discard(writer); writer.close()
+                clients.discard(writer)
+                try: writer.close()
+                except: pass
             return
 
-        # 4. RAW JSON SNAPSHOT (Jika curl/script membuka /)
+        # 3. JSON SNAPSHOT (Untuk Browser / curl)
         if first_line.startswith("get ") or first_line.startswith("head "):
             log.info("HTTP request (Snapshot JSON) dari %s", peer)
             alerts_list = await fetch_alert_list()
@@ -272,7 +230,7 @@ async def handle_client(reader, writer):
     except Exception as e:
         log.error("Error klien %s: %s", peer, e)
     finally:
-        clients.discard(writer); sse_clients.discard(writer)
+        clients.discard(writer)
         try:
             if not writer.is_closing(): writer.close(); await writer.wait_closed()
         except Exception: pass
@@ -298,7 +256,7 @@ async def iris_monitor():
                 detail_data = await fetch_alert_detail(alert_id)
                 if detail_data:
                     payload = build_minimal_payload(detail_data)
-                    await broadcast_alert(payload)
+                    await broadcast_alert(payload) # Kirim JSON ke semua klien stream
                     await send_to_external_server(payload)
                     log.info("✅ Alert %s diproses & dikirim.", alert_id)
             if len(seen_alerts) > MAX_SEEN_ALERTS: seen_alerts.clear()
@@ -326,7 +284,8 @@ async def main():
     try:
         server = await asyncio.start_server(handle_client, host=HOST, port=PORT)
         log.info("🚀 Server aktif di %s:%s", HOST, PORT)
-        log.info("💡 Buka http://%s:%s/stream di Browser untuk Terminal Real-time!", HOST.replace("0.0.0.0", "127.0.0.1"), PORT)
+        log.info("💡 Buka http://%s:%s/ untuk JSON Snapshot", HOST.replace("0.0.0.0", "127.0.0.1"), PORT)
+        log.info("💡 Buka http://%s:%s/stream untuk JSON Real-time", HOST.replace("0.0.0.0", "127.0.0.1"), PORT)
         
         asyncio.create_task(iris_monitor())
         asyncio.create_task(external_data_poller())
