@@ -56,11 +56,11 @@ services:
     
     # 🛡️ HEALTHCHECK YANG DISEDERHANAKAN & DIPASTIKAN BERJALAN
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:17771/health', timeout=3)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:17771/health', timeout=5)"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     
     volumes:
       - /etc/ssl/custom/iris-ca.pem:/app/iris-ca.crt:ro
