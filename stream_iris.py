@@ -20,7 +20,7 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
 
 POLL_INTERVAL = float(os.getenv("IRIS_POLL_INTERVAL", "5.0"))
 REQUEST_TIMEOUT = float(os.getenv("IRIS_REQUEST_TIMEOUT", "10.0"))
-MUX_TIMEOUT = float(os.getenv("MUX_TIMEOUT", "2.0"))  # Naikkan sedikit agar lebih stabil
+MUX_TIMEOUT = float(os.getenv("MUX_TIMEOUT", "2.0")) # Naikkan sedikit agar lebih stabil
 
 clients = set()
 sse_clients = set()
@@ -28,7 +28,7 @@ seen_alerts = set()
 MAX_SEEN_ALERTS = 100000
 
 logging.basicConfig(
-    level="INFO",
+    level="INFO", 
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
@@ -157,44 +157,22 @@ async def broadcast_alert(payload):
 
 
 # ============================================================
-# HTTP HANDLER (DENGAN HEALTHCHECK YANG LEBIH ROBUST)
+# HTTP HANDLER (HEALTHCHECK DIPERBAIKI)
 # ============================================================
 
 async def handle_client(reader, writer):
     peer = writer.get_extra_info('peername')
     try:
-        # Baca request awal dengan timeout yang lebih panjang
         try:
-            first_data = await asyncio.wait_for(reader.read(4096), timeout=MUX_TIMEOUT)
-        except asyncio.TimeoutError:
-            first_data = b""
-        except Exception as e:
-            log.debug("Error membaca data awal dari %s: %s", peer, e)
-            first_data = b""
-
-        if not first_data:
-            # Tidak ada data, perlakukan sebagai TCP streaming client
-            log.info("TCP client terhubung (Raw Stream): %s", peer)
-            clients.add(writer)
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: keep-alive\r\n\r\n")
-            await writer.drain()
-            try:
-                while True:
-                    await asyncio.wait_for(reader.read(4096), timeout=30.0)
-            except (asyncio.TimeoutError, ConnectionError, OSError):
-                pass
-            return
-
-        # Decode request line
-        try:
-            request_text = first_data.decode("utf-8", errors="ignore")
-            request_line = request_text.split("\r\n", 1)[0] if "\r\n" in request_text else request_text.split("\n", 1)[0]
+            first_data = await asyncio.wait_for(reader.read(1024), timeout=MUX_TIMEOUT)
         except Exception:
-            request_line = ""
+            first_data = b""
 
-        # 🆕 HEALTHCHECK - Deteksi lebih fleksibel (urllib mengirim "GET /health HTTP/1.1")
-        if "/health" in request_line:
-            log.debug("Healthcheck request dari %s", peer)
+        first_line = first_data.split(b"\r\n", 1)[0].decode("utf-8", errors="ignore").lower() if first_data else ""
+
+        # 🛡️ HEALTHCHECK: Gunakan "in" agar lebih toleran terhadap format request apa pun
+        if "/health" in first_line:
+            log.debug("Healthcheck request diterima dari %s", peer)
             response = (
                 b"HTTP/1.1 200 OK\r\n"
                 b"Content-Type: text/plain\r\n"
@@ -208,10 +186,9 @@ async def handle_client(reader, writer):
             writer.close()
             return
 
-        # SSE Endpoint
-        if request_line.startswith("GET /stream") or request_line.startswith("HEAD /stream"):
+        # ENDPOINT SSE
+        if first_line.startswith("get /stream") or first_line.startswith("head /stream"):
             log.info("SSE client terhubung (Real-time Stream): %s", peer)
-            
             headers_str = (
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: text/event-stream\r\n"
@@ -222,7 +199,6 @@ async def handle_client(reader, writer):
             )
             writer.write(headers_str.encode("utf-8"))
             await writer.drain()
-            
             sse_clients.add(writer)
             
             try:
@@ -236,7 +212,6 @@ async def handle_client(reader, writer):
                             sse_data = f"data: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
                             writer.write(sse_data.encode("utf-8"))
                             await writer.drain()
-                
                 while True:
                     await asyncio.wait_for(reader.read(4096), timeout=30.0)
             except (asyncio.TimeoutError, ConnectionError, OSError):
@@ -247,7 +222,7 @@ async def handle_client(reader, writer):
             return
 
         # HTTP Request biasa (Snapshot)
-        if request_line.startswith("GET ") or request_line.startswith("HEAD "):
+        if first_line.startswith("get ") or first_line.startswith("head "):
             log.info("HTTP request (Snapshot) dari %s", peer)
             alerts_list = await fetch_alert_list()
             formatted_alerts = []
@@ -262,7 +237,6 @@ async def handle_client(reader, writer):
                         formatted_alerts.append({"alert_description": alert_summary.get("alert_description", "")})
 
             body = json.dumps(formatted_alerts, ensure_ascii=False, indent=2, default=str).encode("utf-8")
-            
             headers_str = (
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: application/json; charset=utf-8\r\n"
@@ -272,11 +246,21 @@ async def handle_client(reader, writer):
                 "\r\n"
             )
             response = headers_str.encode("utf-8") + body
-            
             writer.write(response)
             await writer.drain()
             writer.close()
             return
+
+        # Fallback: Raw TCP Streaming
+        log.info("TCP client terhubung (Raw Stream): %s", peer)
+        clients.add(writer)
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: keep-alive\r\n\r\n")
+        await writer.drain()
+        try:
+            while True:
+                await asyncio.wait_for(reader.read(4096), timeout=30.0)
+        except (asyncio.TimeoutError, ConnectionError, OSError):
+            pass
 
     except Exception as e:
         log.error("Error klien %s: %s", peer, e)
@@ -303,7 +287,6 @@ async def iris_monitor():
     while True:
         try:
             alerts_list = await fetch_alert_list()
-
             for alert_summary in alerts_list:
                 alert_id = alert_summary.get("id") or alert_summary.get("alert_id")
                 if not alert_id: continue
@@ -315,7 +298,6 @@ async def iris_monitor():
                 log.info("🔍 Alert BARU terdeteksi (ID: %s). Mengambil detail & mengirim...", alert_id)
                 
                 detail_data = await fetch_alert_detail(alert_id)
-                
                 if detail_data:
                     payload = build_minimal_payload(detail_data)
                     await broadcast_alert(payload)
@@ -338,10 +320,8 @@ async def main():
     try:
         server = await asyncio.start_server(handle_client, host=HOST, port=PORT)
         log.info("🚀 Server aktif dan mendengarkan di %s:%s", HOST, PORT)
-        log.info("💡 Endpoint: http://localhost:%s/ (snapshot), /stream (SSE), /health (healthcheck)", PORT)
         
         monitor_task = asyncio.create_task(iris_monitor())
-
         async with server:
             await server.serve_forever()
     except Exception as e:
