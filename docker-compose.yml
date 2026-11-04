@@ -62,6 +62,18 @@ services:
 
     volumes:
       - /etc/ssl/custom/iris-ca.pem:/app/iris-ca.crt:ro
+    # 🆕 SERVICE BARU: Penerima Data dari VM Lain (Port 17772)
+  vm-receiver:
+    build: .
+    image: analisis-log:local
+    command: ["python", "receiver_17772.py"]
+    env_file: .env
+    restart: unless-stopped
+    networks: [internal]
+    ports:
+      # Membuka port 17772 agar bisa diakses oleh VM lain dari luar
+      - "0.0.0.0:17772:17772"
+    # Tidak perlu healthcheck HTTP karena ini pure TCP server
 
 volumes:
   pgdata:
