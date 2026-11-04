@@ -20,8 +20,8 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
 
 POLL_INTERVAL = float(os.getenv("IRIS_POLL_INTERVAL", "5.0"))
 REQUEST_TIMEOUT = float(os.getenv("IRIS_REQUEST_TIMEOUT", "10.0"))
-MUX_TIMEOUT = float(os.getenv("MUX_TIMEOUT", "2.0")) # Naikkan sedikit agar lebih stabil
 
+# State global
 clients = set()
 sse_clients = set()
 seen_alerts = set()
@@ -157,22 +157,49 @@ async def broadcast_alert(payload):
 
 
 # ============================================================
-# HTTP HANDLER (HEALTHCHECK DIPERBAIKI)
+# HTTP HANDLER (DIPERBAIKI: ANTI-DEADLOCK)
 # ============================================================
 
 async def handle_client(reader, writer):
     peer = writer.get_extra_info('peername')
     try:
+        # 1. Baca data awal dengan timeout yang cukup panjang (5 detik)
         try:
-            first_data = await asyncio.wait_for(reader.read(1024), timeout=MUX_TIMEOUT)
-        except Exception:
+            first_data = await asyncio.wait_for(reader.read(4096), timeout=5.0)
+        except asyncio.TimeoutError:
+            first_data = b""
+        except Exception as e:
+            log.debug("Error membaca data awal dari %s: %s", peer, e)
             first_data = b""
 
-        first_line = first_data.split(b"\r\n", 1)[0].decode("utf-8", errors="ignore").lower() if first_data else ""
+        # 2. Jika benar-benar tidak ada data, anggap sebagai TCP streaming pasif
+        if not first_data:
+            log.info("TCP client terhubung (Raw Stream, pasif): %s", peer)
+            clients.add(writer)
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: keep-alive\r\n\r\n")
+            await writer.drain()
+            try:
+                while True:
+                    await asyncio.wait_for(reader.read(4096), timeout=30.0)
+            except (asyncio.TimeoutError, ConnectionError, OSError):
+                pass
+            finally:
+                clients.discard(writer)
+                writer.close()
+            return
 
-        # 🛡️ HEALTHCHECK: Gunakan "in" agar lebih toleran terhadap format request apa pun
+        # 3. Decode baris pertama request
+        try:
+            request_text = first_data.decode("utf-8", errors="ignore")
+            first_line = request_text.split("\r\n", 1)[0].split("\n", 1)[0].lower()
+        except Exception:
+            first_line = ""
+
+        log.debug("Menerima request dari %s: %s", peer, first_line)
+
+        # 4. HEALTHCHECK (Paling Prioritas)
         if "/health" in first_line:
-            log.debug("Healthcheck request diterima dari %s", peer)
+            log.info("✅ Healthcheck request berhasil diterima dari %s", peer)
             response = (
                 b"HTTP/1.1 200 OK\r\n"
                 b"Content-Type: text/plain\r\n"
@@ -186,7 +213,7 @@ async def handle_client(reader, writer):
             writer.close()
             return
 
-        # ENDPOINT SSE
+        # 5. ENDPOINT SSE
         if first_line.startswith("get /stream") or first_line.startswith("head /stream"):
             log.info("SSE client terhubung (Real-time Stream): %s", peer)
             headers_str = (
@@ -221,7 +248,7 @@ async def handle_client(reader, writer):
                 writer.close()
             return
 
-        # HTTP Request biasa (Snapshot)
+        # 6. HTTP Request biasa (Snapshot)
         if first_line.startswith("get ") or first_line.startswith("head "):
             log.info("HTTP request (Snapshot) dari %s", peer)
             alerts_list = await fetch_alert_list()
@@ -250,17 +277,6 @@ async def handle_client(reader, writer):
             await writer.drain()
             writer.close()
             return
-
-        # Fallback: Raw TCP Streaming
-        log.info("TCP client terhubung (Raw Stream): %s", peer)
-        clients.add(writer)
-        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: keep-alive\r\n\r\n")
-        await writer.drain()
-        try:
-            while True:
-                await asyncio.wait_for(reader.read(4096), timeout=30.0)
-        except (asyncio.TimeoutError, ConnectionError, OSError):
-            pass
 
     except Exception as e:
         log.error("Error klien %s: %s", peer, e)
