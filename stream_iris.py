@@ -204,9 +204,8 @@ async def handle_client(reader, writer):
         except Exception:
             first_line = ""; path = "/"
 
-        # 1. HEALTHCHECK (Anti-Deadlock)
+        # 1. HEALTHCHECK (Untuk Docker)
         if "/health" in first_line:
-            log.debug("Healthcheck request diterima dari %s", peer)
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
             await writer.drain(); writer.close(); return
 
