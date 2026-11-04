@@ -27,9 +27,8 @@ POLL_INTERVAL = float(os.getenv("IRIS_POLL_INTERVAL", "5.0"))
 REQUEST_TIMEOUT = float(os.getenv("IRIS_REQUEST_TIMEOUT", "10.0"))
 EXTERNAL_POLL_INTERVAL = float(os.getenv("EXTERNAL_POLL_INTERVAL", "10.0"))
 
-# State global untuk berbagai jenis klien
-tcp_clients = set()         # Untuk koneksi TCP mentah (netcat)
-http_stream_clients = set() # Untuk koneksi HTTP Keep-Alive (/stream)
+tcp_clients = set()
+http_stream_clients = set()
 seen_alerts = set()
 MAX_SEEN_ALERTS = 100000
 
@@ -145,10 +144,8 @@ def build_minimal_payload(detail_data):
 # ============================================================
 
 async def broadcast_all(payload):
-    """Kirim JSON ke semua klien (TCP mentah, HTTP Stream, dan Eksternal)"""
     data_bytes = (json.dumps(payload, ensure_ascii=False, default=str) + "\n").encode("utf-8")
     
-    # 1. Kirim ke Raw TCP Clients
     disconnected_tcp = []
     for writer in list(tcp_clients):
         try:
@@ -159,7 +156,6 @@ async def broadcast_all(payload):
     for w in disconnected_tcp:
         tcp_clients.discard(w); w.close()
 
-    # 2. Kirim ke HTTP Stream Clients (Keep-Alive)
     disconnected_http = []
     for writer in list(http_stream_clients):
         try:
@@ -173,7 +169,6 @@ async def broadcast_all(payload):
 async def handle_client(reader, writer):
     peer = writer.get_extra_info('peername')
     
-    # Coba baca data awal untuk mendeteksi jenis koneksi
     try:
         first_data = await asyncio.wait_for(reader.read(4096), timeout=2.0)
     except asyncio.TimeoutError:
@@ -195,7 +190,6 @@ async def handle_client(reader, writer):
             writer.close()
         return
 
-    # Deteksi apakah ini HTTP Request
     try:
         request_text = first_data.decode('utf-8', errors='ignore')
         first_line = request_text.split('\r\n')[0].split('\n')[0].upper()
@@ -211,12 +205,12 @@ async def handle_client(reader, writer):
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
             await writer.drain(); writer.close(); return
 
-        # B. HTTP Stream Real-time (/stream)
+        # B. HTTP Stream Real-time (/stream) -> PERBAIKAN DI SINI
         if path == "/stream":
             log.info("🌐 HTTP Stream client terhubung: %s", peer)
             http_stream_clients.add(writer)
-            # Kirim header HTTP, biarkan koneksi terbuka (Keep-Alive)
-            header = b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: keep-alive\r\n\r\n"
+            # UBAH Content-Type menjadi text/plain agar browser menampilkannya, bukan mendownload
+            header = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: keep-alive\r\n\r\n"
             writer.write(header)
             await writer.drain()
             try:
@@ -249,7 +243,6 @@ async def handle_client(reader, writer):
     log.info("🔌 Raw TCP client terhubung (dengan data awal): %s", peer)
     tcp_clients.add(writer)
     try:
-        # Proses first_data jika perlu, lalu lanjutkan loop
         while True:
             data = await reader.read(4096)
             if not data: break
@@ -279,7 +272,7 @@ async def iris_monitor():
                 detail_data = await fetch_alert_detail(alert_id)
                 if detail_data:
                     payload = build_minimal_payload(detail_data)
-                    await broadcast_all(payload) # Kirim ke TCP, HTTP Stream, dll
+                    await broadcast_all(payload)
                     await send_to_external_server(payload)
                     log.info("✅ Alert %s diproses & dikirim.", alert_id)
             if len(seen_alerts) > MAX_SEEN_ALERTS: seen_alerts.clear()
@@ -309,7 +302,7 @@ async def main():
         log.info("🚀 Hybrid TCP/HTTP Server aktif di %s:%s", HOST, PORT)
         log.info("💡 TCP: nc 127.0.0.1 %s", PORT)
         log.info("💡 HTTP Snapshot: curl http://127.0.0.1:%s/", PORT)
-        log.info("💡 HTTP Stream: curl -N http://127.0.0.1:%s/stream", PORT)
+        log.info("💡 HTTP Stream (Browser): http://127.0.0.1:%s/stream", PORT)
         
         asyncio.create_task(iris_monitor())
         asyncio.create_task(external_data_poller())
