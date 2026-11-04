@@ -42,6 +42,19 @@ log = logging.getLogger("iris-stream")
 if not IRIS_API_KEY:
     log.warning("[!] PERINGATAN: IRIS_API_KEY kosong.")
 
+# Tampilan Terminal Minimalis untuk Browser
+TERMINAL_HTML = """<!DOCTYPE html>
+<html><head><title>IRIS Raw Stream</title>
+<style>body{background:#000;color:#0f0;font-family:monospace;padding:10px;margin:0;font-size:12px;} pre{white-space:pre-wrap;word-wrap:break-word;}</style></head>
+<body><pre id="log">Menunggu data real-time...</pre>
+<script>
+const s=new EventSource('/stream');
+const l=document.getElementById('log');
+s.onopen=()=>l.innerText='Terhubung. Menunggu data...\n\n';
+s.onmessage=e=>{l.innerText+=e.data+'\n\n----------------------------------------\n\n'; window.scrollTo(0,document.body.scrollHeight);};
+s.onerror=()=>l.innerText+='⚠️ Koneksi terputus. Mencoba reconnect...\n\n';
+</script></body></html>"""
+
 
 # ============================================================
 # IRIS API REQUESTS
@@ -185,7 +198,6 @@ async def handle_client(reader, writer):
         except Exception:
             first_data = b""
 
-        # Jika tidak ada data, anggap TCP streaming pasif
         if not first_data:
             clients.add(writer)
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: keep-alive\r\n\r\n")
@@ -201,15 +213,25 @@ async def handle_client(reader, writer):
             request_text = first_data.decode("utf-8", errors="ignore")
             first_line = request_text.split("\r\n", 1)[0].split("\n", 1)[0].lower()
             path = first_line.split(" ")[1] if len(first_line.split(" ")) > 1 else "/"
+            
+            # Deteksi apakah ini Browser atau Script (curl/python)
+            is_browser = "text/html" in request_text.lower() and "application/json" not in request_text.lower()
         except Exception:
-            first_line = ""; path = "/"
+            first_line = ""; path = "/"; is_browser = False
 
-        # 1. HEALTHCHECK (Untuk Docker)
+        # 1. HEALTHCHECK
         if "/health" in first_line:
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
             await writer.drain(); writer.close(); return
 
-        # 2. RAW SSE STREAM (Untuk script/EventSource)
+        # 2. TERMINAL VIEW (Jika Browser membuka /stream atau /)
+        if is_browser and (path == "/stream" or path == "/"):
+            log.info("🖥️ Browser terdeteksi, mengirim Terminal View ke %s", peer)
+            body = TERMINAL_HTML.encode("utf-8")
+            response = f"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("utf-8") + body
+            writer.write(response); await writer.drain(); writer.close(); return
+
+        # 3. RAW SSE STREAM (Jika Script/EventSource membuka /stream)
         if path == "/stream":
             log.info("SSE client terhubung (Raw Stream): %s", peer)
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n")
@@ -231,7 +253,7 @@ async def handle_client(reader, writer):
                 sse_clients.discard(writer); writer.close()
             return
 
-        # 3. RAW JSON SNAPSHOT (Untuk Browser / curl) - MENAMPILKAN DATA TERBARU
+        # 4. RAW JSON SNAPSHOT (Jika curl/script membuka /)
         if first_line.startswith("get ") or first_line.startswith("head "):
             log.info("HTTP request (Snapshot JSON) dari %s", peer)
             alerts_list = await fetch_alert_list()
@@ -304,7 +326,7 @@ async def main():
     try:
         server = await asyncio.start_server(handle_client, host=HOST, port=PORT)
         log.info("🚀 Server aktif di %s:%s", HOST, PORT)
-        log.info("💡 Buka http://%s:%s/ di Browser untuk melihat data JSON terbaru!", HOST.replace("0.0.0.0", "127.0.0.1"), PORT)
+        log.info("💡 Buka http://%s:%s/stream di Browser untuk Terminal Real-time!", HOST.replace("0.0.0.0", "127.0.0.1"), PORT)
         
         asyncio.create_task(iris_monitor())
         asyncio.create_task(external_data_poller())
