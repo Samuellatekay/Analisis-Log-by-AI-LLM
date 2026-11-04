@@ -10,7 +10,6 @@ services:
     restart: unless-stopped
     depends_on:
       postgres: { condition: service_healthy }
-      # redis: { condition: service_started }
     extra_hosts:
       - "iris.local:192.168.51.40"
       - "soc-risk-engine:192.168.51.39"
@@ -37,7 +36,7 @@ services:
       retries: 10
     networks: [internal]
 
-    iris-stream:
+  iris-stream:
     build: .
     image: analisis-log:local
     command: ["python", "stream_iris.py"]
@@ -65,15 +64,6 @@ services:
     
     volumes:
       - /etc/ssl/custom/iris-ca.pem:/app/iris-ca.crt:ro
-
-#  redis:
-#    image: redis:7-alpine
-#    restart: unless-stopped
-#    command: >
-#      redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes
-#      --maxmemory 512mb --maxmemory-policy noeviction
-#    volumes: [redisdata:/data]
-#    networks: [internal]
 
 volumes:
   pgdata:
