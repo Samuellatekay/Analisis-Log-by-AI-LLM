@@ -9,7 +9,7 @@ import httpx
 # ============================================================
 
 HOST = "0.0.0.0"
-PORT = int(os.getenv("IRIS_STREAM_HTTP_PORT", os.getenv("IRIS_STREAM_PORT", "17772")))
+PORT = int(os.getenv("IRIS_STREAM_HTTP_PORT", os.getenv("IRIS_STREAM_PORT", "17771")))
 
 BASE_IRIS_URL = os.getenv("IRIS_URL", "https://iris.local").rstrip("/")
 IRIS_LIST_ENDPOINT = f"{BASE_IRIS_URL}/api/v2/alerts"
