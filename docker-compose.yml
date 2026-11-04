@@ -78,8 +78,6 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     networks: [internal]
-    depends_on:
-      - vm-receiver  # Pastikan sumber stream sudah jalan dulu
     volumes:
       - /etc/ssl/custom/iris-ca.pem:/app/iris-ca.crt:ro
 
