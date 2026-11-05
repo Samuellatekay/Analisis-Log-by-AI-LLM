@@ -15,91 +15,97 @@ log = logging.getLogger("stream-receiver")
 
 TARGET_STREAM_URL = os.getenv("TARGET_STREAM_URL", "http://38.47.66.253:17772/stream")
 
-async def find_and_append_risk(iris_client: IrisClient, raw_data: dict) -> bool:
+async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> bool:
     """
-    Mencari alert yang sudah ada di IRIS dan MENAMBAHKAN info risiko di bawahnya.
-    TIDAK AKAN MEMBUAT ALERT BARU.
+    Mencari alert berdasarkan UUID, lalu menyisipkan incident_report 
+    tepat di bawah baris 'Faktor:' pada deskripsi alert.
     """
-    # 1. Ambil UUID dan data penting dari stream
-    log_uuid = str(raw_data.get("log_uuid") or raw_data.get("id") or raw_data.get("uuid", "")).strip()
-    incoming_title = raw_data.get("title", raw_data.get("action", ""))
-    incoming_ip = raw_data.get("source_ip", raw_data.get("src_ip", ""))
-
-    if not log_uuid and not incoming_title:
-        log.warning("⚠️ Data tidak memiliki UUID maupun Judul. Melewati.")
+    # 1. Ambil data penting
+    log_uuid = str(raw_data.get("log_uuid") or raw_data.get("id", "")).strip()
+    incident_report = raw_data.get("incident_report")
+    
+    if not log_uuid:
+        log.warning("⚠️ Tidak ada UUID. Melewati.")
+        return False
+    if not incident_report:
+        log.debug("ℹ️ Tidak ada incident_report di data. Melewati.")
         return False
 
-    # 2. Format teks risiko yang akan DITAMBAHKAN DI BAWAH
-    risk_data = raw_data.get("risk", {})
-    score = risk_data.get("score", raw_data.get("score", 0.0))
-    level = str(risk_data.get("level", raw_data.get("level", "medium"))).lower()
-    asset_crit = risk_data.get("asset_criticality", raw_data.get("asset_criticality", 0))
-    severity = risk_data.get("event_severity", raw_data.get("event_severity", 0))
-    outcome = risk_data.get("event_outcome", raw_data.get("event_outcome", 0))
-    threat = risk_data.get("threat_weight", raw_data.get("threat_weight", 0))
-    repeat = risk_data.get("repeat_count", raw_data.get("repeat_count", 0))
-
-    append_text = (
-        f"\n\n--- 🔄 Update Informasi Risiko Terbaru ---\n"
-        f"**Risiko**\n"
-        f"- **Skor**: {score} ({level})\n"
-        f"- **Faktor**: kritikalitas aset {asset_crit}, severity {severity}, "
-        f"outcome {outcome}, ancaman {threat}, pengulangan {repeat}\n"
-        f"---------------------------------------------"
-    )
-
-    # 3. Cari Alert ID di IRIS (Ambil 50 alert terakhir untuk dicocokkan)
-    log.info("🔍 Mencari alert di IRIS (UUID: %s | Title: %s)...", log_uuid, incoming_title[:30])
+    # 2. Cari Alert ID di IRIS
+    log.info("🔍 Mencari alert di IRIS dengan UUID: %s...", log_uuid)
     target_alert_id = None
     
     try:
-        # Gunakan client internal yang sudah terautentikasi
+        # Ambil 50 alert terakhir
         resp = await iris_client._client.get("/api/v2/alerts", params={"per_page": 50, "page": 1, "sort": "alert_source_event_time:desc"})
         resp.raise_for_status()
         resp_json = resp.json()
         alerts = resp_json.get("data", []) if isinstance(resp_json, dict) else resp_json
         
-        # PRIORITAS 1: Cari berdasarkan UUID / Source Ref
         for alert in alerts:
             a_id = alert.get("id")
             source_ref = str(alert.get("alert_source_ref", ""))
             desc = str(alert.get("alert_description", ""))
             
-            if log_uuid and (str(log_uuid) == source_ref or str(log_uuid) in desc):
+            # Cek kecocokan UUID
+            if str(log_uuid) == source_ref or str(log_uuid) in desc:
                 target_alert_id = a_id
-                log.info("✅ [PRIORITAS 1] Alert DITEMUKAN via UUID/SourceRef! ID: %s", target_alert_id)
+                log.info("✅ Alert DITEMUKAN! ID: %s", target_alert_id)
                 break
-
-        # PRIORITAS 2 (FALLBACK): Cari berdasarkan Judul dan IP yang sama
-        if not target_alert_id and incoming_title:
-            for alert in alerts:
-                a_id = alert.get("id")
-                title = str(alert.get("alert_title", ""))
                 
-                # Cek apakah judul stream ada di judul alert IRIS
-                if incoming_title.lower() in title.lower():
-                    # Jika ada IP, pastikan IP-nya juga cocok untuk menghindari false positive
-                    if not incoming_ip or incoming_ip in title:
-                        target_alert_id = a_id
-                        log.info("✅ [PRIORITAS 2] Alert DITEMUKAN via Title+IP Fallback! ID: %s", target_alert_id)
-                        break
-                        
     except Exception as e:
         log.error("❌ Gagal mencari alert di IRIS: %s", e)
         return False
 
-    # 4. EKSEKUSI: Append atau Skip (JANGAN CREATE)
-    if target_alert_id:
-        success = await iris_client.append_alert_description(target_alert_id, append_text)
-        return success
-    else:
-        # INI KUNCINYA: Jika tidak ketemu, JANGAN BUAT ALERT BARU.
-        log.warning("⚠️ Alert TIDAK DITEMUKAN di IRIS untuk UUID='%s' / Title='%s'. MELEWATI (Tidak membuat alert baru).", log_uuid, incoming_title)
+    if not target_alert_id:
+        log.warning("⚠️ Alert dengan UUID '%s' TIDAK DITEMUKAN. Melewati (No Create).", log_uuid)
         return False
+
+    # 3. Ambil Deskripsi Saat Ini
+    current_alert = await iris_client.get_alert(target_alert_id)
+    if not current_alert:
+        log.error("❌ Gagal mengambil detail alert %s.", target_alert_id)
+        return False
+        
+    current_desc = current_alert.get("alert_description", "")
+    if not isinstance(current_desc, str):
+        current_desc = ""
+
+    # 4. Cek Duplikasi (Apakah laporan sudah pernah disisipkan?)
+    # Kita cek baris pertama dari incident_report (biasanya "# Incident Report (IR)")
+    first_line_report = incident_report.split('\n')[0].strip()
+    if first_line_report and first_line_report in current_desc:
+        log.info("ℹ️ Laporan insiden sudah ada di alert %s. Melewati update.", target_alert_id)
+        return True
+
+    # 5. SISIPKAN (INJECT) ke Tengah
+    lines = current_desc.split('\n')
+    injected = False
+    
+    # Cari baris yang mengandung "Faktor:"
+    for i, line in enumerate(lines):
+        if "Faktor:" in line and "kritikalitas aset" in line:
+            # Sisipkan tepat di bawah baris Faktor
+            # Tambahkan newline agar rapi sesuai contoh Anda
+            lines.insert(i + 1, f"\n{incident_report}\n")
+            injected = True
+            log.info("📝 Laporan disisipkan setelah baris 'Faktor:' pada alert %s.", target_alert_id)
+            break
+
+    # Fallback: Jika struktur "Faktor:" tidak ditemukan, taruh di paling atas setelah "Risiko" atau di bawah
+    if not injected:
+        log.warning("⚠️ Struktur 'Faktor:' tidak ditemukan. Menambahkan di bagian bawah deskripsi.")
+        lines.append(f"\n\n## Analisis AI (Incident Report)\n{incident_report}")
+
+    new_desc = '\n'.join(lines)
+
+    # 6. Update ke IRIS
+    success = await iris_client.update_alert_description(target_alert_id, new_desc)
+    return success
 
 
 async def run_receiver():
-    log.info("🎧 Receiver aktif (Mode: Cari & TAMBAH di bawah, STRICT NO CREATE).")
+    log.info("🎧 Receiver aktif (Mode: Inject Incident Report to Middle).")
     
     env = {
         "IRIS_ENABLED": "true",
@@ -138,7 +144,7 @@ async def run_receiver():
                         
                         try:
                             raw_data = json.loads(line)
-                            await find_and_append_risk(iris_client, raw_data)
+                            await inject_incident_report(iris_client, raw_data)
                         except json.JSONDecodeError:
                             log.warning("⚠️ Data bukan JSON valid: %s", line[:50])
                         except Exception as e:
@@ -154,7 +160,7 @@ async def run_receiver():
 
 if __name__ == "__main__":
     try:
-        log.info("🚀 Stream Receiver (Strict Append Mode) dimulai.")
+        log.info("🚀 Stream Receiver (Inject Mode) dimulai.")
         asyncio.run(run_receiver())
     except KeyboardInterrupt:
         log.info("🛑 Receiver dihentikan.")

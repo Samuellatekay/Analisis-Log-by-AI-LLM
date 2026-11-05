@@ -521,7 +521,7 @@ class IrisClient:
             await self._put(path, update)
 
     # ============================================================
-    # FITUR BARU: GET & APPEND ALERT DESCRIPTION
+    # FITUR BARU: GET & UPDATE ALERT DESCRIPTION
     # ============================================================
     async def get_alert(self, alert_id: int) -> dict | None:
         """Mengambil detail alert berdasarkan ID."""
@@ -532,36 +532,21 @@ class IrisClient:
             log.error("Gagal mengambil detail alert %s: %s", alert_id, e)
             return None
 
-    async def append_alert_description(self, alert_id: int, text_to_append: str) -> bool:
-        """Mengambil deskripsi alert saat ini dan menambahkan teks baru di bagian bawah."""
-        current_alert = await self.get_alert(alert_id)
-        if not current_alert:
-            log.error("Gagal mendapatkan detail alert %s untuk di-append.", alert_id)
-            return False
-        
-        current_desc = current_alert.get("alert_description", "")
-        if not isinstance(current_desc, str):
-            current_desc = ""
-            
-        # Cek apakah teks sudah ada untuk menghindari duplikasi
-        if text_to_append.strip() and text_to_append.strip() in current_desc:
-            log.info("ℹ️ Teks sudah ada di alert %s, melewati append.", alert_id)
-            return True
-            
-        # Tambahkan teks baru di bagian bawah
-        new_desc = current_desc + "\n\n" + text_to_append
-        
+    async def update_alert_description(self, alert_id: int, new_description: str) -> bool:
+        """
+        Mengupdate seluruh deskripsi alert dengan string baru.
+        Digunakan untuk menyisipkan incident_report di tengah deskripsi.
+        """
         path = self.paths["alert_update"].format(id=alert_id)
-        update_payload = {
-            "alert_description": new_desc[:8000] 
-        }
+        # Batasi panjang maksimal sesuai batas IRIS
+        update_payload = {"alert_description": new_description[:16000]} 
         
         try:
             if self.api_version == "legacy":
                 await self._post(path, update_payload)
             else:
                 await self._put(path, update_payload)
-            log.info("✅ Berhasil menambahkan teks ke deskripsi alert %s.", alert_id)
+            log.info("✅ Berhasil mengupdate deskripsi alert %s.", alert_id)
             return True
         except Exception as e:
             log.error("❌ Gagal mengupdate deskripsi alert %s: %s", alert_id, e)
