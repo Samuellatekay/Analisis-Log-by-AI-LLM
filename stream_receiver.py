@@ -16,13 +16,17 @@ log = logging.getLogger("stream-receiver")
 TARGET_STREAM_URL = os.getenv("TARGET_STREAM_URL", "http://38.47.66.253:17772/stream")
 
 async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> bool:
+    """
+    Mencari alert berdasarkan UUID, lalu menyisipkan incident_report 
+    tepat setelah bagian 'Event' (sebelum 'Source').
+    """
     # 1. Ambil UUID dan incident_report
     log_uuid = str(raw_data.get("log_uuid") or raw_data.get("id", "")).strip()
     incident_report = raw_data.get("incident_report")
     
-    # Jika tidak ada incident_report, abaikan (ini adalah Pesan 1: Raw Log biasa)
+    # Jika tidak ada incident_report, abaikan (ini adalah raw log biasa, biarkan sistem lain yang proses)
     if not incident_report:
-        log.debug("ℹ️ Tidak ada incident_report di data ini. Melewati (mungkin raw log).")
+        log.debug("ℹ️ Tidak ada incident_report di data ini. Melewati (raw log biasa).")
         return False
         
     if not log_uuid:
@@ -33,6 +37,7 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
     target_alert_id = None
     
     try:
+        # Ambil 50 alert terakhir dari IRIS
         resp = await iris_client._client.get("/api/v2/alerts", params={"per_page": 50, "page": 1, "sort": "alert_source_event_time:desc"})
         resp.raise_for_status()
         resp_json = resp.json()
@@ -73,7 +78,7 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
         return False
 
     if not target_alert_id:
-        log.warning("⚠️ Alert dengan UUID '%s' TIDAK DITEMUKAN. Melewati.", log_uuid)
+        log.warning("⚠️ Alert dengan UUID '%s' TIDAK DITEMUKAN. Melewati (No Create).", log_uuid)
         return False
 
     # 2. Ambil Deskripsi Saat Ini
@@ -92,20 +97,22 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
         log.info("ℹ️ Laporan insiden sudah ada di alert %s. Melewati update.", target_alert_id)
         return True
 
-    # 4. SISIPKAN (INJECT) ke Tengah (setelah baris "Faktor:")
+    # 4. SISIPKAN (INJECT) tepat setelah bagian "# Event" (sebelum "# Source")
     lines = current_desc.split('\n')
     injected = False
     
     for i, line in enumerate(lines):
-        if "Faktor:" in line and "kritikalitas aset" in line:
-            lines.insert(i + 1, f"\n{incident_report}\n")
+        # Mencari header "# Source" untuk menyisipkan tepat sebelum Source
+        if line.strip().startswith('# Source') or line.strip() == 'Source':
+            # Sisipkan tepat SEBELUM baris Source
+            lines.insert(i, f"\n{incident_report}\n")
             injected = True
-            log.info("📝 Laporan disisipkan setelah baris 'Faktor:' pada alert %s.", target_alert_id)
+            log.info("📝 Laporan disisipkan tepat setelah 'Event' (sebelum 'Source') pada alert %s.", target_alert_id)
             break
 
-    # Fallback jika struktur "Faktor:" tidak ditemukan
+    # Fallback: Jika struktur "# Source" tidak ditemukan, tambahkan di paling bawah
     if not injected:
-        log.warning("⚠️ Struktur 'Faktor:' tidak ditemukan. Menambahkan di bagian bawah deskripsi.")
+        log.warning("⚠️ Bagian 'Source' tidak ditemukan. Menambahkan di bagian paling bawah deskripsi.")
         lines.append(f"\n\n## Analisis AI (Incident Report)\n{incident_report}")
 
     new_desc = '\n'.join(lines)
@@ -116,7 +123,7 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
 
 
 async def run_receiver():
-    log.info("🎧 Receiver aktif (Mode: Inject Incident Report to Middle).")
+    log.info("🎧 Receiver aktif (Mode: Inject IR setelah Event).")
     
     env = {
         "IRIS_ENABLED": "true",
