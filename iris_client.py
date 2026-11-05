@@ -520,6 +520,54 @@ class IrisClient:
         else:
             await self._put(path, update)
 
+    # ============================================================
+    # FITUR BARU: GET & APPEND ALERT DESCRIPTION
+    # ============================================================
+    async def get_alert(self, alert_id: int) -> dict | None:
+        """Mengambil detail alert berdasarkan ID."""
+        path = self.paths["alert_update"].format(id=alert_id)
+        try:
+            return await self._get(path)
+        except Exception as e:
+            log.error("Gagal mengambil detail alert %s: %s", alert_id, e)
+            return None
+
+    async def append_alert_description(self, alert_id: int, text_to_append: str) -> bool:
+        """Mengambil deskripsi alert saat ini dan menambahkan teks baru di bagian bawah."""
+        current_alert = await self.get_alert(alert_id)
+        if not current_alert:
+            log.error("Gagal mendapatkan detail alert %s untuk di-append.", alert_id)
+            return False
+        
+        current_desc = current_alert.get("alert_description", "")
+        if not isinstance(current_desc, str):
+            current_desc = ""
+            
+        # Cek apakah teks sudah ada untuk menghindari duplikasi jika data masuk berulang
+        if text_to_append.strip() and text_to_append.strip() in current_desc:
+            log.info("ℹ️ Teks sudah ada di alert %s, melewati append.", alert_id)
+            return True
+            
+        # Tambahkan teks baru di bagian bawah (dengan 2 baris baru sebagai pemisah)
+        new_desc = current_desc + "\n\n" + text_to_append
+        
+        path = self.paths["alert_update"].format(id=alert_id)
+        update_payload = {
+            "alert_description": new_desc[:8000] # Batasi panjang maksimal sesuai batas IRIS
+        }
+        
+        try:
+            if self.api_version == "legacy":
+                await self._post(path, update_payload)
+            else:
+                await self._put(path, update_payload)
+            log.info("✅ Berhasil menambahkan teks ke deskripsi alert %s.", alert_id)
+            return True
+        except Exception as e:
+            log.error("❌ Gagal mengupdate deskripsi alert %s: %s", alert_id, e)
+            return False
+    # ============================================================
+
     async def delete_alert(self, alert_id: int) -> bool:
         path = self.paths["alert_delete"].format(id=alert_id)
         if self.api_version == "v2":
@@ -535,20 +583,14 @@ class IrisClient:
         d = await self._post(self.paths["case"], body)
         return d.get("case_id") or d.get("id")
 
-    # ============================================================
-    # PERBAIKAN UTAMA DI SINI
-    # ============================================================
     async def update_case_description(self, case_id: int, doc: dict) -> bool:
         current = await self._get(self.paths["case_read"].format(id=case_id))
-        
-        # Ambil deskripsi saat ini (IRIS kadang menggunakan 'case_description' atau 'description')
         current_description = current.get("case_description") or current.get("description", "")
         if not isinstance(current_description, str):
             current_description = ""
 
         updated_description = self.build_payload(doc)["alert_description"]
         
-        # Normalisasi spasi agar perbandingan lebih akurat
         if updated_description.strip() == current_description.strip():
             log.info("Case %s: Deskripsi tidak berubah, skip update untuk menghemat resource.", case_id)
             return False
@@ -556,7 +598,6 @@ class IrisClient:
         log.info("Case %s: Memulai pembaruan deskripsi...", case_id)
 
         if self.api_version == "v2":
-            # PERBAIKAN: Sertakan field-field penting agar API v2 tidak menolak request PUT
             update_payload = {
                 "case_description": updated_description,
                 "case_name": current.get("case_name") or current.get("name", "Unnamed Case"),
@@ -564,7 +605,6 @@ class IrisClient:
                 "case_soc_id": current.get("case_soc_id") or current.get("soc_id") or "",
                 "case_tags": current.get("case_tags") or "",
             }
-            # Tambahkan field opsional jika ada di response 'current'
             if "classification_id" in current:
                 update_payload["classification_id"] = current["classification_id"]
             if "owner_id" in current:
@@ -572,7 +612,6 @@ class IrisClient:
                 
             await self._put(self.paths["case_update"].format(id=case_id), update_payload)
         else:
-            # Payload untuk legacy (sudah benar di kode asli Anda)
             await self._post(self.paths["case_update"].format(id=case_id), {
                 "case_name": current.get("case_name") or current.get("name", "Unnamed Case"),
                 "case_soc_id": current.get("case_soc_id") or current.get("soc_id") or "",
