@@ -134,7 +134,7 @@ async def run_receiver():
                                 
                             # Kirim ke IRIS
                             log.info("📤 Memproses data (UUID: %s)...", doc.get("log_uuid"))
-                            alert_id = await iris_client.create_alert(doc)
+                            # alert_id = await iris_client.create_alert(doc)
                             
                             if alert_id:
                                 log.info("🎯 BERHASIL! Alert ID %s dibuat di IRIS.", alert_id)
