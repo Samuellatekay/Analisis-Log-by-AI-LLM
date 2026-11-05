@@ -543,17 +543,17 @@ class IrisClient:
         if not isinstance(current_desc, str):
             current_desc = ""
             
-        # Cek apakah teks sudah ada untuk menghindari duplikasi jika data masuk berulang
+        # Cek apakah teks sudah ada untuk menghindari duplikasi
         if text_to_append.strip() and text_to_append.strip() in current_desc:
             log.info("ℹ️ Teks sudah ada di alert %s, melewati append.", alert_id)
             return True
             
-        # Tambahkan teks baru di bagian bawah (dengan 2 baris baru sebagai pemisah)
+        # Tambahkan teks baru di bagian bawah
         new_desc = current_desc + "\n\n" + text_to_append
         
         path = self.paths["alert_update"].format(id=alert_id)
         update_payload = {
-            "alert_description": new_desc[:8000] # Batasi panjang maksimal sesuai batas IRIS
+            "alert_description": new_desc[:8000] 
         }
         
         try:
