@@ -40,21 +40,46 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
         resp = await iris_client._client.get("/api/v2/alerts", params={"per_page": 50, "page": 1, "sort": "alert_source_event_time:desc"})
         resp.raise_for_status()
         resp_json = resp.json()
+        
+        # IRIS API v2 biasanya mengembalikan {"data": [...], ...}
         alerts = resp_json.get("data", []) if isinstance(resp_json, dict) else resp_json
         
+        log.info("📊 Ditemukan %d alert dari IRIS API", len(alerts))
+        
         for alert in alerts:
-            a_id = alert.get("id")
-            source_ref = str(alert.get("alert_source_ref", ""))
-            desc = str(alert.get("alert_description", ""))
-            
-            # Cek kecocokan UUID
-            if str(log_uuid) == source_ref or str(log_uuid) in desc:
-                target_alert_id = a_id
-                log.info("✅ Alert DITEMUKAN! ID: %s", target_alert_id)
-                break
+            # IRIS API v2: id ada di alert["id"] atau alert["data"]["id"]
+            if isinstance(alert, dict):
+                a_id = alert.get("id")
+                # Coba ambil dari nested data jika perlu
+                if a_id is None and "data" in alert:
+                    a_id = alert["data"].get("id")
+                
+                source_ref = str(alert.get("alert_source_ref", ""))
+                if source_ref == "None":
+                    source_ref = ""
+                desc = str(alert.get("alert_description", ""))
+                title = str(alert.get("alert_title", ""))
+                
+                log.debug("🔎 Cek alert ID=%s, source_ref=%s, title=%s", a_id, source_ref[:50] if source_ref else "None", title[:50] if title else "None")
+                
+                # Cek kecocokan UUID di source_ref atau description
+                if log_uuid and (str(log_uuid) == source_ref or str(log_uuid) in desc):
+                    target_alert_id = a_id
+                    log.info("✅ Alert DITEMUKAN via SourceRef! ID: %s", target_alert_id)
+                    break
+                    
+                # Fallback: Cek di title
+                if log_uuid and str(log_uuid) in title:
+                    target_alert_id = a_id
+                    log.info("✅ Alert DITEMUKAN via Title! ID: %s", target_alert_id)
+                    break
+            else:
+                log.debug("⚠️ Alert bukan dict: %s", type(alert))
                 
     except Exception as e:
         log.error("❌ Gagal mencari alert di IRIS: %s", e)
+        import traceback
+        traceback.print_exc()
         return False
 
     if not target_alert_id:
@@ -71,8 +96,7 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
     if not isinstance(current_desc, str):
         current_desc = ""
 
-    # 4. Cek Duplikasi (Apakah laporan sudah pernah disisipkan?)
-    # Kita cek baris pertama dari incident_report (biasanya "# Incident Report (IR)")
+    # 4. Cek Duplikasi
     first_line_report = incident_report.split('\n')[0].strip()
     if first_line_report and first_line_report in current_desc:
         log.info("ℹ️ Laporan insiden sudah ada di alert %s. Melewati update.", target_alert_id)
@@ -82,19 +106,15 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
     lines = current_desc.split('\n')
     injected = False
     
-    # Cari baris yang mengandung "Faktor:"
     for i, line in enumerate(lines):
         if "Faktor:" in line and "kritikalitas aset" in line:
-            # Sisipkan tepat di bawah baris Faktor
-            # Tambahkan newline agar rapi sesuai contoh Anda
             lines.insert(i + 1, f"\n{incident_report}\n")
             injected = True
             log.info("📝 Laporan disisipkan setelah baris 'Faktor:' pada alert %s.", target_alert_id)
             break
 
-    # Fallback: Jika struktur "Faktor:" tidak ditemukan, taruh di paling atas setelah "Risiko" atau di bawah
     if not injected:
-        log.warning("⚠️ Struktur 'Faktor:' tidak ditemukan. Menambahkan di bagian bawah deskripsi.")
+        log.warning("️ Struktur 'Faktor:' tidak ditemukan. Menambahkan di bagian bawah deskripsi.")
         lines.append(f"\n\n## Analisis AI (Incident Report)\n{incident_report}")
 
     new_desc = '\n'.join(lines)
