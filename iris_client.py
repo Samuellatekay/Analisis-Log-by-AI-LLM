@@ -497,22 +497,38 @@ class IrisClient:
         return False
 
     # ============================================================
-    # FITUR BARU: MANAJEMEN ASSET
+    # FITUR BARU: MANAJEMEN ASSET (DIPERBAIKI)
     # ============================================================
     async def add_asset_to_alert(self, alert_id: int, asset_data: dict) -> bool:
         """Menambahkan asset ke alert agar muncul di tab Assets."""
         path = f"/api/v2/alerts/{alert_id}/assets"
+        
+        # DFIR-IRIS memerlukan asset_type_id (integer) untuk membuat asset baru.
+        # 1 = Server, 2 = Workstation, 3 = Firewall, 4 = Router, 5 = Switch, 6 = Other
+        asset_type_str = str(asset_data.get("type", "")).lower()
+        if "server" in asset_type_str or "database" in asset_type_str:
+            asset_type_id = 1
+        elif "linux" in asset_type_str or "windows" in asset_type_str or "pc" in asset_type_str or "workstation" in asset_type_str:
+            asset_type_id = 2
+        else:
+            asset_type_id = 6  # Other
+
         payload = {
-            "asset_name": asset_data.get("name", "Unknown"),
-            "asset_description": asset_data.get("description", ""),
-            "asset_tags": asset_data.get("tags", ""),
-            "asset_ip": asset_data.get("ip", ""),
+            "asset_name": asset_data.get("name", "Unknown")[:255],
+            "asset_description": asset_data.get("description", "")[:2000],
+            "asset_type_id": asset_type_id,
+            "asset_ip": asset_data.get("ip", "")[:255],
+            "asset_tags": asset_data.get("tags", "")[:255],
         }
+        
+        log.info("📦 Mencoba menambahkan asset ke alert %d: %s", alert_id, payload)
+        
         try:
             await self._post(path, payload)
+            log.info("✅ Asset %s berhasil ditambahkan ke alert %d", asset_data.get("name"), alert_id)
             return True
         except Exception as e:
-            log.error("❌ Gagal menambahkan asset ke alert %s: %s", alert_id, e)
+            log.error("❌ Gagal menambahkan asset ke alert %d: %s. Payload: %s", alert_id, e, payload)
             return False
 
     async def add_assets_to_alert(self, alert_id: int, doc: dict) -> int:
@@ -523,12 +539,13 @@ class IrisClient:
         
         # Tambahkan Source Asset
         source_asset = _d(source.get("asset"))
-        if source_asset and source_asset.get("found"):
-            items = source_asset.get("items", [source_asset])
+        if source_asset:
+            items = source_asset.get("items", [source_asset] if source_asset.get("name") else [])
             for item in items[:5]:
-                if isinstance(item, dict):
+                if isinstance(item, dict) and item.get("name"):
                     asset_data = {
                         "name": item.get("name", "Unknown"),
+                        "type": item.get("type", "Unknown"),
                         "description": item.get("description", ""),
                         "ip": item.get("ip") or _join_list(item.get("private_ip_addresses", [])),
                         "tags": f"GLPI-ID:{item.get('id')},source",
@@ -538,12 +555,13 @@ class IrisClient:
         
         # Tambahkan Destination Asset
         dest_asset = _d(destination.get("asset"))
-        if dest_asset and dest_asset.get("found"):
-            items = dest_asset.get("items", [dest_asset])
+        if dest_asset:
+            items = dest_asset.get("items", [dest_asset] if dest_asset.get("name") else [])
             for item in items[:5]:
-                if isinstance(item, dict):
+                if isinstance(item, dict) and item.get("name"):
                     asset_data = {
                         "name": item.get("name", "Unknown"),
+                        "type": item.get("type", "Unknown"),
                         "description": item.get("description", ""),
                         "ip": item.get("ip") or _join_list(item.get("private_ip_addresses", [])),
                         "tags": f"GLPI-ID:{item.get('id')},destination",
