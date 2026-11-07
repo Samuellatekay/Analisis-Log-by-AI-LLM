@@ -497,74 +497,22 @@ class IrisClient:
         return False
 
     # ============================================================
-    # FITUR BARU: MANAJEMEN ASSET (2-STEP API & FIXED LOGGER)
+    # FITUR BARU: MANAJEMEN ASSET
     # ============================================================
     async def add_asset_to_alert(self, alert_id: int, asset_data: dict) -> bool:
-        """Menambahkan asset ke alert (Create Asset -> Link to Alert)."""
-        import logging
-        # Gunakan logger standar agar log muncul di output aplikasi
-        std_log = logging.getLogger("analisis-log") 
-        
-        # 1. Tentukan asset_type_id
-        asset_type_str = str(asset_data.get("type", "")).lower()
-        if "server" in asset_type_str or "database" in asset_type_str:
-            asset_type_id = 1
-        elif "linux" in asset_type_str or "windows" in asset_type_str or "pc" in asset_type_str:
-            asset_type_id = 2
-        else:
-            asset_type_id = 6  # Other
-
-        # LANGKAH 1: Buat Asset Baru di IRIS
-        create_payload = {
-            "asset_name": asset_data.get("name", "Unknown")[:255],
-            "asset_description": asset_data.get("description", "")[:2000],
-            "asset_type_id": asset_type_id,
-            "asset_ip": asset_data.get("ip", "")[:255],
-            "asset_tags": asset_data.get("tags", "")[:255],
+        """Menambahkan asset ke alert agar muncul di tab Assets."""
+        path = f"/api/v2/alerts/{alert_id}/assets"
+        payload = {
+            "asset_name": asset_data.get("name", "Unknown"),
+            "asset_description": asset_data.get("description", ""),
+            "asset_tags": asset_data.get("tags", ""),
+            "asset_ip": asset_data.get("ip", ""),
         }
-        
-        std_log.info(f"📦 [IRIS] Membuat asset baru: {create_payload['asset_name']}")
-        
         try:
-            # POST ke /api/v2/manage/assets untuk membuat asset
-            create_path = "/api/v2/manage/assets"
-            # Gunakan _post manual karena path ini tidak ada di PATHS
-            for attempt in range(3):
-                try:
-                    r = await self._client.post(create_path, json=create_payload)
-                except Exception:
-                    if attempt == 2: raise
-                    await asyncio.sleep(1)
-                    continue
-                if r.status_code in RETRY_STATUS and attempt < 2:
-                    await asyncio.sleep(1)
-                    continue
-                break
-            
-            if r.status_code >= 400:
-                std_log.error(f"❌ [IRIS] Gagal membuat asset: {r.status_code} - {r.text[:200]}")
-                return False
-                
-            res_data = _unwrap(r.json())
-            asset_id = res_data.get("asset_id") or res_data.get("id")
-            
-            if not asset_id:
-                std_log.error(f"❌ [IRIS] Asset dibuat tapi tidak ada ID: {res_data}")
-                return False
-                
-            std_log.info(f"✅ [IRIS] Asset berhasil dibuat dengan ID: {asset_id}")
-
-            # LANGKAH 2: Hubungkan Asset ke Alert
-            link_payload = {"asset_id": asset_id}
-            link_path = f"/api/v2/alerts/{alert_id}/assets"
-            
-            std_log.info(f"🔗 [IRIS] Menghubungkan asset {asset_id} ke alert {alert_id}")
-            await self._post(link_path, link_payload)
-            std_log.info(f"✅ [IRIS] Asset {asset_data.get('name')} berhasil ditambahkan ke alert {alert_id}")
+            await self._post(path, payload)
             return True
-            
         except Exception as e:
-            std_log.error(f"❌ [IRIS] Error fatal saat memproses asset {asset_data.get('name')}: {e}")
+            log.error("❌ Gagal menambahkan asset ke alert %s: %s", alert_id, e)
             return False
 
     async def add_assets_to_alert(self, alert_id: int, doc: dict) -> int:
@@ -575,13 +523,12 @@ class IrisClient:
         
         # Tambahkan Source Asset
         source_asset = _d(source.get("asset"))
-        if source_asset:
-            items = source_asset.get("items", [source_asset] if source_asset.get("name") else [])
+        if source_asset and source_asset.get("found"):
+            items = source_asset.get("items", [source_asset])
             for item in items[:5]:
-                if isinstance(item, dict) and item.get("name"):
+                if isinstance(item, dict):
                     asset_data = {
                         "name": item.get("name", "Unknown"),
-                        "type": item.get("type", "Unknown"),
                         "description": item.get("description", ""),
                         "ip": item.get("ip") or _join_list(item.get("private_ip_addresses", [])),
                         "tags": f"GLPI-ID:{item.get('id')},source",
@@ -591,13 +538,12 @@ class IrisClient:
         
         # Tambahkan Destination Asset
         dest_asset = _d(destination.get("asset"))
-        if dest_asset:
-            items = dest_asset.get("items", [dest_asset] if dest_asset.get("name") else [])
+        if dest_asset and dest_asset.get("found"):
+            items = dest_asset.get("items", [dest_asset])
             for item in items[:5]:
-                if isinstance(item, dict) and item.get("name"):
+                if isinstance(item, dict):
                     asset_data = {
                         "name": item.get("name", "Unknown"),
-                        "type": item.get("type", "Unknown"),
                         "description": item.get("description", ""),
                         "ip": item.get("ip") or _join_list(item.get("private_ip_addresses", [])),
                         "tags": f"GLPI-ID:{item.get('id')},destination",
@@ -607,6 +553,7 @@ class IrisClient:
         
         return added_count
     # ============================================================
+
     async def create_alert(self, doc: dict) -> int | None:
         await self._ensure_ids()
         d = await self._post(self.paths["alert"], self.build_payload(doc))
