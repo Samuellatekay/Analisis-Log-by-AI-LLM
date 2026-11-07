@@ -174,7 +174,7 @@ def _format_geolocation(value: Any) -> list[str]:
 
 
 def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[str]:
-    # Deteksi aset GLPI lebih fleksibel
+    # Fungsi ini tetap ada untuk kompatibilitas, meskipun tidak lagi dipanggil di build_payload
     is_glpi_asset = (
         asset.get("inventory_source") == "GLPI" or 
         asset.get("found") is True or
@@ -323,6 +323,7 @@ class IrisClient:
             source_asset = _d(src.get("asset"))
             destination_asset = _d(destination.get("asset"))
 
+        # --- PERUBAHAN: Menghapus # Source dan # Destination dari deskripsi teks ---
         lines = [
             "# Risiko",
             f"- Skor: {risk.get('score')} ({level})",
@@ -333,11 +334,6 @@ class IrisClient:
             f"- IP sumber (kemungkinan penyerang): {source_label}",
             *([f"- Wazuh Level: {_display(ev.get('wazuh_level'), 30)}"] if is_wazuh else []),
             f"- IP tujuan (host yang diserang): {destination_label}",
-            "# Source",
-            *_format_asset(source_asset, src.get("ip"), None if src.get("ip") else agent_host),
-            "# Destination",
-            *_format_asset(destination_asset, destination.get("ip"),
-                           agent_host if (not destination_ip or destination_ip == agent_ip) else None),
             "# Threat Intelligence Enrichment",
         ]
         
@@ -500,10 +496,79 @@ class IrisClient:
             return self._parse(r, path)
         return False
 
+    # ============================================================
+    # FITUR BARU: MANAJEMEN ASSET
+    # ============================================================
+    async def add_asset_to_alert(self, alert_id: int, asset_data: dict) -> bool:
+        """Menambahkan asset ke alert agar muncul di tab Assets."""
+        path = f"/api/v2/alerts/{alert_id}/assets"
+        payload = {
+            "asset_name": asset_data.get("name", "Unknown"),
+            "asset_description": asset_data.get("description", ""),
+            "asset_tags": asset_data.get("tags", ""),
+            "asset_ip": asset_data.get("ip", ""),
+        }
+        try:
+            await self._post(path, payload)
+            return True
+        except Exception as e:
+            log.error("❌ Gagal menambahkan asset ke alert %s: %s", alert_id, e)
+            return False
+
+    async def add_assets_to_alert(self, alert_id: int, doc: dict) -> int:
+        """Menambahkan source dan destination assets ke alert."""
+        added_count = 0
+        source = _d(doc.get("source"))
+        destination = _d(doc.get("destination"))
+        
+        # Tambahkan Source Asset
+        source_asset = _d(source.get("asset"))
+        if source_asset and source_asset.get("found"):
+            items = source_asset.get("items", [source_asset])
+            for item in items[:5]:
+                if isinstance(item, dict):
+                    asset_data = {
+                        "name": item.get("name", "Unknown"),
+                        "description": item.get("description", ""),
+                        "ip": item.get("ip") or _join_list(item.get("private_ip_addresses", [])),
+                        "tags": f"GLPI-ID:{item.get('id')},source",
+                    }
+                    if await self.add_asset_to_alert(alert_id, asset_data):
+                        added_count += 1
+        
+        # Tambahkan Destination Asset
+        dest_asset = _d(destination.get("asset"))
+        if dest_asset and dest_asset.get("found"):
+            items = dest_asset.get("items", [dest_asset])
+            for item in items[:5]:
+                if isinstance(item, dict):
+                    asset_data = {
+                        "name": item.get("name", "Unknown"),
+                        "description": item.get("description", ""),
+                        "ip": item.get("ip") or _join_list(item.get("private_ip_addresses", [])),
+                        "tags": f"GLPI-ID:{item.get('id')},destination",
+                    }
+                    if await self.add_asset_to_alert(alert_id, asset_data):
+                        added_count += 1
+        
+        return added_count
+    # ============================================================
+
     async def create_alert(self, doc: dict) -> int | None:
         await self._ensure_ids()
         d = await self._post(self.paths["alert"], self.build_payload(doc))
-        return d.get("alert_id") or d.get("id")
+        alert_id = d.get("alert_id") or d.get("id")
+        
+        # Otomatis tambahkan assets ke tab Assets jika alert berhasil dibuat
+        if alert_id:
+            try:
+                asset_count = await self.add_assets_to_alert(alert_id, doc)
+                if asset_count > 0:
+                    log.info("✅ %d asset berhasil ditambahkan ke alert %d", asset_count, alert_id)
+            except Exception as e:
+                log.error("❌ Gagal menambahkan asset ke alert %d: %s", alert_id, e)
+        
+        return alert_id
 
     async def update_alert(self, alert_id: int, doc: dict) -> None:
         payload = self.build_payload(doc)
@@ -533,12 +598,8 @@ class IrisClient:
             return None
 
     async def update_alert_description(self, alert_id: int, new_description: str) -> bool:
-        """
-        Mengupdate seluruh deskripsi alert dengan string baru.
-        Digunakan untuk menyisipkan incident_report di tengah deskripsi.
-        """
+        """Mengupdate seluruh deskripsi alert dengan string baru."""
         path = self.paths["alert_update"].format(id=alert_id)
-        # Batasi panjang maksimal sesuai batas IRIS
         update_payload = {"alert_description": new_description[:16000]} 
         
         try:
