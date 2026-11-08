@@ -585,6 +585,14 @@ class IrisClient:
         else:
             await self._put(path, update)
 
+        # Diagnostik: cek apakah IRIS benar-benar menyimpan asset hasil update.
+        if "alert_assets" in update:
+            current = await self.get_alert(alert_id) or {}
+            stored = current.get("alert_assets") or current.get("assets")
+            names = [a.get("asset_name") or a.get("name") for a in stored if isinstance(a, dict)] if isinstance(stored, list) else stored
+            log.info("IRIS: alert %s: setelah update, asset tersimpan=%s (keys alert=%s)",
+                     alert_id, names, sorted(current.keys())[:40])
+
     # ============================================================
     # GET & UPDATE ALERT DESCRIPTION
     # ============================================================
