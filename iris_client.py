@@ -390,6 +390,7 @@ class IrisClient:
         self.assets_in_description = False
         self.sync_assets_enabled = True
         self.iocs_in_description = False
+        self.show_event = True
         self.ioc_type_ids: dict[str, int] = {}
         self._ioc_type_override: dict[str, int] = {}
         self.tlp_id: int | None = None
@@ -431,6 +432,7 @@ class IrisClient:
         obj.assets_in_description = env.get("IRIS_ASSETS_IN_DESCRIPTION", "false").lower() == "true"
         obj.sync_assets_enabled = env.get("IRIS_SYNC_ASSETS", "true").lower() == "true"
         obj.iocs_in_description = env.get("IRIS_IOCS_IN_DESCRIPTION", "false").lower() == "true"
+        obj.show_event = env.get("IRIS_SHOW_EVENT", "true").lower() == "true"
         for pair in filter(None, env.get("IRIS_IOC_TYPE_MAP", "").split(",")):
             k, _, v = pair.partition(":")
             obj._ioc_type_override[k.strip().lower()] = int(v)
@@ -493,13 +495,17 @@ class IrisClient:
             "# Risiko",
             f"- Skor: {risk.get('score')} ({level})",
             f"- Faktor: kritikalitas aset {risk.get('asset_criticality')}, severity {risk.get('event_severity')}, outcome {risk.get('event_outcome')}, ancaman {risk.get('threat_weight')}, pengulangan {risk.get('repeat_count')}",
-            "# Event",
-            f"- Deteksi: {what}",
-            f"- Hasil: {_display(ev.get('outcome'), 60) or 'Tidak tersedia'}",
-            f"- IP sumber (kemungkinan penyerang): {source_label}",
-            *([f"- Wazuh Level: {_display(ev.get('wazuh_level'), 30)}"] if is_wazuh else []),
-            f"- IP tujuan (host yang diserang): {destination_label}",
         ]
+        # Bagian "# Event" bisa disembunyikan lewat IRIS_SHOW_EVENT=false.
+        if self.show_event:
+            lines += [
+                "# Event",
+                f"- Deteksi: {what}",
+                f"- Hasil: {_display(ev.get('outcome'), 60) or 'Tidak tersedia'}",
+                f"- IP sumber (kemungkinan penyerang): {source_label}",
+                *([f"- Wazuh Level: {_display(ev.get('wazuh_level'), 30)}"] if is_wazuh else []),
+                f"- IP tujuan (host yang diserang): {destination_label}",
+            ]
         # Source/Destination hanya ditulis di Description jika toggle dinyalakan.
         if self.assets_in_description:
             lines += ["# Source", *src_lines, "# Destination", *dst_lines]
