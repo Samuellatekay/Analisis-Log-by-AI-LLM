@@ -496,19 +496,22 @@ class IrisClient:
             f"- Skor: {risk.get('score')} ({level})",
             f"- Faktor: kritikalitas aset {risk.get('asset_criticality')}, severity {risk.get('event_severity')}, outcome {risk.get('event_outcome')}, ancaman {risk.get('threat_weight')}, pengulangan {risk.get('repeat_count')}",
         ]
+        risk_lines = list(lines)
+        event_block = [
+            "# Event",
+            f"- Deteksi: {what}",
+            f"- Hasil: {_display(ev.get('outcome'), 60) or 'Tidak tersedia'}",
+            f"- IP sumber (kemungkinan penyerang): {source_label}",
+            *([f"- Wazuh Level: {_display(ev.get('wazuh_level'), 30)}"] if is_wazuh else []),
+            f"- IP tujuan (host yang diserang): {destination_label}",
+        ]
+        asset_block = ["# Source", *src_lines, "# Destination", *dst_lines]
         # Bagian "# Event" bisa disembunyikan lewat IRIS_SHOW_EVENT=false.
         if self.show_event:
-            lines += [
-                "# Event",
-                f"- Deteksi: {what}",
-                f"- Hasil: {_display(ev.get('outcome'), 60) or 'Tidak tersedia'}",
-                f"- IP sumber (kemungkinan penyerang): {source_label}",
-                *([f"- Wazuh Level: {_display(ev.get('wazuh_level'), 30)}"] if is_wazuh else []),
-                f"- IP tujuan (host yang diserang): {destination_label}",
-            ]
+            lines += event_block
         # Source/Destination hanya ditulis di Description jika toggle dinyalakan.
         if self.assets_in_description:
-            lines += ["# Source", *src_lines, "# Destination", *dst_lines]
+            lines += asset_block
         ti: list[str] = ["# Threat Intelligence Enrichment"]
 
         # Source/Destination dikirim sebagai asset -> tab "Assets" di IRIS.
@@ -588,7 +591,12 @@ class IrisClient:
 
         if self.iocs_in_description:
             lines.extend(ti)
-        lines.append(f"log_uuid: {doc.get('log_uuid')}")
+        uuid_line = f"log_uuid: {doc.get('log_uuid')}"
+        lines.append(uuid_line)
+        # Deskripsi lengkap (semua bagian, tanpa memedulikan toggle) disimpan di dalam
+        # alert_source_content supaya konsumen lain (mis. iris_stream) tetap menerima isi
+        # yang utuh walaupun tampilan Description di IRIS dibuat ringkas.
+        full_description = "\n".join([*risk_lines, *event_block, *asset_block, *ti, uuid_line])[:16000]
 
         tags = ["analisis_log", f"risk:{level}"]
 
@@ -597,6 +605,7 @@ class IrisClient:
             safe_doc = {"error": "Payload terlalu besar (>500KB), dipangkas untuk keamanan IRIS", "log_uuid": doc.get("log_uuid")}
         else:
             safe_doc = doc
+        safe_doc = {**safe_doc, "alert_description_full": full_description}
 
         payload: dict[str, Any] = {
             "alert_title": f"[{level.upper()}] {what} - {who}"[:250],

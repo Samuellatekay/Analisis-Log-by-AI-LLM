@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import httpx
 
 # ============================================================
@@ -27,9 +28,14 @@ POLL_INTERVAL = float(os.getenv("IRIS_POLL_INTERVAL", "5.0"))
 REQUEST_TIMEOUT = float(os.getenv("IRIS_REQUEST_TIMEOUT", "10.0"))
 EXTERNAL_POLL_INTERVAL = float(os.getenv("EXTERNAL_POLL_INTERVAL", "10.0"))
 
+# Jeda sebelum alert baru dikirim, supaya enrichment (GLPI/OpenCTI) yang masuk setelah alert
+# dibuat sudah ikut di deskripsi. 0 = kirim langsung saat pertama terlihat.
+SETTLE_SECONDS = float(os.getenv("IRIS_SETTLE_SECONDS", "10"))
+
 tcp_clients = set()
 http_stream_clients = set()
 seen_alerts = set()
+pending_alerts = {}   # alert_id -> waktu pertama kali terlihat (monotonic)
 MAX_SEEN_ALERTS = 100000
 
 logging.basicConfig(
@@ -113,13 +119,30 @@ async def receive_from_external_server() -> list:
 # PAYLOAD BUILDER
 # ============================================================
 
+def _source_content(detail_data):
+    """alert_source_content sebagai dict (bisa berupa dict atau string JSON)."""
+    asc = detail_data.get("alert_source_content")
+    if isinstance(asc, str):
+        try:
+            asc = json.loads(asc)
+        except ValueError:
+            return {}
+    return asc if isinstance(asc, dict) else {}
+
+
 def build_minimal_payload(detail_data):
     if isinstance(detail_data, dict) and "data" in detail_data:
         detail_data = detail_data["data"]
     if not detail_data or not isinstance(detail_data, dict):
         return {"alert_description": "Gagal mengambil detail"}
 
-    payload = {"alert_description": detail_data.get("alert_description", "")}
+    # Description di IRIS dibuat ringkas (Source/Destination ada di tab Assets, IOC di tab IOCs).
+    # Deskripsi lengkap (Event, Source, Destination, Threat Intelligence, Geolokasi, IOC terkait)
+    # disimpan oleh iris_client di alert_source_content["alert_description_full"].
+    asc_dict = _source_content(detail_data)
+    full_description = asc_dict.get("alert_description_full")
+    payload = {"alert_description": full_description or detail_data.get("alert_description", "")}
+
     raw_original = None
     if "original" in detail_data:
         if isinstance(detail_data["original"], str): raw_original = detail_data["original"]
@@ -127,7 +150,8 @@ def build_minimal_payload(detail_data):
             raw_original = detail_data["original"]["original"]
     if not raw_original and "alert_source_content" in detail_data:
         asc = detail_data["alert_source_content"]
-        if isinstance(asc, str): raw_original = asc
+        if isinstance(asc, str):
+            raw_original = asc_dict.get("original") or asc   # string JSON -> ambil field original-nya
         elif isinstance(asc, dict) and "original" in asc: raw_original = asc["original"]
 
     if raw_original: payload["original"] = raw_original
@@ -205,11 +229,11 @@ async def handle_client(reader, writer):
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
             await writer.drain(); writer.close(); return
 
-        # B. HTTP Stream Real-time (/stream) -> PERBAIKAN DI SINI
+        # B. HTTP Stream Real-time (/stream)
         if path == "/stream":
             log.info("🌐 HTTP Stream client terhubung: %s", peer)
             http_stream_clients.add(writer)
-            # UBAH Content-Type menjadi text/plain agar browser menampilkannya, bukan mendownload
+            # Content-Type text/plain agar browser menampilkannya, bukan mendownload
             header = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: keep-alive\r\n\r\n"
             writer.write(header)
             await writer.drain()
@@ -257,15 +281,23 @@ async def handle_client(reader, writer):
 # ============================================================
 
 async def iris_monitor():
-    log.info("Polling IRIS aktif...")
+    log.info("Polling IRIS aktif (jeda enrichment: %.0f detik)...", SETTLE_SECONDS)
     while True:
         try:
             alerts_list = await fetch_alert_list()
+            current = set()
             for alert_summary in alerts_list:
                 alert_id = alert_summary.get("id") or alert_summary.get("alert_id")
                 if not alert_id: continue
                 dedup_key = str(alert_id)
+                current.add(dedup_key)
                 if dedup_key in seen_alerts: continue
+
+                # Tunggu enrichment (GLPI/OpenCTI) selesai sebelum alert dikirim.
+                first_seen = pending_alerts.setdefault(dedup_key, time.monotonic())
+                if time.monotonic() - first_seen < SETTLE_SECONDS: continue
+                pending_alerts.pop(dedup_key, None)
+
                 seen_alerts.add(dedup_key)
                 log.info("🔍 Alert BARU (ID: %s). Mengambil detail...", alert_id)
                 
@@ -275,6 +307,8 @@ async def iris_monitor():
                     await broadcast_all(payload)
                     await send_to_external_server(payload)
                     log.info("✅ Alert %s diproses & dikirim.", alert_id)
+            for key in list(pending_alerts):
+                if key not in current: del pending_alerts[key]
             if len(seen_alerts) > MAX_SEEN_ALERTS: seen_alerts.clear()
         except Exception as e:
             log.exception("Error polling IRIS: %s", e)
