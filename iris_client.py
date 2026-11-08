@@ -6,10 +6,10 @@ Alert dibuat dari log berisiko tinggi dan konteks enrichment. Severity IRIS dite
 secara deterministik dari risk score.
 
 Source dan Destination tidak lagi ditulis di Description, tetapi dikirim sebagai
-`alert_assets` (tab "Assets" alert IRIS) saat alert dibuat. Karena IRIS v3 mengabaikan
-`alert_assets` pada update dan aset bersifat entitas bersama (managed asset), data GLPI
-yang datang belakangan disinkronkan ke managed asset lewat
-`/api/v2/manage/managed-assets` (lihat `IrisClient.sync_assets`).
+`alert_assets` (tab "Assets" alert IRIS) saat alert dibuat. IRIS v3 mengabaikan
+`alert_assets` pada update alert, jadi data GLPI yang datang belakangan disinkronkan lewat:
+  - PUT /api/v2/alerts/{alert}/assets/{asset}  -> aset di tab Assets alert (`sync_alert_assets`)
+  - PUT /api/v2/manage/managed-assets/{id}     -> aset bersama (`sync_assets`)
 """
 from __future__ import annotations
 
@@ -48,6 +48,7 @@ PATHS = {
         "case_note_directories": "/api/v2/cases/{id}/notes-directories",
         "probe": "/api/v2/cases",
         "managed_assets": "/api/v2/manage/managed-assets",
+        "alert_asset": "/api/v2/alerts/{alert_id}/assets/{id}",
         "severity_list": ["/api/v2/manage/severities"],
         "status_list": ["/api/v2/manage/alert-statuses", "/api/v2/manage/alert-status"]
     },
@@ -335,7 +336,8 @@ def _asset_targets(doc: dict) -> list[dict]:
                 "location": _display(item.get("location"), 150),
                 "ip": (str(priv[0]) if isinstance(priv, list) and priv else None) or _display(item.get("ip"), 80),
             }
-            targets.append({"candidates": cands, "fields": {k: v for k, v in fields.items() if v}})
+            targets.append({"candidates": cands, "glpi_lines": lines,
+                            "fields": {k: v for k, v in fields.items() if v}})
     return targets
 
 
@@ -649,22 +651,87 @@ class IrisClient:
                 "alert_severity_id", "alert_tags",
             )
         }
-        # alert_assets tidak dikirim saat update: IRIS mengabaikannya (terverifikasi lewat log).
+        # alert_assets diabaikan IRIS saat update; aset diperbarui lewat _safe_sync_assets().
         path = self.paths["alert_update"].format(id=alert_id)
         if self.api_version == "legacy":
             await self._post(path, update)
         else:
             await self._put(path, update)
-        await self._safe_sync_assets(doc)
+        await self._safe_sync_assets(doc, alert_id)
 
     # ============================================================
     # SINKRONISASI MANAGED ASSET (data GLPI -> aset IRIS)
     # ============================================================
-    async def _safe_sync_assets(self, doc: dict) -> None:
+    async def _safe_sync_assets(self, doc: dict, alert_id: int | None = None) -> None:
+        # sinkronisasi aset tidak boleh menggagalkan alert
         try:
             await self.sync_assets(doc)
-        except Exception as exc:  # sinkronisasi aset tidak boleh menggagalkan alert
-            log.warning("IRIS: sinkronisasi aset gagal (%s): %s", type(exc).__name__, exc)
+        except Exception as exc:
+            log.warning("IRIS: sinkronisasi managed asset gagal (%s): %s", type(exc).__name__, exc)
+        if alert_id is not None:
+            try:
+                await self.sync_alert_assets(alert_id, doc)
+            except Exception as exc:
+                log.warning("IRIS: sinkronisasi aset alert %s gagal (%s): %s", alert_id, type(exc).__name__, exc)
+
+    async def sync_alert_assets(self, alert_id: int, doc: dict) -> int:
+        """Perbarui aset di tab Assets alert (deskripsi GLPI) lewat PUT /alerts/{id}/assets/{id}."""
+        tpl = self.paths.get("alert_asset")
+        if not (self.sync_assets_enabled and tpl):
+            return 0
+        if hasattr(doc, "doc") and isinstance(doc.doc, dict):
+            doc = doc.doc
+        targets = _asset_targets(doc if isinstance(doc, dict) else {})
+        if not targets:
+            return 0
+        sig = f"alert:{alert_id}:" + hashlib.sha1(orjson.dumps(targets, option=orjson.OPT_SORT_KEYS)).hexdigest()
+        if sig in self._asset_sync_done:
+            return 0
+
+        async with self._asset_sync_lock:
+            if sig in self._asset_sync_done:
+                return 0
+            alert = await self.get_alert(alert_id) or {}
+            assets = [a for a in (alert.get("assets") or []) if isinstance(a, dict) and a.get("asset_id") is not None]
+            updated, complete, used = 0, True, set()
+            for t in targets:
+                cands = {c.lower() for c in t["candidates"]}
+                a = next((x for x in assets if x["asset_id"] not in used and (
+                    str(x.get("asset_name") or "").lower() in cands
+                    or str(x.get("asset_ip") or "").lower() in cands)), None)
+                if a is None:
+                    complete = False
+                    log.info("IRIS: alert %s: aset untuk %s belum ditemukan", alert_id, t["candidates"][:3])
+                    continue
+                used.add(a["asset_id"])
+                tag = str(a.get("asset_tags") or "").lower()
+                role = ("Source (kemungkinan penyerang)" if "source" in tag
+                        else "Destination (host yang diserang)" if "destination" in tag else "")
+                new_desc = ((role + "\n") if role else "") + "\n".join(t["glpi_lines"])
+                if (a.get("asset_description") or "") == new_desc:
+                    continue
+                body = {
+                    "asset_name": a.get("asset_name"),
+                    "asset_type_id": a.get("asset_type_id"),
+                    "asset_description": new_desc,
+                    "asset_ip": a.get("asset_ip") or t["fields"].get("ip") or "",
+                    "asset_domain": a.get("asset_domain") or "",
+                    "asset_tags": a.get("asset_tags") or "",
+                }
+                if a.get("asset_enrichment") is not None:
+                    body["asset_enrichment"] = a["asset_enrichment"]
+                path = tpl.format(alert_id=alert_id, id=a["asset_id"])
+                r = await self._client.put(path, json=body)
+                if r.status_code >= 400:
+                    log.warning("IRIS %s -> HTTP %s: %s", path, r.status_code, r.text[:300].replace("\n", " "))
+                    r.raise_for_status()
+                updated += 1
+                log.info("IRIS: alert %s: aset %s (%s) diperbarui dengan data GLPI", alert_id, a["asset_id"], a.get("asset_name"))
+            if complete:
+                if len(self._asset_sync_done) > 5000:
+                    self._asset_sync_done.clear()
+                self._asset_sync_done.add(sig)
+            return updated
 
     async def _save_managed_asset(self, path: str, body: dict) -> dict:
         try:
