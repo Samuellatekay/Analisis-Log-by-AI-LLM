@@ -629,8 +629,15 @@ class IrisClient:
         doc = doc if isinstance(doc, dict) else {}
         observables = _d(doc.get("enrichment")).get("observables") or []
         if not isinstance(observables, list):
-            return []
+            observables = []
         src_ip = str(_d(doc.get("source")).get("ip") or "")
+        # IP sumber/tujuan selalu jadi IOC, walau enrichment (observables) belum datang,
+        # supaya update berikutnya punya IOC yang bisa diisi data OpenCTI/geolokasi.
+        known = {str(o.get("value") or "").strip().lower() for o in observables if isinstance(o, dict)}
+        base = [{"entity_type": "IPv4-Addr", "value": str(ip)}
+                for ip in (src_ip, _d(doc.get("destination")).get("ip"))
+                if ip and str(ip).strip().lower() not in known]
+        observables = [*base, *observables]
         rep = _d(doc.get("reputation"))
         rep_ip = str(rep.get("ip") or rep.get("value") or "")
         geo = doc.get("geolocation")
@@ -761,6 +768,11 @@ class IrisClient:
     async def create_alert(self, doc: dict) -> int | None:
         await self._ensure_ids()
         payload = self.build_payload(doc)
+        if payload.get("alert_iocs"):
+            log.info("IRIS: membuat alert dengan %d IOC", len(payload["alert_iocs"]))
+        else:
+            log.warning("IRIS: alert dibuat TANPA alert_iocs (tipe IOC dikenali=%s, tlp_id=%s)",
+                        sorted(self.ioc_type_ids), self.tlp_id)
         try:
             d = await self._post(self.paths["alert"], payload)
         except httpx.HTTPStatusError as exc:
