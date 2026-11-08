@@ -365,8 +365,6 @@ class IrisClient:
         dst_host = agent_host if (not destination_ip or destination_ip == agent_ip) else None
         src_lines = _format_asset(source_asset, src.get("ip"), src_host)
         dst_lines = _format_asset(destination_asset, destination.get("ip"), dst_host)
-        log.info("IRIS assets debug: source_asset keys=%s | destination_asset keys=%s | doc.asset keys=%s",
-                 list(source_asset.keys()), list(destination_asset.keys()), list(asset.keys()))
 
         lines = [
             "# Risiko",
@@ -572,26 +570,12 @@ class IrisClient:
                 "alert_severity_id", "alert_tags",
             )
         }
-        # Enrichment GLPI sering baru tersedia setelah alert dibuat. Asset hanya
-        # dikirim ulang jika sekarang ada yang cocok di GLPI, supaya asset yang
-        # sudah terisi tidak ditimpa dengan hasil "tidak ada aset".
-        assets = payload.get("alert_assets") or []
-        if any("Tidak ada aset GLPI" not in a["asset_description"] for a in assets):
-            update["alert_assets"] = assets
-            log.info("IRIS: alert %s: alert_assets ikut diupdate (%d asset)", alert_id, len(assets))
+        # alert_assets tidak dikirim saat update: IRIS mengabaikannya (terverifikasi lewat log).
         path = self.paths["alert_update"].format(id=alert_id)
         if self.api_version == "legacy":
             await self._post(path, update)
         else:
             await self._put(path, update)
-
-        # Diagnostik: cek apakah IRIS benar-benar menyimpan asset hasil update.
-        if "alert_assets" in update:
-            current = await self.get_alert(alert_id) or {}
-            stored = current.get("alert_assets") or current.get("assets")
-            names = [a.get("asset_name") or a.get("name") for a in stored if isinstance(a, dict)] if isinstance(stored, list) else stored
-            log.info("IRIS: alert %s: setelah update, asset tersimpan=%s (keys alert=%s)",
-                     alert_id, names, sorted(current.keys())[:40])
 
     # ============================================================
     # GET & UPDATE ALERT DESCRIPTION
