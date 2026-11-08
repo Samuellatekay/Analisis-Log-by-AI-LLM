@@ -365,6 +365,8 @@ class IrisClient:
         dst_host = agent_host if (not destination_ip or destination_ip == agent_ip) else None
         src_lines = _format_asset(source_asset, src.get("ip"), src_host)
         dst_lines = _format_asset(destination_asset, destination.get("ip"), dst_host)
+        log.info("IRIS assets debug: source_asset keys=%s | destination_asset keys=%s | doc.asset keys=%s",
+                 list(source_asset.keys()), list(destination_asset.keys()), list(asset.keys()))
 
         lines = [
             "# Risiko",
