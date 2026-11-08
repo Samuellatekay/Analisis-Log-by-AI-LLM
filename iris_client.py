@@ -77,7 +77,7 @@ def _md_escape(v: Any, n: int = 300) -> str:
     s = _short(v, n)
     for ch in ("<", ">", "`", "|", "*", "[", "]"):
         s = s.replace(ch, " ")
-    return s.replace("\n", " ")
+    return s.replace("\r", " ").replace("\n", " ")
 
 
 def _display(v: Any, n: int = 300) -> str | None:
