@@ -10,12 +10,18 @@ Source dan Destination tidak lagi ditulis di Description, tetapi dikirim sebagai
 `alert_assets` pada update alert, jadi data GLPI yang datang belakangan disinkronkan lewat:
   - PUT /api/v2/alerts/{alert}/assets/{asset}  -> aset di tab Assets alert (`sync_alert_assets`)
   - PUT /api/v2/manage/managed-assets/{id}     -> aset bersama (`sync_assets`)
+
+Threat Intelligence, Geolokasi, dan IOC terkait tidak lagi ditulis di Description, tetapi
+dikirim sebagai `alert_iocs` (tab "IOCs"): satu IOC per observable, dengan reputasi OpenCTI dan
+geolokasi di deskripsi/enrichment IOC. Pembaruan belakangan lewat `sync_alert_iocs`.
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import logging
+import re
 import ssl
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -35,7 +41,8 @@ PATHS = {
         "case_update": "/manage/cases/update/{id}", "case_delete": "/manage/cases/delete/{id}",
         "case_note": "/case/notes/add",
         "probe": "/manage/cases/list",
-        "severity_list": ["/manage/severities/list"], "status_list": ["/manage/alert-status/list"]
+        "severity_list": ["/manage/severities/list"], "status_list": ["/manage/alert-status/list"],
+        "ioc_type_list": ["/manage/ioc-types/list"], "tlp_list": ["/manage/tlp/list"],
     },
     "v2": {
         "alert": "/api/v2/alerts", "alert_update": "/api/v2/alerts/{id}",
@@ -49,6 +56,8 @@ PATHS = {
         "probe": "/api/v2/cases",
         "managed_assets": "/api/v2/manage/managed-assets",
         "alert_asset": "/api/v2/alerts/{alert_id}/assets/{id}",
+        "alert_ioc": "/api/v2/alerts/{alert_id}/iocs/{id}",
+        "ioc_type_list": ["/api/v2/manage/case-objects/ioc-types"], "tlp_list": ["/api/v2/manage/tlp"],
         "severity_list": ["/api/v2/manage/severities"],
         "status_list": ["/api/v2/manage/alert-statuses", "/api/v2/manage/alert-status"]
     },
@@ -341,6 +350,30 @@ def _asset_targets(doc: dict) -> list[dict]:
     return targets
 
 
+def _ioc_kind(entity_type: Any, value: Any) -> str | None:
+    """Petakan observable ke jenis IOC IRIS: ip | domain | url | sha256 | sha1 | md5 | filename."""
+    t, v = str(entity_type or "").lower(), str(value or "").strip()
+    if not v or t in ("host-name", "hostname", "host"):
+        return None
+    try:
+        ipaddress.ip_address(v)
+        return "ip"
+    except ValueError:
+        pass
+    if "ipv4" in t or "ipv6" in t:
+        return "ip"
+    if "domain" in t:
+        return "domain"
+    if "url" in t:
+        return "url"
+    for kind, n in (("sha256", 64), ("sha1", 40), ("md5", 32)):
+        if len(v) == n and re.fullmatch(r"[0-9a-fA-F]+", v):
+            return kind
+    if "file" in t:
+        return "filename"
+    return None
+
+
 class IrisClient:
     def __init__(self, url: str, api_key: str, customer_id: int, verify: bool | ssl.SSLContext,
                  timeout_s: float, severity_map: dict[str, int], status_id: int | None,
@@ -356,6 +389,10 @@ class IrisClient:
         self.asset_type_id = 1
         self.assets_in_description = False
         self.sync_assets_enabled = True
+        self.iocs_in_description = False
+        self.ioc_type_ids: dict[str, int] = {}
+        self._ioc_type_override: dict[str, int] = {}
+        self.tlp_id: int | None = None
         self._asset_sync_done: set[str] = set()
         self._asset_sync_lock = asyncio.Lock()
         self._ids_ready = False
@@ -393,6 +430,12 @@ class IrisClient:
         obj.asset_type_id = int(env.get("IRIS_ASSET_TYPE_ID", "1") or 1)
         obj.assets_in_description = env.get("IRIS_ASSETS_IN_DESCRIPTION", "false").lower() == "true"
         obj.sync_assets_enabled = env.get("IRIS_SYNC_ASSETS", "true").lower() == "true"
+        obj.iocs_in_description = env.get("IRIS_IOCS_IN_DESCRIPTION", "false").lower() == "true"
+        for pair in filter(None, env.get("IRIS_IOC_TYPE_MAP", "").split(",")):
+            k, _, v = pair.partition(":")
+            obj._ioc_type_override[k.strip().lower()] = int(v)
+        tlp = env.get("IRIS_IOC_TLP_ID", "").strip()
+        obj.tlp_id = int(tlp) if tlp else None
         return obj
 
     def allows(self, doc: dict) -> bool:
@@ -460,7 +503,7 @@ class IrisClient:
         # Source/Destination hanya ditulis di Description jika toggle dinyalakan.
         if self.assets_in_description:
             lines += ["# Source", *src_lines, "# Destination", *dst_lines]
-        lines.append("# Threat Intelligence Enrichment")
+        ti: list[str] = ["# Threat Intelligence Enrichment"]
 
         # Source/Destination dikirim sebagai asset -> tab "Assets" di IRIS.
         alert_assets: list[dict] = []
@@ -515,14 +558,14 @@ class IrisClient:
             summary_parts.append(f"Hash/File: {', '.join(enriched_iocs['Hash/File'][:3])}")
 
         if summary_parts:
-            lines.append(f"- IOC : {' | '.join(summary_parts)}")
+            ti.append(f"- IOC : {' | '.join(summary_parts)}")
         elif source_ip:
-            lines.append(f"- IP Sumber: {source_ip} (Tidak ditemukan dalam database OpenCTI)")
+            ti.append(f"- IP Sumber: {source_ip} (Tidak ditemukan dalam database OpenCTI)")
 
-        lines.extend(_format_reputation(doc.get("reputation"), observables))
-        lines.append("# Geolokasi")
-        lines.extend(_format_geolocation(doc.get("geolocation")))
-        lines.append("# IOC terkait")
+        ti.extend(_format_reputation(doc.get("reputation"), observables))
+        ti.append("# Geolokasi")
+        ti.extend(_format_geolocation(doc.get("geolocation")))
+        ti.append("# IOC terkait")
 
         shown_ioc = False
         if isinstance(observables, list) and observables:
@@ -531,12 +574,14 @@ class IrisClient:
                 e_type = _display(obs.get("entity_type"), 40)
                 e_val = _display(obs.get("value"), 180)
                 if e_type and e_val and e_type.lower() not in ("host-name", "hostname", "host"):
-                    lines.append(f"- {e_type}: {e_val}")
+                    ti.append(f"- {e_type}: {e_val}")
                     shown_ioc = True
 
         if not shown_ioc:
-            lines.append("- Detail IOC tidak tersedia.")
+            ti.append("- Detail IOC tidak tersedia.")
 
+        if self.iocs_in_description:
+            lines.extend(ti)
         lines.append(f"log_uuid: {doc.get('log_uuid')}")
 
         tags = ["analisis_log", f"risk:{level}"]
@@ -559,11 +604,88 @@ class IrisClient:
             "alert_tags": ",".join(tags),
             "alert_assets": alert_assets,
         }
+        alert_iocs = self._build_alert_iocs(doc)
+        if alert_iocs:
+            payload["alert_iocs"] = alert_iocs
         if self.source_link_tpl:
             payload["alert_source_link"] = self.source_link_tpl.format(log_uuid=doc.get("log_uuid"))
         if self.status_id is not None:
             payload["alert_status_id"] = self.status_id
         return payload
+
+    def _ioc_type_id(self, kind: str, is_source: bool = False) -> int | None:
+        ids = self.ioc_type_ids
+        order = {
+            "ip": ["ip-src", "ip-dst"] if is_source else ["ip-dst", "ip-src"],
+            "domain": ["domain", "hostname"], "url": ["url"], "sha256": ["sha256"],
+            "sha1": ["sha1"], "md5": ["md5"], "filename": ["filename"],
+        }.get(kind, [])
+        return next((ids[n] for n in order if n in ids), None)
+
+    def _build_alert_iocs(self, doc: dict) -> list[dict]:
+        """Satu IOC per observable, dengan reputasi OpenCTI + geolokasi di deskripsi/enrichment."""
+        if not self.ioc_type_ids or self.tlp_id is None:
+            return []
+        doc = doc if isinstance(doc, dict) else {}
+        observables = _d(doc.get("enrichment")).get("observables") or []
+        if not isinstance(observables, list):
+            return []
+        src_ip = str(_d(doc.get("source")).get("ip") or "")
+        rep = _d(doc.get("reputation"))
+        rep_ip = str(rep.get("ip") or rep.get("value") or "")
+        geo = doc.get("geolocation")
+        geo_ok = isinstance(geo, dict) and bool(geo) and geo.get("available") is not False
+
+        out: list[dict] = []
+        seen: set[str] = set()
+        geo_done = False
+        for obs in observables[:50]:
+            if not isinstance(obs, dict):
+                continue
+            value = str(obs.get("value") or "").strip()
+            kind = _ioc_kind(obs.get("entity_type"), value)
+            if not kind or value.lower() in seen:
+                continue
+            is_src = bool(src_ip) and value == src_ip
+            type_id = self._ioc_type_id(kind, is_src)
+            if type_id is None:
+                continue
+            seen.add(value.lower())
+
+            rep_here = rep if (rep and rep_ip and rep_ip == value) else {}
+            rep_lines = _format_reputation(rep_here, [obs])
+            if rep_lines == ["- Data reputasi belum tersedia."]:
+                rep_lines = ["- Belum ada data OpenCTI untuk IOC ini."]
+            lines = ["Threat Intelligence (OpenCTI):", *rep_lines]
+
+            enr: dict[str, Any] = {}
+            opencti = obs.get("opencti")
+            if isinstance(opencti, dict) and opencti:
+                enr["opencti"] = opencti
+            elif rep_here:
+                enr["opencti"] = rep_here
+
+            use_geo = geo_ok and kind == "ip" and not geo_done and (is_src or not src_ip)
+            if use_geo:
+                geo_done = True
+                lines += ["Geolokasi:", *_format_geolocation(geo)]
+                enr["geolocation"] = geo
+            if enr:
+                enr = orjson.loads(orjson.dumps(enr, default=str))
+                if len(orjson.dumps(enr)) > 20_000:
+                    enr = {}
+
+            ioc = {
+                "ioc_value": value[:1000],
+                "ioc_type_id": type_id,
+                "ioc_tlp_id": self.tlp_id,
+                "ioc_description": "\n".join(lines)[:3000],
+                "ioc_tags": "analisis_log",
+            }
+            if enr:
+                ioc["ioc_enrichment"] = enr
+            out.append(ioc)
+        return out
 
     def _parse(self, r: httpx.Response, path: str) -> dict:
         if r.status_code >= 400:
@@ -638,7 +760,16 @@ class IrisClient:
 
     async def create_alert(self, doc: dict) -> int | None:
         await self._ensure_ids()
-        d = await self._post(self.paths["alert"], self.build_payload(doc))
+        payload = self.build_payload(doc)
+        try:
+            d = await self._post(self.paths["alert"], payload)
+        except httpx.HTTPStatusError as exc:
+            if not payload.get("alert_iocs") or exc.response.status_code not in (400, 422):
+                raise
+            log.warning("IRIS: alert ditolak dengan alert_iocs (HTTP %s); diulang tanpa IOC. "
+                        "Cek IRIS_IOC_TYPE_MAP / IRIS_IOC_TLP_ID.", exc.response.status_code)
+            payload.pop("alert_iocs")
+            d = await self._post(self.paths["alert"], payload)
         await self._safe_sync_assets(doc)
         return d.get("alert_id") or d.get("id")
 
@@ -673,6 +804,67 @@ class IrisClient:
                 await self.sync_alert_assets(alert_id, doc)
             except Exception as exc:
                 log.warning("IRIS: sinkronisasi aset alert %s gagal (%s): %s", alert_id, type(exc).__name__, exc)
+            try:
+                await self.sync_alert_iocs(alert_id, doc)
+            except Exception as exc:
+                log.warning("IRIS: sinkronisasi IOC alert %s gagal (%s): %s", alert_id, type(exc).__name__, exc)
+
+    async def sync_alert_iocs(self, alert_id: int, doc: dict) -> int:
+        """Perbarui IOC alert yang sudah ada (deskripsi/enrichment) lewat PUT /alerts/{id}/iocs/{id}."""
+        tpl = self.paths.get("alert_ioc")
+        if not (self.sync_assets_enabled and tpl):
+            return 0
+        if hasattr(doc, "doc") and isinstance(doc.doc, dict):
+            doc = doc.doc
+        await self._ensure_ids()
+        desired = self._build_alert_iocs(doc if isinstance(doc, dict) else {})
+        if not desired:
+            return 0
+        sig = f"alert-ioc:{alert_id}:" + hashlib.sha1(orjson.dumps(desired, option=orjson.OPT_SORT_KEYS)).hexdigest()
+        if sig in self._asset_sync_done:
+            return 0
+
+        async with self._asset_sync_lock:
+            if sig in self._asset_sync_done:
+                return 0
+            alert = await self.get_alert(alert_id) or {}
+            existing = {
+                str(i.get("ioc_value") or i.get("value") or "").lower(): i
+                for i in (alert.get("iocs") or []) if isinstance(i, dict)
+            }
+            updated, complete = 0, True
+            for want in desired:
+                cur = existing.get(want["ioc_value"].lower())
+                ioc_id = (cur or {}).get("ioc_id") or (cur or {}).get("id")
+                if ioc_id is None:
+                    complete = False
+                    log.info("IRIS: alert %s: IOC %s belum ada di alert (tidak bisa ditambah lewat update)",
+                             alert_id, want["ioc_value"])
+                    continue
+                if ((cur.get("ioc_description") or "") == want["ioc_description"]
+                        and (cur.get("ioc_enrichment") or None) == want.get("ioc_enrichment")):
+                    continue
+                body = {
+                    "ioc_value": want["ioc_value"],
+                    "ioc_type_id": cur.get("ioc_type_id") or want["ioc_type_id"],
+                    "ioc_tlp_id": cur.get("ioc_tlp_id") or want["ioc_tlp_id"],
+                    "ioc_description": want["ioc_description"],
+                    "ioc_tags": cur.get("ioc_tags") or want["ioc_tags"],
+                }
+                if want.get("ioc_enrichment"):
+                    body["ioc_enrichment"] = want["ioc_enrichment"]
+                path = tpl.format(alert_id=alert_id, id=ioc_id)
+                r = await self._client.put(path, json=body)
+                if r.status_code >= 400:
+                    log.warning("IRIS %s -> HTTP %s: %s", path, r.status_code, r.text[:300].replace("\n", " "))
+                    r.raise_for_status()
+                updated += 1
+                log.info("IRIS: alert %s: IOC %s diperbarui", alert_id, want["ioc_value"])
+            if complete:
+                if len(self._asset_sync_done) > 5000:
+                    self._asset_sync_done.clear()
+                self._asset_sync_done.add(sig)
+            return updated
 
     async def sync_alert_assets(self, alert_id: int, doc: dict) -> int:
         """Perbarui aset di tab Assets alert (deskripsi GLPI) lewat PUT /alerts/{id}/assets/{id}."""
@@ -993,6 +1185,18 @@ class IrisClient:
                         log.info("IRIS: alert_status_id otomatis = %s", pick)
                     else:
                         log.warning("IRIS: status alert 'New' tidak ditemukan otomatis; set IRIS_STATUS_ID di .env")
+                if self.paths.get("ioc_type_list") and not self.ioc_type_ids:
+                    types = await self._list(self.paths["ioc_type_list"])
+                    self.ioc_type_ids = {n.strip().lower(): i for i, n in types if n}
+                if self._ioc_type_override:
+                    self.ioc_type_ids.update(self._ioc_type_override)
+                if self.tlp_id is None and self.paths.get("tlp_list"):
+                    tl = await self._list(self.paths["tlp_list"])
+                    self.tlp_id = next((i for i, n in tl if n.strip().lower() == "amber"), tl[0][0] if tl else None)
+                if self.ioc_type_ids:
+                    log.info("IRIS: tipe IOC dikenali = %s, tlp_id = %s", sorted(self.ioc_type_ids)[:12], self.tlp_id)
+                else:
+                    log.warning("IRIS: tipe IOC tidak ditemukan otomatis; isi IRIS_IOC_TYPE_MAP di .env (alert_iocs dinonaktifkan)")
                 if not self._severity_explicit:
                     by_name = {n.strip().lower(): i for i, n in await self._list(self.paths["severity_list"])}
                     found = {lvl: by_name[lvl] for lvl in ("low", "medium", "high", "critical") if lvl in by_name}
