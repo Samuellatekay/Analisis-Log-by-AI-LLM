@@ -4,6 +4,9 @@ iris_client.py - Integrasi DFIR-IRIS (REST API: POST {IRIS_URL}/alerts/add, auth
 
 Alert dibuat dari log berisiko tinggi dan konteks enrichment. Severity IRIS ditentukan
 secara deterministik dari risk score.
+
+Source dan Destination tidak lagi ditulis di Description, tetapi dikirim sebagai
+`alert_assets` sehingga muncul di tab "Assets" pada alert IRIS.
 """
 from __future__ import annotations
 
@@ -57,7 +60,8 @@ def _unwrap(j) -> dict:
         return {}
     d = j.get("data")
     return d if isinstance(d, dict) else j
-    
+
+
 DEFAULT_SEVERITY_MAP = {"low": 3, "medium": 4, "high": 5, "critical": 6}
 
 
@@ -97,7 +101,7 @@ def _join_list(val: Any) -> str:
 def _format_reputation(value: Any, observables: list | None = None) -> list[str]:
     """Format reputasi dengan fallback ke observables jika doc.reputation kosong."""
     reputation = _d(value)
-    
+
     if not reputation and isinstance(observables, list):
         for obs in observables:
             if not isinstance(obs, dict):
@@ -119,22 +123,22 @@ def _format_reputation(value: Any, observables: list | None = None) -> list[str]
                     "indicators": [],
                 }
                 break
-    
+
     if not reputation:
         return ["- Data reputasi belum tersedia."]
-    
+
     lines = []
     score = _display(reputation.get("opencti_score"), 30)
     verdict = _display(reputation.get("verdict"), 40)
     if score or verdict:
         lines.append(f"- Skor OpenCTI: {score or 0}/100 - Verdict: {verdict or 'unknown'}.")
-        
+
     labels = reputation.get("labels")
     if isinstance(labels, list) and labels:
         shown = [_display(label, 80) for label in labels[:8] if label]
         if shown:
             lines.append(f"- Label: {', '.join(shown)}.")
-            
+
     authors = []
     inds = reputation.get("indicators") or []
     if isinstance(inds, list):
@@ -143,7 +147,7 @@ def _format_reputation(value: Any, observables: list | None = None) -> list[str]
                 author = ind.get("created_by") or ind.get("author")
                 if isinstance(author, dict): author = author.get("name")
                 if author and author not in authors: authors.append(str(author))
-    
+
     if not authors and isinstance(observables, list):
         for obs in observables:
             if not isinstance(obs, dict): continue
@@ -153,7 +157,7 @@ def _format_reputation(value: Any, observables: list | None = None) -> list[str]
                     author = ind.get("created_by") or ind.get("author")
                     if isinstance(author, dict): author = author.get("name")
                     if author and author not in authors: authors.append(str(author))
-    
+
     author_str = " | ".join(authors[:5]) if authors else "Tidak tersedia"
     lines.append(f"- Author: {author_str}.")
     return lines
@@ -163,7 +167,7 @@ def _format_geolocation(value: Any) -> list[str]:
     geo = _d(value)
     if not geo or geo.get("available") is False:
         return ["- Data geolokasi belum tersedia."]
-        
+
     fields = (
         ("Lokasi", ", ".join(str(p) for p in (geo.get("city"), geo.get("region"), geo.get("country_name")) if p)),
         ("ISP", geo.get("isp") or geo.get("org")),
@@ -177,9 +181,9 @@ def _format_geolocation(value: Any) -> list[str]:
 def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[str]:
     # Deteksi aset GLPI lebih fleksibel
     is_glpi_asset = (
-        asset.get("inventory_source") == "GLPI" or 
+        asset.get("inventory_source") == "GLPI" or
         asset.get("found") is True or
-        isinstance(asset.get("id"), int) or 
+        isinstance(asset.get("id"), int) or
         bool(asset.get("glpi_id")) or
         isinstance(asset.get("items"), list)
     )
@@ -187,7 +191,7 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[st
     if not is_glpi_asset:
         searched_ip = _display(asset.get("ip") or source_ip, 80)
         searched_host = _display(asset.get("host_name") or host_name, 80)
-        
+
         if searched_ip and searched_host:
             lines = [f"- Tidak ada aset GLPI yang cocok dengan IP {searched_ip} maupun hostname {searched_host}."]
         elif searched_ip:
@@ -196,22 +200,22 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[st
             lines = [f"- Tidak ada aset GLPI yang cocok dengan hostname {searched_host}."]
         else:
             lines = ["- Tidak ada aset GLPI yang cocok: event tidak memuat IP maupun hostname."]
-            
+
         error = _display(asset.get("error"), 160)
         if error:
             lines.append(f"- Catatan pencarian GLPI: {error}")
         return lines
-    
+
     assets = asset.get("items")
     if not isinstance(assets, list) or not assets:
         assets = [asset]
-    
+
     lines = []
     for index, item in enumerate(assets[:10], start=1):
         if not isinstance(item, dict): continue
         asset_id = _display(item.get("id"), 80)
         lines.append(f"- Aset GLPI #{asset_id or index}:")
-        
+
         fields = (
             ("Nama", item.get("name")),
             ("IP privat", _join_list(item.get("private_ip_addresses"))),
@@ -232,6 +236,35 @@ def _format_asset(asset: dict, source_ip: Any, host_name: Any = None) -> list[st
     return lines
 
 
+def _make_alert_assets(role: str, tag: str, ip: Any, asset: dict, host_name: Any,
+                       desc_lines: list[str], asset_type_id: int) -> list[dict]:
+    """Ubah data aset GLPI (atau IP saja) menjadi entri alert_assets IRIS (tab Assets)."""
+    ip_s = _display(ip, 80)
+    items = asset.get("items")
+    if isinstance(items, list) and items:
+        glpi_items = [i for i in items if isinstance(i, dict)]
+    else:
+        glpi_items = [asset]
+
+    out: list[dict] = []
+    for item in glpi_items[:10]:
+        priv_raw = _join_list(item.get("private_ip_addresses"))
+        priv = priv_raw.split(", ")[0] if priv_raw else ""
+        name = _display(item.get("name"), 150) or _display(host_name, 150) or ip_s
+        if not name:
+            continue
+        lines = desc_lines if len(glpi_items) == 1 else _format_asset(item, ip, host_name)
+        out.append({
+            "asset_name": name,
+            "asset_description": f"{role}\n" + "\n".join(lines),
+            "asset_type_id": asset_type_id,
+            "asset_ip": ip_s or priv or "",
+            "asset_domain": "",
+            "asset_tags": tag,
+        })
+    return out
+
+
 class IrisClient:
     def __init__(self, url: str, api_key: str, customer_id: int, verify: bool | ssl.SSLContext,
                  timeout_s: float, severity_map: dict[str, int], status_id: int | None,
@@ -244,6 +277,8 @@ class IrisClient:
         self._severity_explicit = False
         self.min_wazuh_level = 0
         self.max_wazuh_level = 0
+        self.asset_type_id = 1
+        self.assets_in_description = False
         self._ids_ready = False
         self._ids_lock = asyncio.Lock()
         self.severity_map = severity_map
@@ -270,12 +305,14 @@ class IrisClient:
             smap[k.strip().lower()] = int(v)
         status = env.get("IRIS_STATUS_ID", "").strip()
         obj = cls(url, key, int(env.get("IRIS_CUSTOMER_ID", "1")), verify,
-                   float(env.get("IRIS_TIMEOUT_S", "30")), smap,
-                   int(status) if status else None, env.get("IRIS_SOURCE_LINK_TEMPLATE", ""),
-                   env.get("IRIS_API_VERSION", "v2").lower())
+                  float(env.get("IRIS_TIMEOUT_S", "30")), smap,
+                  int(status) if status else None, env.get("IRIS_SOURCE_LINK_TEMPLATE", ""),
+                  env.get("IRIS_API_VERSION", "v2").lower())
         obj._severity_explicit = bool(env.get("IRIS_SEVERITY_MAP", "").strip())
         obj.min_wazuh_level = int(env.get("IRIS_MIN_WAZUH_LEVEL", "0") or 0)
         obj.max_wazuh_level = int(env.get("IRIS_MAX_WAZUH_LEVEL", "0") or 0)
+        obj.asset_type_id = int(env.get("IRIS_ASSET_TYPE_ID", "1") or 1)
+        obj.assets_in_description = env.get("IRIS_ASSETS_IN_DESCRIPTION", "false").lower() == "true"
         return obj
 
     def allows(self, doc: dict) -> bool:
@@ -301,28 +338,33 @@ class IrisClient:
         agent_info = _d(doc.get("agent"))
         agent_host = _display(_d(doc.get("host")).get("name") or agent_info.get("name"), 80)
         agent_ip = _display(agent_info.get("ip"), 80)
-        
+
         level = str(risk.get("level", "medium")).lower()
         what = _md_escape(ev.get("action") or ev.get("category") or "event", 80)
         who = _md_escape(src.get("ip") or asset.get("name") or "unknown", 80)
-        
+
         destination = _d(doc.get("destination"))
         observables = _d(doc.get("enrichment")).get("observables") or []
         is_wazuh = doc.get("data_source") == "wazuh" or "wazuh_level" in ev
-        
+
         destination_ip = _display(destination.get("ip"), 80)
         source_ip = _display(src.get("ip"), 80)
         source_label = source_ip or "Tidak tersedia di event"
         destination_label = destination_ip or "Tidak tersedia di event"
 
         is_local_event = not src.get("ip") and not destination.get("ip")
-        
+
         if is_local_event:
             source_asset = {}
             destination_asset = _d(destination.get("asset")) or asset
         else:
             source_asset = _d(src.get("asset"))
             destination_asset = _d(destination.get("asset"))
+
+        src_host = None if src.get("ip") else agent_host
+        dst_host = agent_host if (not destination_ip or destination_ip == agent_ip) else None
+        src_lines = _format_asset(source_asset, src.get("ip"), src_host)
+        dst_lines = _format_asset(destination_asset, destination.get("ip"), dst_host)
 
         lines = [
             "# Risiko",
@@ -334,50 +376,62 @@ class IrisClient:
             f"- IP sumber (kemungkinan penyerang): {source_label}",
             *([f"- Wazuh Level: {_display(ev.get('wazuh_level'), 30)}"] if is_wazuh else []),
             f"- IP tujuan (host yang diserang): {destination_label}",
-            "# Source",
-            *_format_asset(source_asset, src.get("ip"), None if src.get("ip") else agent_host),
-            "# Destination",
-            *_format_asset(destination_asset, destination.get("ip"),
-                           agent_host if (not destination_ip or destination_ip == agent_ip) else None),
-            "# Threat Intelligence Enrichment",
         ]
-        
+        # Source/Destination hanya ditulis di Description jika toggle dinyalakan.
+        if self.assets_in_description:
+            lines += ["# Source", *src_lines, "# Destination", *dst_lines]
+        lines.append("# Threat Intelligence Enrichment")
+
+        # Source/Destination dikirim sebagai asset -> tab "Assets" di IRIS.
+        alert_assets: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for a in (
+            *_make_alert_assets("Source (kemungkinan penyerang)", "source", src.get("ip"),
+                                source_asset, None, src_lines, self.asset_type_id),
+            *_make_alert_assets("Destination (host yang diserang)", "destination", destination.get("ip"),
+                                destination_asset, dst_host, dst_lines, self.asset_type_id),
+        ):
+            key = (a["asset_name"].lower(), a["asset_ip"])
+            if key not in seen:
+                seen.add(key)
+                alert_assets.append(a)
+
         enriched_iocs = {"IP": [], "Domain": [], "Hash/File": []}
         reputation_data = _d(doc.get("reputation"))
         rep_ip = reputation_data.get("ip") or reputation_data.get("value")
-        
+
         if isinstance(observables, list):
             for obs in observables:
-                if not isinstance(obs, dict): 
+                if not isinstance(obs, dict):
                     continue
                 val = str(obs.get("value", ""))
                 e_type = str(obs.get("entity_type", ""))
-                
+
                 has_opencti = False
-                if rep_ip and val == rep_ip: 
+                if rep_ip and val == rep_ip:
                     has_opencti = True
-                elif isinstance(obs.get("opencti"), dict) and (obs["opencti"].get("indicators") or obs["opencti"].get("score")): 
+                elif isinstance(obs.get("opencti"), dict) and (obs["opencti"].get("indicators") or obs["opencti"].get("score")):
                     has_opencti = True
-                elif obs.get("opencti_score") or obs.get("verdict"): 
+                elif obs.get("opencti_score") or obs.get("verdict"):
                     has_opencti = True
-                
+
                 if has_opencti:
-                    if e_type in ("IPv4", "IPv6", "Ip") or (val and val.replace(".","").replace(":","").isdigit()):
-                        if val not in enriched_iocs["IP"]: 
+                    if e_type in ("IPv4", "IPv6", "Ip") or (val and val.replace(".", "").replace(":", "").isdigit()):
+                        if val not in enriched_iocs["IP"]:
                             enriched_iocs["IP"].append(val)
                     elif e_type in ("Domain", "Url", "Hostname"):
-                        if val not in enriched_iocs["Domain"]: 
+                        if val not in enriched_iocs["Domain"]:
                             enriched_iocs["Domain"].append(val)
                     elif e_type in ("StixFile", "File", "SHA-256", "SHA-1", "MD5"):
-                        if val not in enriched_iocs["Hash/File"]: 
+                        if val not in enriched_iocs["Hash/File"]:
                             enriched_iocs["Hash/File"].append(val)
 
         summary_parts = []
-        if enriched_iocs["IP"]: 
+        if enriched_iocs["IP"]:
             summary_parts.append(f"IP: {', '.join(enriched_iocs['IP'])}")
-        if enriched_iocs["Domain"]: 
+        if enriched_iocs["Domain"]:
             summary_parts.append(f"Domain: {', '.join(enriched_iocs['Domain'])}")
-        if enriched_iocs["Hash/File"]: 
+        if enriched_iocs["Hash/File"]:
             summary_parts.append(f"Hash/File: {', '.join(enriched_iocs['Hash/File'][:3])}")
 
         if summary_parts:
@@ -389,7 +443,7 @@ class IrisClient:
         lines.append("# Geolokasi")
         lines.extend(_format_geolocation(doc.get("geolocation")))
         lines.append("# IOC terkait")
-        
+
         shown_ioc = False
         if isinstance(observables, list) and observables:
             for obs in observables[:20]:
@@ -399,14 +453,14 @@ class IrisClient:
                 if e_type and e_val and e_type.lower() not in ("host-name", "hostname", "host"):
                     lines.append(f"- {e_type}: {e_val}")
                     shown_ioc = True
-                    
+
         if not shown_ioc:
             lines.append("- Detail IOC tidak tersedia.")
-            
+
         lines.append(f"log_uuid: {doc.get('log_uuid')}")
 
         tags = ["analisis_log", f"risk:{level}"]
-        
+
         doc_json_str = orjson.dumps(doc).decode('utf-8')
         if len(doc_json_str) > 500_000:
             safe_doc = {"error": "Payload terlalu besar (>500KB), dipangkas untuk keamanan IRIS", "log_uuid": doc.get("log_uuid")}
@@ -423,6 +477,7 @@ class IrisClient:
             "alert_customer_id": self.customer_id,
             "alert_source_event_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "alert_tags": ",".join(tags),
+            "alert_assets": alert_assets,
         }
         if self.source_link_tpl:
             payload["alert_source_link"] = self.source_link_tpl.format(log_uuid=doc.get("log_uuid"))
@@ -507,6 +562,7 @@ class IrisClient:
         return d.get("alert_id") or d.get("id")
 
     async def update_alert(self, alert_id: int, doc: dict) -> None:
+        # alert_assets sengaja tidak ikut di-update agar asset tidak terduplikasi/tertimpa.
         payload = self.build_payload(doc)
         update = {
             key: payload[key]
@@ -522,7 +578,7 @@ class IrisClient:
             await self._put(path, update)
 
     # ============================================================
-    # FITUR BARU: GET & UPDATE ALERT DESCRIPTION
+    # GET & UPDATE ALERT DESCRIPTION
     # ============================================================
     async def get_alert(self, alert_id: int) -> dict | None:
         """Mengambil detail alert berdasarkan ID."""
@@ -540,8 +596,8 @@ class IrisClient:
         """
         path = self.paths["alert_update"].format(id=alert_id)
         # Batasi panjang maksimal sesuai batas IRIS
-        update_payload = {"alert_description": new_description[:16000]} 
-        
+        update_payload = {"alert_description": new_description[:16000]}
+
         try:
             if self.api_version == "legacy":
                 await self._post(path, update_payload)
@@ -576,7 +632,7 @@ class IrisClient:
             current_description = ""
 
         updated_description = self.build_payload(doc)["alert_description"]
-        
+
         if updated_description.strip() == current_description.strip():
             log.info("Case %s: Deskripsi tidak berubah, skip update untuk menghemat resource.", case_id)
             return False
@@ -595,7 +651,7 @@ class IrisClient:
                 update_payload["classification_id"] = current["classification_id"]
             if "owner_id" in current:
                 update_payload["owner_id"] = current["owner_id"]
-                
+
             await self._put(self.paths["case_update"].format(id=case_id), update_payload)
         else:
             await self._post(self.paths["case_update"].format(id=case_id), {
@@ -607,7 +663,7 @@ class IrisClient:
                 "owner_id": current.get("owner_id") or current.get("case_owner_id"),
                 "case_tags": current.get("case_tags") or "",
             })
-        
+
         log.info("✅ Case %s: Deskripsi berhasil diperbarui.", case_id)
         return True
 
@@ -639,7 +695,7 @@ class IrisClient:
             directory_id = directory["id"]
         else:
             directory_id = None
-            
+
         body: dict[str, Any] = {
             "note_title": f"Enrichment update - {doc.get('log_uuid')}"[:154],
             "note_content": payload["alert_description"],
