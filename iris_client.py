@@ -562,7 +562,6 @@ class IrisClient:
         return d.get("alert_id") or d.get("id")
 
     async def update_alert(self, alert_id: int, doc: dict) -> None:
-        # alert_assets sengaja tidak ikut di-update agar asset tidak terduplikasi/tertimpa.
         payload = self.build_payload(doc)
         update = {
             key: payload[key]
@@ -571,6 +570,13 @@ class IrisClient:
                 "alert_severity_id", "alert_tags",
             )
         }
+        # Enrichment GLPI sering baru tersedia setelah alert dibuat. Asset hanya
+        # dikirim ulang jika sekarang ada yang cocok di GLPI, supaya asset yang
+        # sudah terisi tidak ditimpa dengan hasil "tidak ada aset".
+        assets = payload.get("alert_assets") or []
+        if any("Tidak ada aset GLPI" not in a["asset_description"] for a in assets):
+            update["alert_assets"] = assets
+            log.info("IRIS: alert %s: alert_assets ikut diupdate (%d asset)", alert_id, len(assets))
         path = self.paths["alert_update"].format(id=alert_id)
         if self.api_version == "legacy":
             await self._post(path, update)
