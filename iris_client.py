@@ -393,6 +393,7 @@ class IrisClient:
         self.show_event = True
         self.case_full_description = False
         self.case_import_assets = True
+        self.case_summary_field = ""
         self.ioc_type_ids: dict[str, int] = {}
         self._ioc_type_override: dict[str, int] = {}
         self.tlp_id: int | None = None
@@ -437,6 +438,7 @@ class IrisClient:
         obj.show_event = env.get("IRIS_SHOW_EVENT", "true").lower() == "true"
         obj.case_full_description = env.get("IRIS_CASE_FULL_DESCRIPTION", "false").lower() == "true"
         obj.case_import_assets = env.get("IRIS_CASE_IMPORT_ASSETS", "true").lower() == "true"
+        obj.case_summary_field = env.get("IRIS_CASE_SUMMARY_FIELD", "").strip()
         for pair in filter(None, env.get("IRIS_IOC_TYPE_MAP", "").split(",")):
             k, _, v = pair.partition(":")
             obj._ioc_type_override[k.strip().lower()] = int(v)
@@ -1077,6 +1079,8 @@ class IrisClient:
         p = self.build_payload(doc)
         body = {"case_name": p["alert_title"][:250], "case_description": self._case_text(p),
                 "case_customer": self.customer_id, "case_soc_id": str(doc.get("log_uuid"))}
+        if self.case_summary_field:
+            body[self.case_summary_field] = body["case_description"]
         d = await self._post(self.paths["case"], body)
         return d.get("case_id") or d.get("id")
 
@@ -1088,7 +1092,9 @@ class IrisClient:
 
         updated_description = self._case_text(self.build_payload(doc))
 
-        if updated_description.strip() == current_description.strip():
+        summary_same = (not self.case_summary_field
+                        or str(current.get(self.case_summary_field) or "").strip() == updated_description.strip())
+        if updated_description.strip() == current_description.strip() and summary_same:
             log.info("Case %s: Deskripsi tidak berubah, skip update untuk menghemat resource.", case_id)
             return False
 
@@ -1102,6 +1108,8 @@ class IrisClient:
                 "case_soc_id": current.get("case_soc_id") or current.get("soc_id") or "",
                 "case_tags": current.get("case_tags") or "",
             }
+            if self.case_summary_field:
+                update_payload[self.case_summary_field] = updated_description
             if "classification_id" in current:
                 update_payload["classification_id"] = current["classification_id"]
             if "owner_id" in current:
@@ -1109,7 +1117,7 @@ class IrisClient:
 
             await self._put(self.paths["case_update"].format(id=case_id), update_payload)
         else:
-            await self._post(self.paths["case_update"].format(id=case_id), {
+            legacy_body = {
                 "case_name": current.get("case_name") or current.get("name", "Unnamed Case"),
                 "case_soc_id": current.get("case_soc_id") or current.get("soc_id") or "",
                 "case_description": updated_description,
@@ -1117,7 +1125,10 @@ class IrisClient:
                 "custom_attributes": current.get("custom_attributes") or {},
                 "owner_id": current.get("owner_id") or current.get("case_owner_id"),
                 "case_tags": current.get("case_tags") or "",
-            })
+            }
+            if self.case_summary_field:
+                legacy_body[self.case_summary_field] = updated_description
+            await self._post(self.paths["case_update"].format(id=case_id), legacy_body)
 
         log.info("✅ Case %s: Deskripsi berhasil diperbarui.", case_id)
         return True
