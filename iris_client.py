@@ -391,6 +391,7 @@ class IrisClient:
         self.sync_assets_enabled = True
         self.iocs_in_description = False
         self.show_event = True
+        self.case_full_description = True
         self.ioc_type_ids: dict[str, int] = {}
         self._ioc_type_override: dict[str, int] = {}
         self.tlp_id: int | None = None
@@ -433,6 +434,7 @@ class IrisClient:
         obj.sync_assets_enabled = env.get("IRIS_SYNC_ASSETS", "true").lower() == "true"
         obj.iocs_in_description = env.get("IRIS_IOCS_IN_DESCRIPTION", "false").lower() == "true"
         obj.show_event = env.get("IRIS_SHOW_EVENT", "true").lower() == "true"
+        obj.case_full_description = env.get("IRIS_CASE_FULL_DESCRIPTION", "true").lower() == "true"
         for pair in filter(None, env.get("IRIS_IOC_TYPE_MAP", "").split(",")):
             k, _, v = pair.partition(":")
             obj._ioc_type_override[k.strip().lower()] = int(v)
@@ -1061,9 +1063,17 @@ class IrisClient:
             res = await self._post(path, {})
             return bool(res)
 
+    def _case_text(self, payload: dict) -> str:
+        """Teks untuk case/note: lengkap (Event, Source, Destination, TI, Geolokasi, IOC) atau ringkas."""
+        if self.case_full_description:
+            full = _d(payload.get("alert_source_content")).get("alert_description_full")
+            if isinstance(full, str) and full:
+                return full
+        return payload["alert_description"]
+
     async def create_case(self, doc: dict) -> int | None:
         p = self.build_payload(doc)
-        body = {"case_name": p["alert_title"][:250], "case_description": p["alert_description"],
+        body = {"case_name": p["alert_title"][:250], "case_description": self._case_text(p),
                 "case_customer": self.customer_id, "case_soc_id": str(doc.get("log_uuid"))}
         d = await self._post(self.paths["case"], body)
         return d.get("case_id") or d.get("id")
@@ -1074,7 +1084,7 @@ class IrisClient:
         if not isinstance(current_description, str):
             current_description = ""
 
-        updated_description = self.build_payload(doc)["alert_description"]
+        updated_description = self._case_text(self.build_payload(doc))
 
         if updated_description.strip() == current_description.strip():
             log.info("Case %s: Deskripsi tidak berubah, skip update untuk menghemat resource.", case_id)
@@ -1141,7 +1151,7 @@ class IrisClient:
 
         body: dict[str, Any] = {
             "note_title": f"Enrichment update - {doc.get('log_uuid')}"[:154],
-            "note_content": payload["alert_description"],
+            "note_content": self._case_text(payload),
         }
         if directory_id is not None:
             body["directory_id"] = directory_id
