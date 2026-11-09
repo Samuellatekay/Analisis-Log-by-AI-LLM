@@ -1,7 +1,6 @@
 """
 iris_client.py - Integrasi DFIR-IRIS (REST API: POST {IRIS_URL}/alerts/add, auth Bearer API key).
 
-
 Alert dibuat dari log berisiko tinggi dan konteks enrichment. Severity IRIS ditentukan
 secara deterministik dari risk score.
 
@@ -1222,13 +1221,13 @@ class IrisClient:
         p = self.build_payload(doc)
         iocs, assets = await self._import_lists(alert_id)
         body = {
-            "iocs_import_list": iocs, 
-            "assets_import_list": assets, 
+            "iocs_import_list": iocs,
+            "assets_import_list": assets,
             "import_as_event": False,
             "note": "Diekskalasi otomatis oleh Analisis_Log (risk tinggi).",
-            "case_title": p["alert_title"][:250], 
+            "case_title": p["alert_title"][:250],
             "case_tags": p["alert_tags"],
-            "case_description": self._case_text(p)  # ← TAMBAHKAN BARIS INI
+            "case_description": self._case_text(p)  # <-- INI YANG DITAMBAHKAN
         }
         d = await self._post_with_import(self.paths["escalate"].format(id=alert_id), body)
         return d.get("case_id") or d.get("id")
