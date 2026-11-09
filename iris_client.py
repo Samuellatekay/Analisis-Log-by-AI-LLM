@@ -1092,8 +1092,14 @@ class IrisClient:
 
         updated_description = self._case_text(self.build_payload(doc))
 
-        summary_same = (not self.case_summary_field
-                        or str(current.get(self.case_summary_field) or "").strip() == updated_description.strip())
+        # IRIS v3 beta bisa memakai nama field berbeda untuk Summary (description/summary/...).
+        # Kirim ke setiap field yang ada di data case, ditambah field dari IRIS_CASE_SUMMARY_FIELD.
+        extra_fields = [k for k in ("description", "summary", "case_summary") if k in current]
+        if self.case_summary_field and self.case_summary_field not in extra_fields:
+            extra_fields.append(self.case_summary_field)
+        log.info("Case %s: field deskripsi/summary = %s", case_id,
+                 sorted({"case_description" if "case_description" in current else "(tidak ada)", *extra_fields}))
+        summary_same = all(str(current.get(k) or "").strip() == updated_description.strip() for k in extra_fields)
         if updated_description.strip() == current_description.strip() and summary_same:
             log.info("Case %s: Deskripsi tidak berubah, skip update untuk menghemat resource.", case_id)
             return False
@@ -1108,8 +1114,8 @@ class IrisClient:
                 "case_soc_id": current.get("case_soc_id") or current.get("soc_id") or "",
                 "case_tags": current.get("case_tags") or "",
             }
-            if self.case_summary_field:
-                update_payload[self.case_summary_field] = updated_description
+            for k in extra_fields:
+                update_payload[k] = updated_description
             if "classification_id" in current:
                 update_payload["classification_id"] = current["classification_id"]
             if "owner_id" in current:
@@ -1126,8 +1132,8 @@ class IrisClient:
                 "owner_id": current.get("owner_id") or current.get("case_owner_id"),
                 "case_tags": current.get("case_tags") or "",
             }
-            if self.case_summary_field:
-                legacy_body[self.case_summary_field] = updated_description
+            for k in extra_fields:
+                legacy_body[k] = updated_description
             await self._post(self.paths["case_update"].format(id=case_id), legacy_body)
 
         log.info("✅ Case %s: Deskripsi berhasil diperbarui.", case_id)
