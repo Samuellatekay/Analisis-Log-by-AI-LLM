@@ -1221,9 +1221,15 @@ class IrisClient:
     async def escalate_alert(self, alert_id: int, doc: dict) -> int | None:
         p = self.build_payload(doc)
         iocs, assets = await self._import_lists(alert_id)
-        body = {"iocs_import_list": iocs, "assets_import_list": assets, "import_as_event": False,
-                "note": "Diekskalasi otomatis oleh Analisis_Log (risk tinggi).",
-                "case_title": p["alert_title"][:250], "case_tags": p["alert_tags"]}
+        body = {
+            "iocs_import_list": iocs, 
+            "assets_import_list": assets, 
+            "import_as_event": False,
+            "note": "Diekskalasi otomatis oleh Analisis_Log (risk tinggi).",
+            "case_title": p["alert_title"][:250], 
+            "case_tags": p["alert_tags"],
+            "case_description": self._case_text(p)  # ← TAMBAHKAN BARIS INI
+        }
         d = await self._post_with_import(self.paths["escalate"].format(id=alert_id), body)
         return d.get("case_id") or d.get("id")
 
