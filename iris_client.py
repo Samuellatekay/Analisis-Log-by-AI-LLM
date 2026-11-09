@@ -391,7 +391,8 @@ class IrisClient:
         self.sync_assets_enabled = True
         self.iocs_in_description = False
         self.show_event = True
-        self.case_full_description = True
+        self.case_full_description = False
+        self.case_import_assets = True
         self.ioc_type_ids: dict[str, int] = {}
         self._ioc_type_override: dict[str, int] = {}
         self.tlp_id: int | None = None
@@ -434,7 +435,8 @@ class IrisClient:
         obj.sync_assets_enabled = env.get("IRIS_SYNC_ASSETS", "true").lower() == "true"
         obj.iocs_in_description = env.get("IRIS_IOCS_IN_DESCRIPTION", "false").lower() == "true"
         obj.show_event = env.get("IRIS_SHOW_EVENT", "true").lower() == "true"
-        obj.case_full_description = env.get("IRIS_CASE_FULL_DESCRIPTION", "true").lower() == "true"
+        obj.case_full_description = env.get("IRIS_CASE_FULL_DESCRIPTION", "false").lower() == "true"
+        obj.case_import_assets = env.get("IRIS_CASE_IMPORT_ASSETS", "true").lower() == "true"
         for pair in filter(None, env.get("IRIS_IOC_TYPE_MAP", "").split(",")):
             k, _, v = pair.partition(":")
             obj._ioc_type_override[k.strip().lower()] = int(v)
@@ -1158,20 +1160,43 @@ class IrisClient:
         path = self.paths["case_note"].format(id=case_id)
         await self._post(path, body)
 
+    async def _import_lists(self, alert_id: int) -> tuple[list[str], list[str]]:
+        """UUID IOC dan aset milik alert, untuk diimpor ke case saat escalate/merge."""
+        if not self.case_import_assets:
+            return [], []
+        alert = await self.get_alert(alert_id) or {}
+        iocs = [i["ioc_uuid"] for i in alert.get("iocs") or [] if isinstance(i, dict) and i.get("ioc_uuid")]
+        assets = [a["asset_uuid"] for a in alert.get("assets") or [] if isinstance(a, dict) and a.get("asset_uuid")]
+        return iocs, assets
+
+    async def _post_with_import(self, path: str, body: dict) -> dict:
+        try:
+            return await self._post(path, body)
+        except httpx.HTTPStatusError as exc:
+            if not (body.get("iocs_import_list") or body.get("assets_import_list")) \
+                    or exc.response.status_code not in (400, 422, 500):
+                raise
+            log.warning("IRIS: %s ditolak dengan import aset/IOC (HTTP %s); diulang tanpa import.",
+                        path, exc.response.status_code)
+            body = {**body, "iocs_import_list": [], "assets_import_list": []}
+            return await self._post(path, body)
+
     async def escalate_alert(self, alert_id: int, doc: dict) -> int | None:
         p = self.build_payload(doc)
-        body = {"iocs_import_list": [], "assets_import_list": [], "import_as_event": False,
+        iocs, assets = await self._import_lists(alert_id)
+        body = {"iocs_import_list": iocs, "assets_import_list": assets, "import_as_event": False,
                 "note": "Diekskalasi otomatis oleh Analisis_Log (risk tinggi).",
                 "case_title": p["alert_title"][:250], "case_tags": p["alert_tags"]}
-        d = await self._post(self.paths["escalate"].format(id=alert_id), body)
+        d = await self._post_with_import(self.paths["escalate"].format(id=alert_id), body)
         return d.get("case_id") or d.get("id")
 
     async def merge_alert(self, alert_id: int, case_id: int, doc: dict) -> None:
         risk = _d(doc.get("risk"))
-        body = {"target_case_id": case_id, "iocs_import_list": [], "assets_import_list": [],
+        iocs, assets = await self._import_lists(alert_id)
+        body = {"target_case_id": case_id, "iocs_import_list": iocs, "assets_import_list": assets,
                 "import_as_event": False,
                 "note": f"Alert terkait dari sumber yang sama (risk {risk.get('score')}, {risk.get('level')}) digabung otomatis. log_uuid={doc.get('log_uuid')}"}
-        await self._post(self.paths["merge"].format(id=alert_id), body)
+        await self._post_with_import(self.paths["merge"].format(id=alert_id), body)
 
     async def _list(self, paths: list[str]) -> list[tuple[int, str]]:
         for p in paths:
