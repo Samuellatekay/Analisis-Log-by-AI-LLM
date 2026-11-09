@@ -374,6 +374,20 @@ def _ioc_kind(entity_type: Any, value: Any) -> str | None:
     return None
 
 
+def _case_tags_str(current: dict) -> str:
+    """Tag case sebagai string 'a,b' dari key case_tags atau tags (list/dict/string)."""
+    tags = current.get("case_tags") or current.get("tags") or ""
+    if isinstance(tags, list):
+        names = []
+        for t in tags:
+            if isinstance(t, dict):
+                t = t.get("tag_title") or t.get("title") or t.get("name") or t.get("value")
+            if t:
+                names.append(str(t))
+        return ",".join(names)
+    return str(tags)
+
+
 class IrisClient:
     def __init__(self, url: str, api_key: str, customer_id: int, verify: bool | ssl.SSLContext,
                  timeout_s: float, severity_map: dict[str, int], status_id: int | None,
@@ -1110,10 +1124,16 @@ class IrisClient:
             update_payload = {
                 "case_description": updated_description,
                 "case_name": current.get("case_name") or current.get("name", "Unnamed Case"),
-                "case_customer": current.get("case_customer") or self.customer_id,
+                "case_customer": current.get("case_customer_id") or current.get("case_customer") or self.customer_id,
                 "case_soc_id": current.get("case_soc_id") or current.get("soc_id") or "",
-                "case_tags": current.get("case_tags") or "",
+                "case_tags": _case_tags_str(current),
             }
+            # Pertahankan atribut case yang ada agar update deskripsi tidak mereset nilainya.
+            for k in ("state_id", "severity_id", "status_id", "reviewer_id", "review_status_id"):
+                if current.get(k) is not None:
+                    update_payload[k] = current[k]
+            if isinstance(current.get("custom_attributes"), dict):
+                update_payload["custom_attributes"] = current["custom_attributes"]
             for k in extra_fields:
                 update_payload[k] = updated_description
             if "classification_id" in current:
@@ -1130,7 +1150,7 @@ class IrisClient:
                 "classification_id": current.get("classification_id") or current.get("case_classification_id"),
                 "custom_attributes": current.get("custom_attributes") or {},
                 "owner_id": current.get("owner_id") or current.get("case_owner_id"),
-                "case_tags": current.get("case_tags") or "",
+                "case_tags": _case_tags_str(current),
             }
             for k in extra_fields:
                 legacy_body[k] = updated_description
