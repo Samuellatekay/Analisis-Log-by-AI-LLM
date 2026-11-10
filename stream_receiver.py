@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import httpx
+import markdown
 
 from iris_client import IrisClient
 
@@ -100,34 +101,38 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
     if target_case_id:
         log.info("✅ Case DITEMUKAN! ID: %s. Mengupdate deskripsi Case...", target_case_id)
         try:
-            # 1. Ambil data Case terkini secara lengkap
             current_case = await iris_client._get(f"/api/v2/cases/{target_case_id}")
             if not current_case:
                 log.warning("⚠️ Gagal mengambil detail Case %s", target_case_id)
             else:
                 old_desc = current_case.get("case_description") or current_case.get("description") or ""
                 
-                # 2. Cek apakah laporan AI sudah ada
-                if incident_report.strip() not in old_desc:
-                    combined_desc = f"{old_desc}\n\n---\n\n# 🤖 Update Analisis AI\n{incident_report}"
-                    
-                    # 3. Buat payload LENGKAP (termasuk field wajib agar IRIS tidak menolak)
+                # 1. KONVERSI MARKDOWN KE HTML DI SINI
+                # Ekstensi 'extra', 'fenced_code', dan 'tables' memastikan format AI rapi
+                html_report = markdown.markdown(
+                    incident_report, 
+                    extensions=['extra', 'fenced_code', 'tables']
+                )
+                
+                # 2. Gabungkan dengan deskripsi lama (yang juga sebaiknya di-HTML-kan jika perlu, 
+                # tapi untuk amannya kita append HTML baru di bawah)
+                combined_desc = f"{old_desc}<hr><h3>🤖 Update Analisis AI</h3>{html_report}"
+                
+                if incident_report.strip() not in old_desc: # Cek sederhana
                     update_payload = {
                         "case_description": combined_desc[:16000],
                         "case_name": current_case.get("case_name") or "Unnamed Case",
                         "case_customer": current_case.get("case_customer_id") or current_case.get("case_customer") or 1,
                         "case_soc_id": current_case.get("case_soc_id") or current_case.get("soc_id") or log_uuid,
                         "case_tags": current_case.get("case_tags") or "",
-                        # FIELD WAJIB INI HARUS DIKIRIM AGAR UPDATE BERHASIL:
-                        "state_id": current_case.get("state_id") or 3,       # 3 = Open
-                        "severity_id": current_case.get("severity_id") or 4, # 4 = Medium (default)
+                        "state_id": current_case.get("state_id") or 3,
+                        "severity_id": current_case.get("severity_id") or 4,
                         "status_id": current_case.get("status_id") or 0,
                         "owner_id": current_case.get("owner_id") or current_case.get("user_id") or 1,
                     }
                     
-                    # 4. Kirim update
                     await iris_client._put(f"/api/v2/cases/{target_case_id}", update_payload)
-                    log.info("📝 Deskripsi Case %s berhasil diupdate dengan Laporan AI.", target_case_id)
+                    log.info("📝 Deskripsi Case %s berhasil diupdate dengan HTML Laporan AI.", target_case_id)
                 else:
                     log.info("ℹ️ Laporan AI sudah ada di Case %s.", target_case_id)
                     
