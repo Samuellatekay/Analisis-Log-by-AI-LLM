@@ -138,7 +138,21 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
                     
         except Exception as e:
             log.error("❌ Gagal mengupdate Case %s: %s", target_case_id, e)
-            
+    # ==========================================================
+    # 3. TAMBAHKAN KE NOTES (FALLBACK YANG PASTI MUNCUL) <--- INI BAGIAN BARUNYA
+    # ==========================================================
+    if target_case_id:
+        try:
+            note_payload = {
+                "note_title": f"🤖 Laporan Analisis AI - {log_uuid[:8]}",
+                "note_content": incident_report,
+            }
+            # Kirim ke endpoint Notes API v2
+            await iris_client._post(f"/api/v2/cases/{target_case_id}/notes", note_payload)
+            log.info("✅ Laporan AI berhasil ditambahkan ke tab NOTES Case %s", target_case_id)
+        except Exception as e:
+            log.warning("⚠️ Gagal menambah ke Notes: %s", e)    
+                
     return True
 
 
