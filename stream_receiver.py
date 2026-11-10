@@ -29,12 +29,14 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
 
     log.info("🔍 Mencari Alert dan Case dengan UUID: %s...", log_uuid)
     
-    # ==========================================================
-    # 1. UPDATE ALERT
-    # ==========================================================
     target_alert_id = None
+    target_case_id = None
+
+    # ==========================================================
+    # 1. UPDATE ALERT (PASTI BERHASIL)
+    # ==========================================================
     try:
-        resp = await iris_client._client.get("/api/v2/alerts", params={"per_page": 50, "page": 1, "sort": "alert_source_event_time:desc"})
+        resp = await iris_client._client.get("/api/v2/alerts", params={"per_page": 100, "page": 1, "sort": "alert_source_event_time:desc"})
         resp.raise_for_status()
         resp_json = resp.json()
         alerts = resp_json.get("data", []) if isinstance(resp_json, dict) else resp_json
@@ -78,11 +80,12 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
                     log.info("ℹ️ Laporan sudah ada di Alert %s.", target_alert_id)
 
     # ==========================================================
-    # 2. UPDATE CASE (JIKA SUDAH ADA) - VERSI ROBUST
+    # 2. UPDATE CASE (SMART SEARCH + HTML CONVERSION)
     # ==========================================================
-    target_case_id = None
+    log.info("🔎 Memulai pencarian Case untuk UUID: %s...", log_uuid)
     try:
-        resp_case = await iris_client._client.get("/api/v2/cases", params={"per_page": 50, "page": 1, "sort": "open_date:desc"})
+        # Ambil 100 case terbaru agar tidak terlewat
+        resp_case = await iris_client._client.get("/api/v2/cases", params={"per_page": 100, "page": 1, "sort": "open_date:desc"})
         resp_case.raise_for_status()
         cases_data = resp_case.json()
         cases = cases_data.get("data", []) if isinstance(cases_data, dict) else cases_data
@@ -91,15 +94,24 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
             if not isinstance(case, dict): continue
             c_id = case.get("case_id") or case.get("id")
             soc_id = str(case.get("case_soc_id") or case.get("soc_id") or "")
+            case_name = str(case.get("case_name") or "")
+            case_desc = str(case.get("case_description") or "")
             
-            if str(log_uuid) == soc_id:
+            # SMART SEARCH: Cocokkan soc_id, ATAU cek apakah log_uuid ada di Judul/Deskripsi Case
+            # (Karena saat escalate, deskripsi Alert yang berisi log_uuid akan disalin ke Case)
+            if str(log_uuid) == soc_id or str(log_uuid) in case_name or str(log_uuid) in case_desc:
                 target_case_id = c_id
+                log.info("✅ Case COCOK DITEMUKAN! ID: %s (via soc_id, name, atau desc)", target_case_id)
                 break
+                
+        if not target_case_id:
+            log.info("ℹ️ Case untuk UUID ini belum di-escalate atau tidak ditemukan di 100 case terbaru.")
+            
     except Exception as e:
         log.error("❌ Gagal mencari case: %s", e)
 
     if target_case_id:
-        log.info("✅ Case DITEMUKAN! ID: %s. Mengupdate deskripsi Case...", target_case_id)
+        log.info("🔄 Memproses update deskripsi Case ID: %s...", target_case_id)
         try:
             current_case = await iris_client._get(f"/api/v2/cases/{target_case_id}")
             if not current_case:
@@ -107,18 +119,17 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
             else:
                 old_desc = current_case.get("case_description") or current_case.get("description") or ""
                 
-                # 1. KONVERSI MARKDOWN KE HTML DI SINI
-                # Ekstensi 'extra', 'fenced_code', dan 'tables' memastikan format AI rapi
-                html_report = markdown.markdown(
-                    incident_report, 
-                    extensions=['extra', 'fenced_code', 'tables']
-                )
+                # KONVERSI MARKDOWN KE HTML (Mengatasi bug rendering kosong di IRIS)
+                try:
+                    import markdown
+                    html_report = markdown.markdown(incident_report, extensions=['extra', 'fenced_code', 'tables'])
+                    combined_desc = f"{old_desc}<hr><h3>🤖 Update Analisis AI</h3>{html_report}"
+                except ImportError:
+                    log.warning("⚠️ Library 'markdown' tidak terinstal. Menggunakan teks biasa.")
+                    combined_desc = f"{old_desc}\n\n---\n\n### 🤖 Update Analisis AI\n{incident_report}"
                 
-                # 2. Gabungkan dengan deskripsi lama (yang juga sebaiknya di-HTML-kan jika perlu, 
-                # tapi untuk amannya kita append HTML baru di bawah)
-                combined_desc = f"{old_desc}<hr><h3>🤖 Update Analisis AI</h3>{html_report}"
-                
-                if incident_report.strip() not in old_desc: # Cek sederhana
+                # Cek duplikasi sederhana
+                if "Update Analisis AI" not in old_desc and incident_report.strip() not in old_desc:
                     update_payload = {
                         "case_description": combined_desc[:16000],
                         "case_name": current_case.get("case_name") or "Unnamed Case",
@@ -139,47 +150,7 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
         except Exception as e:
             log.error("❌ Gagal mengupdate Case %s: %s", target_case_id, e)
 
-    # ==========================================================
-    # 3. TAMBAHKAN KE NOTES (DENGAN LOGIKA DIRECTORY OTOMATIS)
-    # ==========================================================
-    if target_case_id:
-        try:
-            # A. Cek apakah sudah ada directory/folder notes di Case ini
-            dirs_resp = await iris_client._get(f"/api/v2/cases/{target_case_id}/notes-directories")
-            dirs_data = dirs_resp.get("data", [])
-            
-            directory_id = None
-            
-            # Jika sudah ada folder, ambil ID folder pertama
-            if isinstance(dirs_data, list) and len(dirs_data) > 0:
-                directory_id = dirs_data[0].get("id")
-            else:
-                # Jika BELUM ADA folder, BUAT folder baru terlebih dahulu!
-                log.info("📁 Belum ada folder notes, membuat folder 'Laporan AI'...")
-                new_dir = await iris_client._post(
-                    f"/api/v2/cases/{target_case_id}/notes-directories", 
-                    {"name": "Laporan AI"}
-                )
-                directory_id = new_dir.get("id")
-
-            # Sekarang buat Notenya
-            if directory_id:
-                note_payload = {
-                    "note_title": f"🤖 Laporan Analisis AI - {log_uuid[:8]}",
-                    "note_content": incident_report,
-                    "directory_id": int(directory_id)
-                }
-                
-                await iris_client._post(f"/api/v2/cases/{target_case_id}/notes", note_payload)
-                log.info("✅ Laporan AI berhasil ditambahkan ke tab NOTES Case %s", target_case_id)
-            else:
-                log.error("❌ Gagal mendapatkan ID directory untuk Case %s", target_case_id)
-                
-        except Exception as e:
-            log.error("❌ Gagal menambah Note ke Case %s: %s", target_case_id, e)
-
     return True
-
 
 async def run_receiver():
     log.info("🎧 Receiver aktif (Mode: Inject IR ke Alert & Case).")
