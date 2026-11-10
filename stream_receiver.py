@@ -138,7 +138,7 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
                     
         except Exception as e:
             log.error("❌ Gagal mengupdate Case %s: %s", target_case_id, e)
-            
+
     # ==========================================================
     # 3. TAMBAHKAN KE NOTES (DENGAN LOGIKA DIRECTORY OTOMATIS)
     # ==========================================================
@@ -150,11 +150,11 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
             
             directory_id = None
             
-            # Jika sudah ada folder, ambil ID folder pertama (biasanya folder root)
+            # Jika sudah ada folder, ambil ID folder pertama
             if isinstance(dirs_data, list) and len(dirs_data) > 0:
                 directory_id = dirs_data[0].get("id")
             else:
-                # B. Jika BELUM ADA folder, BUAT folder baru terlebih dahulu!
+                # Jika BELUM ADA folder, BUAT folder baru terlebih dahulu!
                 log.info("📁 Belum ada folder notes, membuat folder 'Laporan AI'...")
                 new_dir = await iris_client._post(
                     f"/api/v2/cases/{target_case_id}/notes-directories", 
@@ -162,12 +162,12 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
                 )
                 directory_id = new_dir.get("id")
 
-            # C. Sekarang buat Notenya dengan directory_id yang VALID (Integer)
+            # Sekarang buat Notenya
             if directory_id:
                 note_payload = {
                     "note_title": f"🤖 Laporan Analisis AI - {log_uuid[:8]}",
                     "note_content": incident_report,
-                    "directory_id": int(directory_id) # WAJIB Integer, tidak boleh null
+                    "directory_id": int(directory_id)
                 }
                 
                 await iris_client._post(f"/api/v2/cases/{target_case_id}/notes", note_payload)
