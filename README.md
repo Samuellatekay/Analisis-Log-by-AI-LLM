@@ -96,8 +96,10 @@ Note case. Salinan Alert Note menjaga laporan lengkap tetap tersedia di Alert
 jika Description dibatasi saat ditampilkan. Case eskalasi dicocokkan melalui
 `log_uuid` pada deskripsinya. Jika `.env` sudah dibuat sebelumnya, buat ulang
 container setelah memperbarui image aplikasi.
-Laporan AI tidak dipotong oleh batas karakter tetap aplikasi; jika IRIS menolak
-deskripsi yang terlalu panjang, kegagalan update dicatat di log receiver.
+Receiver meneruskan seluruh teks `incident_report` yang diterima tanpa batas
+karakter atau trim whitespace. Jika log jumlah karakter menunjukkan laporan
+sudah tidak lengkap saat diterima, teks yang hilang harus diperbaiki pada
+layanan pengirim; receiver tidak dapat memulihkan teks yang tidak dikirim.
 
 ## Konfigurasi dan menjalankan
 

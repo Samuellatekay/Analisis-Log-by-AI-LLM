@@ -17,10 +17,9 @@ TARGET_STREAM_URL = os.getenv("TARGET_STREAM_URL", "http://38.47.66.253:17772/st
 
 
 def log_incident_report(log_uuid: str, report: str) -> None:
-    """Tampilkan seluruh laporan AI di log, dengan penanda tiap baris."""
+    """Tampilkan seluruh laporan AI di log tanpa mengubah isi atau line ending."""
     log.info("===== BEGIN LLM REPORT uuid=%s chars=%s =====", log_uuid, len(report))
-    for line in report.splitlines():
-        log.info("LLM | %s", line)
+    log.info("%s", report)
     log.info("===== END LLM REPORT uuid=%s =====", log_uuid)
 
 
@@ -83,7 +82,7 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
                     ):
                         saved_alert = await iris_client.get_alert(target_alert_id)
                         saved_note = saved_alert.get("alert_note") if saved_alert else None
-                        if isinstance(saved_note, str) and incident_report.strip() in saved_note:
+                        if isinstance(saved_note, str) and incident_report in saved_note:
                             log.info(
                                 "📝 Deskripsi dan Alert Note %s diupdate; laporan utuh tersimpan (%s karakter).",
                                 target_alert_id,
@@ -242,8 +241,8 @@ async def run_receiver():
                     log.info("✅ Terhubung ke /stream! Menunggu data...")
                     
                     async for line in response.aiter_lines():
-                        line = line.strip()
-                        if not line: continue
+                        if not line.strip():
+                            continue
                         
                         try:
                             raw_data = json.loads(line)

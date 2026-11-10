@@ -407,13 +407,11 @@ def split_ai_sections(desc: str) -> tuple[str, dict[str, str]]:
     return desc[:matches[0].start()].rstrip(), sections
 
 
-def upsert_ai_section(desc: str, log_uuid: str, report: str, max_report: int | None = None) -> str:
+def upsert_ai_section(desc: str, log_uuid: str, report: str) -> str:
     """Tambahkan/ganti section Analisis AI milik log_uuid di akhir deskripsi."""
     base, sections = split_ai_sections(desc)
     key = re.sub(r"[^0-9A-Za-z]", "", str(log_uuid))[:8].ljust(8, "0")
-    body = str(report).strip()
-    if max_report is not None and len(body) > max_report:
-        body = body[:max_report].rstrip() + "\n\n_(dipotong; laporan lengkap ada di tab Notes)_"
+    body = str(report)
     sections[key] = f"## Analisis AI (LLM) - {key}\n\n{body}"
     return "\n\n".join(([base] if base else []) + list(sections.values()))
 
