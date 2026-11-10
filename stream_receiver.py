@@ -16,114 +16,127 @@ log = logging.getLogger("stream-receiver")
 TARGET_STREAM_URL = os.getenv("TARGET_STREAM_URL", "http://38.47.66.253:17772/stream")
 
 async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> bool:
-    """
-    Mencari alert berdasarkan UUID, lalu menyisipkan incident_report 
-    tepat setelah bagian 'Event' (sebelum 'Source').
-    """
-    # 1. Ambil UUID dan incident_report
     log_uuid = str(raw_data.get("log_uuid") or raw_data.get("id", "")).strip()
     incident_report = raw_data.get("incident_report")
     
-    # Jika tidak ada incident_report, abaikan (ini adalah raw log biasa, biarkan sistem lain yang proses)
     if not incident_report:
-        log.debug("ℹ️ Tidak ada incident_report di data ini. Melewati (raw log biasa).")
+        log.debug("ℹ️ Tidak ada incident_report. Melewati.")
         return False
-        
     if not log_uuid:
         log.warning("⚠️ Ada incident_report tapi Tidak ada UUID. Melewati.")
         return False
 
-    log.info("🔍 Mencari alert di IRIS dengan UUID: %s...", log_uuid)
-    target_alert_id = None
+    log.info("🔍 Mencari Alert dan Case dengan UUID: %s...", log_uuid)
     
+    # ==========================================================
+    # 1. UPDATE ALERT
+    # ==========================================================
+    target_alert_id = None
     try:
-        # Ambil 50 alert terakhir dari IRIS
         resp = await iris_client._client.get("/api/v2/alerts", params={"per_page": 50, "page": 1, "sort": "alert_source_event_time:desc"})
         resp.raise_for_status()
         resp_json = resp.json()
-        
         alerts = resp_json.get("data", []) if isinstance(resp_json, dict) else resp_json
         
         for alert in alerts:
-            if not isinstance(alert, dict):
-                continue
-                
-            # Ekstraksi ID dengan berbagai kemungkinan nama key (ROBUST)
+            if not isinstance(alert, dict): continue
             a_id = alert.get("id") or alert.get("alert_id")
             if a_id is None and isinstance(alert.get("data"), dict):
                 a_id = alert["data"].get("id") or alert["data"].get("alert_id")
             
-            # Fallback: cari key apa saja yang berisi 'id' dan bernilai integer
-            if a_id is None:
-                for key, val in alert.items():
-                    if "id" in key.lower() and isinstance(val, int):
-                        a_id = val
-                        break
-                        
             source_ref = str(alert.get("alert_source_ref", ""))
             desc = str(alert.get("alert_description", ""))
-            title = str(alert.get("alert_title", ""))
             
-            # Cek kecocokan UUID di source_ref, description, atau title
-            if str(log_uuid) == source_ref or str(log_uuid) in desc or str(log_uuid) in title:
+            if str(log_uuid) == source_ref or str(log_uuid) in desc:
                 target_alert_id = a_id
-                if target_alert_id:
-                    log.info("✅ Alert DITEMUKAN! ID: %s", target_alert_id)
-                else:
-                    log.warning("⚠️ Alert cocok ditemukan, tapi ID-nya None! Keys tersedia: %s", list(alert.keys()))
                 break
-                
     except Exception as e:
-        log.error("❌ Gagal mencari alert di IRIS: %s", e)
-        return False
+        log.error("❌ Gagal mencari alert: %s", e)
 
-    if not target_alert_id:
-        log.warning("⚠️ Alert dengan UUID '%s' TIDAK DITEMUKAN. Melewati (No Create).", log_uuid)
-        return False
+    if target_alert_id:
+        log.info("✅ Alert DITEMUKAN! ID: %s", target_alert_id)
+        current_alert = await iris_client.get_alert(target_alert_id)
+        if current_alert:
+            current_desc = current_alert.get("alert_description", "")
+            if isinstance(current_desc, str):
+                first_line_report = incident_report.split('\n')[0].strip()
+                if first_line_report and first_line_report not in current_desc:
+                    lines = current_desc.split('\n')
+                    injected = False
+                    for i, line in enumerate(lines):
+                        if line.strip().startswith('# Source') or line.strip() == 'Source':
+                            lines.insert(i, f"\n{incident_report}\n")
+                            injected = True
+                            break
+                    if not injected:
+                        lines.append(f"\n\n## Analisis AI (Incident Report)\n{incident_report}")
+                    
+                    await iris_client.update_alert_description(target_alert_id, '\n'.join(lines))
+                    log.info("📝 Deskripsi Alert %s berhasil diupdate.", target_alert_id)
+                else:
+                    log.info("ℹ️ Laporan sudah ada di Alert %s.", target_alert_id)
 
-    # 2. Ambil Deskripsi Saat Ini
-    current_alert = await iris_client.get_alert(target_alert_id)
-    if not current_alert:
-        log.error("❌ Gagal mengambil detail alert %s.", target_alert_id)
-        return False
+    # ==========================================================
+    # 2. UPDATE CASE (JIKA SUDAH ADA)
+    # ==========================================================
+    target_case_id = None
+    try:
+        # Cari case berdasarkan case_soc_id (yang kita set sebagai log_uuid)
+        resp_case = await iris_client._client.get("/api/v2/cases", params={"per_page": 50, "page": 1, "sort": "open_date:desc"})
+        resp_case.raise_for_status()
+        cases_data = resp_case.json()
+        cases = cases_data.get("data", []) if isinstance(cases_data, dict) else cases_data
         
-    current_desc = current_alert.get("alert_description", "")
-    if not isinstance(current_desc, str):
-        current_desc = ""
+        for case in cases:
+            if not isinstance(case, dict): continue
+            c_id = case.get("case_id") or case.get("id")
+            soc_id = str(case.get("case_soc_id") or case.get("soc_id") or "")
+            
+            if str(log_uuid) == soc_id:
+                target_case_id = c_id
+                break
+    except Exception as e:
+        log.error("❌ Gagal mencari case: %s", e)
 
-    # 3. Cek Duplikasi (apakah laporan sudah pernah disisipkan?)
-    first_line_report = incident_report.split('\n')[0].strip()
-    if first_line_report and first_line_report in current_desc:
-        log.info("ℹ️ Laporan insiden sudah ada di alert %s. Melewati update.", target_alert_id)
-        return True
+    if target_case_id:
+        log.info("✅ Case DITEMUKAN! ID: %s. Mengupdate deskripsi Case juga...", target_case_id)
+        # Kita ambil deskripsi case saat ini, atau buat baru jika kosong
+        # Untuk simplisitas, kita append laporan AI ke deskripsi case yang ada
+        try:
+            # Menggunakan endpoint get case (perlu disesuaikan dengan iris_client Anda jika perlu)
+            # Atau kita bisa langsung append teks baru
+            new_case_desc = f"# Laporan Analisis AI\n\n{incident_report}\n\n---\n*Catatan: Ini adalah update otomatis dari stream receiver.*"
+            
+            # Kita gunakan fungsi update deskripsi case yang sudah kita buat di iris_client.py
+            # Tapi karena kita butuh deskripsi lama, kita fetch dulu (opsional, atau timpa saja)
+            # Untuk amannya, kita append:
+            current_case = await iris_client._get(f"/api/v2/cases/{target_case_id}")
+            old_desc = current_case.get("case_description") or current_case.get("description") or ""
+            
+            if incident_report.strip() not in old_desc:
+                combined_desc = f"{old_desc}\n\n---\n\n# 🤖 Update Analisis AI\n{incident_report}"
+                
+                # Update payload
+                update_payload = {
+                    "case_description": combined_desc[:16000],
+                    "case_name": current_case.get("case_name", "Unnamed Case"),
+                    "case_customer": current_case.get("case_customer_id") or current_case.get("case_customer") or 1,
+                    "case_soc_id": current_case.get("case_soc_id") or current_case.get("soc_id") or log_uuid,
+                    "case_tags": current_case.get("case_tags") or "",
+                }
+                await iris_client._put(f"/api/v2/cases/{target_case_id}", update_payload)
+                log.info("📝 Deskripsi Case %s berhasil diupdate dengan Laporan AI.", target_case_id)
+            else:
+                log.info("ℹ️ Laporan sudah ada di Case %s.", target_case_id)
+                
+        except Exception as e:
+            log.error("❌ Gagal mengupdate Case %s: %s", target_case_id, e)
 
-    # 4. SISIPKAN (INJECT) tepat setelah bagian "# Event" (sebelum "# Source")
-    lines = current_desc.split('\n')
-    injected = False
-    
-    for i, line in enumerate(lines):
-        # Mencari header "# Source" untuk menyisipkan tepat sebelum Source
-        if line.strip().startswith('# Source') or line.strip() == 'Source':
-            # Sisipkan tepat SEBELUM baris Source
-            lines.insert(i, f"\n{incident_report}\n")
-            injected = True
-            log.info("📝 Laporan disisipkan tepat setelah 'Event' (sebelum 'Source') pada alert %s.", target_alert_id)
-            break
-
-    # Fallback: Jika struktur "# Source" tidak ditemukan, tambahkan di paling bawah
-    if not injected:
-        log.warning("⚠️ Bagian 'Source' tidak ditemukan. Menambahkan di bagian paling bawah deskripsi.")
-        lines.append(f"\n\n## Analisis AI (Incident Report)\n{incident_report}")
-
-    new_desc = '\n'.join(lines)
-
-    # 5. Update ke IRIS
-    success = await iris_client.update_alert_description(target_alert_id, new_desc)
-    return success
+    return True
 
 
 async def run_receiver():
-    log.info("🎧 Receiver aktif (Mode: Inject IR setelah Event).")
+    log.info("🎧 Receiver aktif (Mode: Inject IR ke Alert & Case).")
     
     env = {
         "IRIS_ENABLED": "true",
@@ -157,8 +170,7 @@ async def run_receiver():
                     
                     async for line in response.aiter_lines():
                         line = line.strip()
-                        if not line:
-                            continue
+                        if not line: continue
                         
                         try:
                             raw_data = json.loads(line)
@@ -173,7 +185,7 @@ async def run_receiver():
             except Exception as e:
                 log.error("❌ Error tidak terduga: %s", e)
             
-            log.info("🔄 Reconnect dalam 5 detik...")
+            log.info("🔄 Reconnect dalam5 detik...")
             await asyncio.sleep(5)
 
 if __name__ == "__main__":
