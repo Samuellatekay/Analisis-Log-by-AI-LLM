@@ -141,7 +141,11 @@ def build_minimal_payload(detail_data):
     # disimpan oleh iris_client di alert_source_content["alert_description_full"].
     asc_dict = _source_content(detail_data)
     full_description = asc_dict.get("alert_description_full")
-    payload = {"alert_description": full_description or detail_data.get("alert_description", "")}
+    payload = {
+        "alert_id": detail_data.get("alert_id") or detail_data.get("id"),
+        "log_uuid": detail_data.get("alert_source_ref"),
+        "alert_description": full_description or detail_data.get("alert_description", ""),
+    }
 
     raw_original = None
     if "original" in detail_data:

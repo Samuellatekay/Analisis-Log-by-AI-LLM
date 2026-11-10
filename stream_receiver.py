@@ -25,6 +25,7 @@ def log_incident_report(log_uuid: str, report: str) -> None:
 
 async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> bool:
     log_uuid = str(raw_data.get("log_uuid") or raw_data.get("id", "")).strip()
+    source_alert_id = raw_data.get("alert_id")
     incident_report = raw_data.get("incident_report")
     
     if not isinstance(incident_report, str) or not incident_report.strip():
@@ -36,7 +37,11 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
 
     log.info("incident_report diterima untuk %s: %s karakter.", log_uuid, len(incident_report))
     log_incident_report(log_uuid, incident_report)
-    log.info("🔍 Mencari Alert dan Case dengan UUID: %s...", log_uuid)
+    log.info(
+        "🔍 Mencari Alert untuk UUID %s%s...",
+        log_uuid,
+        f" dan ID {source_alert_id}" if source_alert_id is not None else "",
+    )
     
     # ==========================================================
     # 1. UPDATE ALERT
@@ -57,7 +62,9 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
             source_ref = str(alert.get("alert_source_ref", ""))
             desc = str(alert.get("alert_description", ""))
             
-            if str(log_uuid) == source_ref or str(log_uuid) in desc:
+            if (
+                source_alert_id is not None and str(source_alert_id) == str(a_id)
+            ) or str(log_uuid) == source_ref or str(log_uuid) in desc:
                 target_alert_id = a_id
                 break
     except Exception as e:
@@ -67,6 +74,26 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
         log.info("✅ Alert DITEMUKAN! ID: %s", target_alert_id)
         current_alert = await iris_client.get_alert(target_alert_id)
         if current_alert:
+            alert_source_ref = str(current_alert.get("alert_source_ref") or "").strip()
+            if alert_source_ref and alert_source_ref != log_uuid:
+                if source_alert_id is not None and str(source_alert_id) == str(target_alert_id):
+                    log.warning(
+                        "UUID laporan %s berbeda dari UUID Alert %s; menggunakan UUID Alert.",
+                        log_uuid,
+                        alert_source_ref,
+                    )
+                    log_uuid = alert_source_ref
+                else:
+                    log.error(
+                        "UUID Alert %s (%s) tidak cocok dengan laporan (%s); "
+                        "laporan tidak ditulis untuk menghindari salah Alert.",
+                        target_alert_id,
+                        alert_source_ref,
+                        log_uuid,
+                    )
+                    target_alert_id = None
+
+        if target_alert_id and current_alert:
             current_desc = current_alert.get("alert_description", "")
             if isinstance(current_desc, str):
                 updated_desc = upsert_ai_section(current_desc, log_uuid, incident_report)
