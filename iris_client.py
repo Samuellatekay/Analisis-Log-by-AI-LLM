@@ -698,12 +698,26 @@ class IrisClient:
             payload["alert_status_id"] = self.status_id
         return payload
 
-    def _ioc_type_id(self, kind: str, is_source: bool = False) -> int | None:
+    def _ioc_type_id(self, kind: str, is_source: bool = False, value: str = "") -> int | None:
         ids = self.ioc_type_ids
+        ip_type = "ipv4-addr"
+        try:
+            if ipaddress.ip_address(value).version == 6:
+                ip_type = "ipv6-addr"
+        except ValueError:
+            pass
         order = {
-            "ip": ["ip-src", "ip-dst"] if is_source else ["ip-dst", "ip-src"],
-            "domain": ["domain", "hostname"], "url": ["url"], "sha256": ["sha256"],
-            "sha1": ["sha1"], "md5": ["md5"], "filename": ["filename"],
+            "ip": (
+                ["ip-src", ip_type, "ip-address", "ip-dst"]
+                if is_source else
+                ["ip-dst", ip_type, "ip-address", "ip-src"]
+            ),
+            "domain": ["domain", "domain-name", "hostname"],
+            "url": ["url", "uri"],
+            "sha256": ["sha256", "sha-256"],
+            "sha1": ["sha1", "sha-1"],
+            "md5": ["md5"],
+            "filename": ["filename", "file-name"],
         }.get(kind, [])
         return next((ids[n] for n in order if n in ids), None)
 
@@ -719,9 +733,16 @@ class IrisClient:
         # IP sumber/tujuan selalu jadi IOC, walau enrichment (observables) belum datang,
         # supaya update berikutnya punya IOC yang bisa diisi data OpenCTI/geolokasi.
         known = {str(o.get("value") or "").strip().lower() for o in observables if isinstance(o, dict)}
-        base = [{"entity_type": "IPv4-Addr", "value": str(ip)}
-                for ip in (src_ip, _d(doc.get("destination")).get("ip"))
-                if ip and str(ip).strip().lower() not in known]
+        base = []
+        for ip in (src_ip, _d(doc.get("destination")).get("ip")):
+            if not ip or str(ip).strip().lower() in known:
+                continue
+            try:
+                parsed_ip = ipaddress.ip_address(str(ip))
+            except ValueError:
+                continue
+            entity_type = "IPv4-Addr" if parsed_ip.version == 4 else "IPv6-Addr"
+            base.append({"entity_type": entity_type, "value": str(parsed_ip)})
         observables = [*base, *observables]
         rep = _d(doc.get("reputation"))
         rep_ip = str(rep.get("ip") or rep.get("value") or "")
@@ -739,7 +760,7 @@ class IrisClient:
             if not kind or value.lower() in seen:
                 continue
             is_src = bool(src_ip) and value == src_ip
-            type_id = self._ioc_type_id(kind, is_src)
+            type_id = self._ioc_type_id(kind, is_src, value)
             if type_id is None:
                 continue
             seen.add(value.lower())
