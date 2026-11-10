@@ -138,21 +138,46 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
                     
         except Exception as e:
             log.error("❌ Gagal mengupdate Case %s: %s", target_case_id, e)
+            
     # ==========================================================
-    # 3. TAMBAHKAN KE NOTES (FALLBACK YANG PASTI MUNCUL) <--- INI BAGIAN BARUNYA
+    # 3. TAMBAHKAN KE NOTES (DENGAN LOGIKA DIRECTORY OTOMATIS)
     # ==========================================================
     if target_case_id:
         try:
-            note_payload = {
-                "note_title": f"🤖 Laporan Analisis AI - {log_uuid[:8]}",
-                "note_content": incident_report,
-            }
-            # Kirim ke endpoint Notes API v2
-            await iris_client._post(f"/api/v2/cases/{target_case_id}/notes", note_payload)
-            log.info("✅ Laporan AI berhasil ditambahkan ke tab NOTES Case %s", target_case_id)
-        except Exception as e:
-            log.warning("⚠️ Gagal menambah ke Notes: %s", e)    
+            # A. Cek apakah sudah ada directory/folder notes di Case ini
+            dirs_resp = await iris_client._get(f"/api/v2/cases/{target_case_id}/notes-directories")
+            dirs_data = dirs_resp.get("data", [])
+            
+            directory_id = None
+            
+            # Jika sudah ada folder, ambil ID folder pertama (biasanya folder root)
+            if isinstance(dirs_data, list) and len(dirs_data) > 0:
+                directory_id = dirs_data[0].get("id")
+            else:
+                # B. Jika BELUM ADA folder, BUAT folder baru terlebih dahulu!
+                log.info("📁 Belum ada folder notes, membuat folder 'Laporan AI'...")
+                new_dir = await iris_client._post(
+                    f"/api/v2/cases/{target_case_id}/notes-directories", 
+                    {"name": "Laporan AI"}
+                )
+                directory_id = new_dir.get("id")
+
+            # C. Sekarang buat Notenya dengan directory_id yang VALID (Integer)
+            if directory_id:
+                note_payload = {
+                    "note_title": f"🤖 Laporan Analisis AI - {log_uuid[:8]}",
+                    "note_content": incident_report,
+                    "directory_id": int(directory_id) # WAJIB Integer, tidak boleh null
+                }
                 
+                await iris_client._post(f"/api/v2/cases/{target_case_id}/notes", note_payload)
+                log.info("✅ Laporan AI berhasil ditambahkan ke tab NOTES Case %s", target_case_id)
+            else:
+                log.error("❌ Gagal mendapatkan ID directory untuk Case %s", target_case_id)
+                
+        except Exception as e:
+            log.error("❌ Gagal menambah Note ke Case %s: %s", target_case_id, e)
+
     return True
 
 
