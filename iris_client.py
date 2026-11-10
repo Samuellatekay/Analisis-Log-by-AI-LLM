@@ -408,8 +408,6 @@ class IrisClient:
         self.case_full_description = False
         self.case_import_assets = True
         self.case_summary_field = ""
-        self.case_update_enabled = True
-        self.escalate_description = True
         self.ioc_type_ids: dict[str, int] = {}
         self._ioc_type_override: dict[str, int] = {}
         self.tlp_id: int | None = None
@@ -455,8 +453,6 @@ class IrisClient:
         obj.case_full_description = env.get("IRIS_CASE_FULL_DESCRIPTION", "false").lower() == "true"
         obj.case_import_assets = env.get("IRIS_CASE_IMPORT_ASSETS", "true").lower() == "true"
         obj.case_summary_field = env.get("IRIS_CASE_SUMMARY_FIELD", "").strip()
-        obj.case_update_enabled = env.get("IRIS_CASE_UPDATE", "true").lower() == "true"
-        obj.escalate_description = env.get("IRIS_ESCALATE_DESCRIPTION", "true").lower() == "true"
         for pair in filter(None, env.get("IRIS_IOC_TYPE_MAP", "").split(",")):
             k, _, v = pair.partition(":")
             obj._ioc_type_override[k.strip().lower()] = int(v)
@@ -1103,19 +1099,7 @@ class IrisClient:
         return d.get("case_id") or d.get("id")
 
     async def update_case_description(self, case_id: int, doc: dict) -> bool:
-        if not self.case_update_enabled:
-            log.info("Case %s: update deskripsi dimatikan (IRIS_CASE_UPDATE=false).", case_id)
-            return False
-        try:
-            current = await self._get(self.paths["case_read"].format(id=case_id))
-        except Exception as e:
-            log.error("❌ Gagal membaca Case %s: %s. Case mungkin tidak ada atau akses ditolak.", case_id, e)
-            return False
-
-        if not current:
-            log.warning("⚠️ Case %s tidak ditemukan di IRIS.", case_id)
-            return False
-
+        current = await self._get(self.paths["case_read"].format(id=case_id))
         current_description = current.get("case_description") or current.get("description", "")
         if not isinstance(current_description, str):
             current_description = ""
@@ -1226,8 +1210,6 @@ class IrisClient:
         body = {"iocs_import_list": iocs, "assets_import_list": assets, "import_as_event": False,
                 "note": "Diekskalasi otomatis oleh Analisis_Log (risk tinggi).",
                 "case_title": p["alert_title"][:250], "case_tags": p["alert_tags"]}
-        if self.escalate_description:
-            body["case_description"] = self._case_text(p)
         d = await self._post_with_import(self.paths["escalate"].format(id=alert_id), body)
         return d.get("case_id") or d.get("id")
 
