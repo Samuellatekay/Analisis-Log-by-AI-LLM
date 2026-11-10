@@ -1204,14 +1204,34 @@ class IrisClient:
             body = {**body, "iocs_import_list": [], "assets_import_list": []}
             return await self._post(path, body)
 
+
     async def escalate_alert(self, alert_id: int, doc: dict) -> int | None:
         p = self.build_payload(doc)
         iocs, assets = await self._import_lists(alert_id)
-        body = {"iocs_import_list": iocs, "assets_import_list": assets, "import_as_event": False,
-                "note": "Diekskalasi otomatis oleh Analisis_Log (risk tinggi).",
-                "case_title": p["alert_title"][:250], "case_tags": p["alert_tags"]}
-        d = await self._post_with_import(self.paths["escalate"].format(id=alert_id), body)
+
+        # Ambil OVERVIEW/Description dari alert
+        case_summary = self._case_text(p)
+
+        body = {
+            "iocs_import_list": iocs,
+            "assets_import_list": assets,
+            "import_as_event": False,
+            "note": "Diekskalasi otomatis oleh Analisis_Log (risk tinggi).",
+            "case_title": p["alert_title"][:250],
+            "case_description": case_summary,
+            "case_tags": p["alert_tags"]
+        }
+
+        if self.case_summary_field:
+            body[self.case_summary_field] = case_summary
+
+        d = await self._post_with_import(
+            self.paths["escalate"].format(id=alert_id),
+            body
+        )
+
         return d.get("case_id") or d.get("id")
+
 
     async def merge_alert(self, alert_id: int, case_id: int, doc: dict) -> None:
         risk = _d(doc.get("risk"))
