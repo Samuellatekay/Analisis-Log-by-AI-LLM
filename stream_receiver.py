@@ -250,15 +250,25 @@ async def run_receiver():
                     
                     async for line in response.aiter_lines():
                         line = line.strip()
-                        if not line: continue
+                        if not line:
+                            continue
+                        
+                        # LOG BARU: Cetak 100 karakter pertama dari apa pun yang diterima
+                        log.info(f"📩 TERIMA DATA DARI STREAM: {line[:100]}...")
                         
                         try:
                             raw_data = json.loads(line)
-                            await inject_incident_report(iris_client, raw_data)
-                        except json.JSONDecodeError:
-                            log.warning("⚠️ Data bukan JSON valid: %s", line[:50])
+                            
+                            # Cek manual apakah ada incident_report
+                            if not raw_data.get("incident_report"):
+                                log.warning("⚠️ Data diterima, tapi TIDAK ADA 'incident_report'. Melewati.")
+                                continue
+                                
+                            await inject_report(client, raw_data)
+                        except json.JSONDecodeError as e:
+                            log.error(f"❌ Data BUKAN JSON valid: {line[:100]} | Error: {e}")
                         except Exception as e:
-                            log.error("❌ Error memproses data: %s", e)
+                            log.error(f"❌ Error fatal saat memproses data: {e}", exc_info=True)
                             
             except httpx.RequestError as e:
                 log.error("❌ Koneksi stream terputus: %s", e)
