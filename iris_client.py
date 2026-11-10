@@ -491,7 +491,20 @@ class IrisClient:
         obj.escalate_description = env.get("IRIS_ESCALATE_DESCRIPTION", "true").lower() == "true"
         for pair in filter(None, env.get("IRIS_IOC_TYPE_MAP", "").split(",")):
             k, _, v = pair.partition(":")
-            obj._ioc_type_override[k.strip().lower()] = int(v)
+            key, value = k.strip().lower(), v.strip()
+            try:
+                type_id = int(value)
+            except ValueError:
+                log.warning(
+                    "IRIS_IOC_TYPE_MAP entry for %r has no numeric type ID; ignoring it. "
+                    "Set a real IRIS ID or leave the mapping empty.",
+                    key,
+                )
+                continue
+            if not key:
+                log.warning("IRIS_IOC_TYPE_MAP contains an entry without an IOC type; ignoring it.")
+                continue
+            obj._ioc_type_override[key] = type_id
         tlp = env.get("IRIS_IOC_TLP_ID", "").strip()
         obj.tlp_id = int(tlp) if tlp else None
         return obj
