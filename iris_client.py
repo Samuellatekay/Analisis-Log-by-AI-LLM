@@ -392,7 +392,6 @@ def _case_tags_str(current: dict) -> str:
 # Disimpan di akhir deskripsi sebagai section ber-judul "## Analisis AI (LLM) - <8 huruf uuid>"
 # supaya bisa diganti per log_uuid (tanpa dobel) dan dipertahankan saat deskripsi ditulis ulang.
 _AI_RE = re.compile(r"(?m)^## Analisis AI \(LLM\) - ([0-9A-Za-z]{8})[^\n]*$")
-AI_SUMMARY_MAX = 6000
 
 
 def split_ai_sections(desc: str) -> tuple[str, dict[str, str]]:
@@ -408,12 +407,12 @@ def split_ai_sections(desc: str) -> tuple[str, dict[str, str]]:
     return desc[:matches[0].start()].rstrip(), sections
 
 
-def upsert_ai_section(desc: str, log_uuid: str, report: str, max_report: int = AI_SUMMARY_MAX) -> str:
+def upsert_ai_section(desc: str, log_uuid: str, report: str, max_report: int | None = None) -> str:
     """Tambahkan/ganti section Analisis AI milik log_uuid di akhir deskripsi."""
     base, sections = split_ai_sections(desc)
     key = re.sub(r"[^0-9A-Za-z]", "", str(log_uuid))[:8].ljust(8, "0")
     body = str(report).strip()
-    if len(body) > max_report:
+    if max_report is not None and len(body) > max_report:
         body = body[:max_report].rstrip() + "\n\n_(dipotong; laporan lengkap ada di tab Notes)_"
     sections[key] = f"## Analisis AI (LLM) - {key}\n\n{body}"
     return "\n\n".join(([base] if base else []) + list(sections.values()))
@@ -1158,8 +1157,7 @@ class IrisClient:
         Digunakan untuk menyisipkan incident_report di tengah deskripsi.
         """
         path = self.paths["alert_update"].format(id=alert_id)
-        # Batasi panjang maksimal sesuai batas IRIS
-        update_payload = {"alert_description": new_description[:16000]}
+        update_payload = {"alert_description": new_description}
 
         try:
             if self.api_version == "legacy":

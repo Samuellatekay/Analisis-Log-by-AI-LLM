@@ -94,6 +94,8 @@ yang memuat `log_uuid` dan `incident_report`. Laporan ditambahkan sebagai sectio
 Markdown di Summary alert/case dan disimpan juga sebagai Note case. Case eskalasi
 dicocokkan melalui `log_uuid` pada deskripsinya. Jika `.env` sudah dibuat
 sebelumnya, buat ulang container setelah memperbarui image aplikasi.
+Laporan AI tidak dipotong oleh batas karakter tetap aplikasi; jika IRIS menolak
+deskripsi yang terlalu panjang, kegagalan update dicatat di log receiver.
 
 ## Konfigurasi dan menjalankan
 

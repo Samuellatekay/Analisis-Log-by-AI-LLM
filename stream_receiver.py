@@ -61,8 +61,10 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
             if isinstance(current_desc, str):
                 updated_desc = upsert_ai_section(current_desc, log_uuid, incident_report)
                 if updated_desc != current_desc:
-                    await iris_client.update_alert_description(target_alert_id, updated_desc)
-                    log.info("📝 Deskripsi Alert %s berhasil diupdate.", target_alert_id)
+                    if await iris_client.update_alert_description(target_alert_id, updated_desc):
+                        log.info("📝 Deskripsi Alert %s berhasil diupdate.", target_alert_id)
+                    else:
+                        log.warning("⚠️ Gagal mengupdate deskripsi Alert %s.", target_alert_id)
                 else:
                     log.info("ℹ️ Laporan sudah ada di Alert %s.", target_alert_id)
 
@@ -118,7 +120,7 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
                 if updated_desc != old_desc:
                     await iris_client._put(
                         f"/api/v2/cases/{target_case_id}",
-                        {"case_description": updated_desc[:16000]},
+                        {"case_description": updated_desc},
                     )
                     log.info("📝 Summary Case %s berhasil diupdate dengan analisis AI.", target_case_id)
                 else:
