@@ -1351,9 +1351,15 @@ class App:
                 await self.redis.delete(lock)
 
     async def _update_case_from_enrichment(self, case_id: int, r: Record) -> None:
-        updated = await self.iris.update_case_description(case_id, r.doc)
-        if updated:
-            log.info("IRIS case %s diperbarui dari enrichment log=%s", case_id, r.log_uuid)
+        try:
+            updated = await self.iris.update_case_description(case_id, r.doc)
+            if updated:
+                log.info("IRIS case %s diperbarui dari enrichment log=%s", case_id, r.log_uuid)
+        except Exception as e:
+            if "404" in str(e) or "Not Found" in str(e):
+                log.warning("⚠️ Case %s tidak ditemukan di IRIS (mungkin sudah dihapus). Melewati update.", case_id)
+            else:
+                log.error("❌ Gagal mengupdate case %s: %s", case_id, e)
 
     @staticmethod
     def _has_enrichment_update(doc: dict) -> bool:
