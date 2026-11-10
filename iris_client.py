@@ -1,6 +1,7 @@
 """
 iris_client.py - Integrasi DFIR-IRIS (REST API: POST {IRIS_URL}/alerts/add, auth Bearer API key).
 
+
 Alert dibuat dari log berisiko tinggi dan konteks enrichment. Severity IRIS ditentukan
 secara deterministik dari risk score.
 
@@ -1098,16 +1099,7 @@ class IrisClient:
         return d.get("case_id") or d.get("id")
 
     async def update_case_description(self, case_id: int, doc: dict) -> bool:
-        try:
-            current = await self._get(self.paths["case_read"].format(id=case_id))
-        except Exception as e:
-            log.error("❌ Gagal membaca Case %s: %s. Case mungkin tidak ada atau akses ditolak.", case_id, e)
-            return False
-            
-        if not current:
-            log.warning("⚠️ Case %s tidak ditemukan di IRIS.", case_id)
-            return False
-            
+        current = await self._get(self.paths["case_read"].format(id=case_id))
         current_description = current.get("case_description") or current.get("description", "")
         if not isinstance(current_description, str):
             current_description = ""
@@ -1129,25 +1121,11 @@ class IrisClient:
         log.info("Case %s: Memulai pembaruan deskripsi...", case_id)
 
         if self.api_version == "v2":
-            update_payload = {
-                "case_description": updated_description,
-                "case_name": current.get("case_name") or current.get("name", "Unnamed Case"),
-                "case_customer": current.get("case_customer_id") or current.get("case_customer") or self.customer_id,
-                "case_soc_id": current.get("case_soc_id") or current.get("soc_id") or "",
-                "case_tags": _case_tags_str(current),
-            }
-            # Pertahankan atribut case yang ada agar update deskripsi tidak mereset nilainya.
-            for k in ("state_id", "severity_id", "status_id", "reviewer_id", "review_status_id"):
-                if current.get(k) is not None:
-                    update_payload[k] = current[k]
-            if isinstance(current.get("custom_attributes"), dict):
-                update_payload["custom_attributes"] = current["custom_attributes"]
+            # Sama seperti UI IRIS saat menyimpan Summary: cukup {"case_description": ...}.
+            # PUT menerima body parsial, jadi nama, tag, status, dan atribut lain tidak disentuh.
+            update_payload = {"case_description": updated_description}
             for k in extra_fields:
                 update_payload[k] = updated_description
-            if "classification_id" in current:
-                update_payload["classification_id"] = current["classification_id"]
-            if "owner_id" in current:
-                update_payload["owner_id"] = current["owner_id"]
 
             await self._put(self.paths["case_update"].format(id=case_id), update_payload)
         else:
@@ -1166,7 +1144,7 @@ class IrisClient:
 
         log.info("✅ Case %s: Deskripsi berhasil diperbarui.", case_id)
         return True
-    
+
     async def delete_case(self, case_id: int) -> bool:
         path = self.paths["case_delete"].format(id=case_id)
         if self.api_version == "v2":
@@ -1229,15 +1207,9 @@ class IrisClient:
     async def escalate_alert(self, alert_id: int, doc: dict) -> int | None:
         p = self.build_payload(doc)
         iocs, assets = await self._import_lists(alert_id)
-        body = {
-            "iocs_import_list": iocs,
-            "assets_import_list": assets,
-            "import_as_event": False,
-            "note": "Diekskalasi otomatis oleh Analisis_Log (risk tinggi).",
-            "case_title": p["alert_title"][:250],
-            "case_tags": p["alert_tags"],
-            "case_description": self._case_text(p)  # <-- INI YANG DITAMBAHKAN
-        }
+        body = {"iocs_import_list": iocs, "assets_import_list": assets, "import_as_event": False,
+                "note": "Diekskalasi otomatis oleh Analisis_Log (risk tinggi).",
+                "case_title": p["alert_title"][:250], "case_tags": p["alert_tags"]}
         d = await self._post_with_import(self.paths["escalate"].format(id=alert_id), body)
         return d.get("case_id") or d.get("id")
 
