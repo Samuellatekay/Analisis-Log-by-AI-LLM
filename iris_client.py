@@ -388,6 +388,37 @@ def _case_tags_str(current: dict) -> str:
     return str(tags)
 
 
+# ---- Bagian "Analisis AI (LLM)" yang ditambahkan stream_receiver ke deskripsi alert/case.
+# Disimpan di akhir deskripsi sebagai section ber-judul "## Analisis AI (LLM) - <8 huruf uuid>"
+# supaya bisa diganti per log_uuid (tanpa dobel) dan dipertahankan saat deskripsi ditulis ulang.
+_AI_RE = re.compile(r"(?m)^## Analisis AI \(LLM\) - ([0-9A-Za-z]{8})[^\n]*$")
+AI_SUMMARY_MAX = 6000
+
+
+def split_ai_sections(desc: str) -> tuple[str, dict[str, str]]:
+    """Pisahkan deskripsi menjadi (bagian dasar, {kunci: teks section Analisis AI})."""
+    desc = desc or ""
+    matches = list(_AI_RE.finditer(desc))
+    if not matches:
+        return desc.rstrip(), {}
+    sections: dict[str, str] = {}
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(desc)
+        sections[m.group(1)] = desc[m.start():end].rstrip()
+    return desc[:matches[0].start()].rstrip(), sections
+
+
+def upsert_ai_section(desc: str, log_uuid: str, report: str, max_report: int = AI_SUMMARY_MAX) -> str:
+    """Tambahkan/ganti section Analisis AI milik log_uuid di akhir deskripsi."""
+    base, sections = split_ai_sections(desc)
+    key = re.sub(r"[^0-9A-Za-z]", "", str(log_uuid))[:8].ljust(8, "0")
+    body = str(report).strip()
+    if len(body) > max_report:
+        body = body[:max_report].rstrip() + "\n\n_(dipotong; laporan lengkap ada di tab Notes)_"
+    sections[key] = f"## Analisis AI (LLM) - {key}\n\n{body}"
+    return "\n\n".join(([base] if base else []) + list(sections.values()))
+
+
 class IrisClient:
     def __init__(self, url: str, api_key: str, customer_id: int, verify: bool | ssl.SSLContext,
                  timeout_s: float, severity_map: dict[str, int], status_id: int | None,
@@ -408,6 +439,9 @@ class IrisClient:
         self.case_full_description = False
         self.case_import_assets = True
         self.case_summary_field = ""
+        self.case_update_enabled = True
+        self._missing_cases: set[int] = set()
+        self.escalate_description = True
         self.ioc_type_ids: dict[str, int] = {}
         self._ioc_type_override: dict[str, int] = {}
         self.tlp_id: int | None = None
@@ -453,6 +487,8 @@ class IrisClient:
         obj.case_full_description = env.get("IRIS_CASE_FULL_DESCRIPTION", "false").lower() == "true"
         obj.case_import_assets = env.get("IRIS_CASE_IMPORT_ASSETS", "true").lower() == "true"
         obj.case_summary_field = env.get("IRIS_CASE_SUMMARY_FIELD", "").strip()
+        obj.case_update_enabled = env.get("IRIS_CASE_UPDATE", "true").lower() == "true"
+        obj.escalate_description = env.get("IRIS_ESCALATE_DESCRIPTION", "true").lower() == "true"
         for pair in filter(None, env.get("IRIS_IOC_TYPE_MAP", "").split(",")):
             k, _, v = pair.partition(":")
             obj._ioc_type_override[k.strip().lower()] = int(v)
@@ -830,6 +866,17 @@ class IrisClient:
             )
         }
         # alert_assets diabaikan IRIS saat update; aset diperbarui lewat _safe_sync_assets().
+        # Pertahankan section "Analisis AI (LLM)" yang sudah ditambahkan stream_receiver.
+        try:
+            current = await self.get_alert(alert_id)
+            cur_desc = (current or {}).get("alert_description")
+            if isinstance(cur_desc, str):
+                _, ai_sections = split_ai_sections(cur_desc)
+                if ai_sections:
+                    update["alert_description"] = (update["alert_description"].rstrip() + "\n\n"
+                                                   + "\n\n".join(ai_sections.values()))
+        except Exception as exc:
+            log.warning("IRIS: gagal membaca deskripsi alert %s untuk menjaga Analisis AI (%s)", alert_id, type(exc).__name__)
         path = self.paths["alert_update"].format(id=alert_id)
         if self.api_version == "legacy":
             await self._post(path, update)
@@ -1099,12 +1146,39 @@ class IrisClient:
         return d.get("case_id") or d.get("id")
 
     async def update_case_description(self, case_id: int, doc: dict) -> bool:
-        current = await self._get(self.paths["case_read"].format(id=case_id))
+        if not self.case_update_enabled:
+            log.info("Case %s: update deskripsi dimatikan (IRIS_CASE_UPDATE=false).", case_id)
+            return False
+        if case_id in self._missing_cases:
+            return False
+        try:
+            current = await self._get(self.paths["case_read"].format(id=case_id))
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                self._missing_cases.add(case_id)
+                log.warning("⚠️ Case %s tidak ada di IRIS (404, mungkin sudah dihapus). Update dilewati; "
+                            "hapus/ganti nomor case ini dari penyimpanan korelasi aplikasi supaya dibuat case baru.",
+                            case_id)
+            else:
+                log.error("❌ Gagal membaca Case %s: HTTP %s.", case_id, e.response.status_code)
+            return False
+        except Exception as e:
+            log.error("❌ Gagal membaca Case %s: %s", case_id, e)
+            return False
+
+        if not current:
+            log.warning("⚠️ Case %s tidak ditemukan di IRIS.", case_id)
+            return False
+
         current_description = current.get("case_description") or current.get("description", "")
         if not isinstance(current_description, str):
             current_description = ""
 
         updated_description = self._case_text(self.build_payload(doc))
+        # Pertahankan section "Analisis AI (LLM)" di Summary agar tidak tertimpa update otomatis.
+        _, ai_sections = split_ai_sections(current_description)
+        if ai_sections:
+            updated_description = updated_description.rstrip() + "\n\n" + "\n\n".join(ai_sections.values())
 
         # IRIS v3 beta bisa memakai nama field berbeda untuk Summary (description/summary/...).
         # Kirim ke setiap field yang ada di data case, ditambah field dari IRIS_CASE_SUMMARY_FIELD.
@@ -1204,34 +1278,16 @@ class IrisClient:
             body = {**body, "iocs_import_list": [], "assets_import_list": []}
             return await self._post(path, body)
 
-
     async def escalate_alert(self, alert_id: int, doc: dict) -> int | None:
         p = self.build_payload(doc)
         iocs, assets = await self._import_lists(alert_id)
-
-        # Ambil OVERVIEW/Description dari alert
-        case_summary = self._case_text(p)
-
-        body = {
-            "iocs_import_list": iocs,
-            "assets_import_list": assets,
-            "import_as_event": False,
-            "note": "Diekskalasi otomatis oleh Analisis_Log (risk tinggi).",
-            "case_title": p["alert_title"][:250],
-            "case_description": case_summary,
-            "case_tags": p["alert_tags"]
-        }
-
-        if self.case_summary_field:
-            body[self.case_summary_field] = case_summary
-
-        d = await self._post_with_import(
-            self.paths["escalate"].format(id=alert_id),
-            body
-        )
-
+        body = {"iocs_import_list": iocs, "assets_import_list": assets, "import_as_event": False,
+                "note": "Diekskalasi otomatis oleh Analisis_Log (risk tinggi).",
+                "case_title": p["alert_title"][:250], "case_tags": p["alert_tags"]}
+        if self.escalate_description:
+            body["case_description"] = self._case_text(p)
+        d = await self._post_with_import(self.paths["escalate"].format(id=alert_id), body)
         return d.get("case_id") or d.get("id")
-
 
     async def merge_alert(self, alert_id: int, case_id: int, doc: dict) -> None:
         risk = _d(doc.get("risk"))
