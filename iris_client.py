@@ -1098,7 +1098,16 @@ class IrisClient:
         return d.get("case_id") or d.get("id")
 
     async def update_case_description(self, case_id: int, doc: dict) -> bool:
-        current = await self._get(self.paths["case_read"].format(id=case_id))
+        try:
+            current = await self._get(self.paths["case_read"].format(id=case_id))
+        except Exception as e:
+            log.error("❌ Gagal membaca Case %s: %s. Case mungkin tidak ada atau akses ditolak.", case_id, e)
+            return False
+            
+        if not current:
+            log.warning("⚠️ Case %s tidak ditemukan di IRIS.", case_id)
+            return False
+            
         current_description = current.get("case_description") or current.get("description", "")
         if not isinstance(current_description, str):
             current_description = ""
@@ -1157,7 +1166,7 @@ class IrisClient:
 
         log.info("✅ Case %s: Deskripsi berhasil diperbarui.", case_id)
         return True
-
+    
     async def delete_case(self, case_id: int) -> bool:
         path = self.paths["case_delete"].format(id=case_id)
         if self.api_version == "v2":
