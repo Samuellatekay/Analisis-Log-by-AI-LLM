@@ -1353,32 +1353,57 @@ class IrisClient:
         await self._post_with_import(self.paths["merge"].format(id=alert_id), body)
 
     async def _list(self, paths: list[str]) -> list[tuple[int, str]]:
+        per_page = 100
         for p in paths:
-            try:
-                r = await self._client.get(p)
-                if r.status_code != 200 or "json" not in r.headers.get("content-type", ""):
-                    continue
-                j = r.json()
-            except (httpx.HTTPError, ValueError):
-                continue
-            items = j if isinstance(j, list) else None
-            if items is None and isinstance(j, dict):
-                for v in j.values():
-                    if isinstance(v, list):
-                        items = v
+            out: list[tuple[int, str]] = []
+            seen_ids: set[int] = set()
+            for page in range(1, 101):
+                try:
+                    r = await self._client.get(p, params={"page": page, "per_page": per_page})
+                    if r.status_code != 200 or "json" not in r.headers.get("content-type", ""):
+                        if page == 1:
+                            out = []
                         break
-                    if isinstance(v, dict):
-                        items = next((x for x in v.values() if isinstance(x, list)), None)
-                        if items is not None:
+                    j = r.json()
+                except (httpx.HTTPError, ValueError):
+                    if page == 1:
+                        out = []
+                        break
+                    log.warning("IRIS: gagal mengambil halaman %s dari daftar master data %s.", page, p)
+                    break
+                items = j if isinstance(j, list) else None
+                if items is None and isinstance(j, dict):
+                    for v in j.values():
+                        if isinstance(v, list):
+                            items = v
                             break
-            out = []
-            for it in items or []:
-                if not isinstance(it, dict):
-                    continue
-                _id = it.get("id") if isinstance(it.get("id"), int) else next((v for k, v in it.items() if k.endswith("_id") and isinstance(v, int)), None)
-                name = next((str(v) for k, v in it.items() if k == "name" or k.endswith("_name")), "")
-                if _id is not None:
-                    out.append((int(_id), name))
+                        if isinstance(v, dict):
+                            items = next((x for x in v.values() if isinstance(x, list)), None)
+                            if items is not None:
+                                break
+
+                page_out: list[tuple[int, str]] = []
+                for it in items or []:
+                    if not isinstance(it, dict):
+                        continue
+                    _id = it.get("id") if isinstance(it.get("id"), int) else next(
+                        (v for k, v in it.items() if k.endswith("_id") and isinstance(v, int)),
+                        None,
+                    )
+                    name = next(
+                        (str(v) for k, v in it.items() if k == "name" or k.endswith("_name")),
+                        "",
+                    )
+                    if _id is not None:
+                        page_out.append((int(_id), name))
+
+                new_items = [(item_id, name) for item_id, name in page_out if item_id not in seen_ids]
+                out.extend(new_items)
+                seen_ids.update(item_id for item_id, _ in new_items)
+                if len(page_out) < per_page or not new_items:
+                    break
+            else:
+                log.warning("IRIS: daftar master data %s melebihi 100 halaman; hasil mungkin tidak lengkap.", p)
             if out:
                 return out
         return []
