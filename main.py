@@ -1420,8 +1420,15 @@ class App:
             try:
                 alert_id, case_id = await self.db.get_iris_ids(r.log_uuid)
                 if alert_id is not None:
-                    await self.iris.update_alert(int(alert_id), r.doc)
-                    log.info("IRIS alert %s diperbarui log=%s", alert_id, r.log_uuid)
+                    try:
+                        await self.iris.update_alert(int(alert_id), r.doc)
+                        log.info("IRIS alert %s diperbarui log=%s", alert_id, r.log_uuid)
+                    except Exception as exc:
+                        if "404" in str(exc) or "Not Found" in str(exc):
+                            log.warning("⚠️ Alert %s tidak ditemukan di IRIS (mungkin sudah dihapus).", alert_id)
+                        else:
+                            log.error("❌ Gagal memperbarui alert IRIS %s: %s", alert_id, _error_label(exc))
+                    
                     if case_id is not None and self._has_enrichment_update(r.doc):
                         await self._update_case_from_enrichment(int(case_id), r)
                     continue
