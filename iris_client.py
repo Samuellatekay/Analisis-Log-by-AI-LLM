@@ -459,9 +459,6 @@ class IrisClient:
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "IrisClient | None":
-        # Komentar di belakang nilai ("NILAI   # catatan") dibuang; tidak semua pemuat .env
-        # (mis. docker run --env-file) menghapusnya sendiri.
-        env = {k: (re.sub(r"\s+#.*$", "", v).strip() if isinstance(v, str) else v) for k, v in env.items()}
         if env.get("IRIS_ENABLED", "false").lower() != "true":
             return None
         url, key = env.get("IRIS_URL", ""), env.get("IRIS_API_KEY", "")
