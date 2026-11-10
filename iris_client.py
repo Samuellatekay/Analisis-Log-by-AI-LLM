@@ -442,7 +442,6 @@ class IrisClient:
         self.case_update_enabled = True
         self._missing_cases: set[int] = set()
         self._missing_alerts: set[int] = set()
-        self.escalate_description = True
         self.ioc_type_ids: dict[str, int] = {}
         self._ioc_type_override: dict[str, int] = {}
         self.tlp_id: int | None = None
@@ -489,7 +488,6 @@ class IrisClient:
         obj.case_import_assets = env.get("IRIS_CASE_IMPORT_ASSETS", "true").lower() == "true"
         obj.case_summary_field = env.get("IRIS_CASE_SUMMARY_FIELD", "").strip()
         obj.case_update_enabled = env.get("IRIS_CASE_UPDATE", "true").lower() == "true"
-        obj.escalate_description = env.get("IRIS_ESCALATE_DESCRIPTION", "true").lower() == "true"
         for pair in filter(None, env.get("IRIS_IOC_TYPE_MAP", "").split(",")):
             k, _, v = pair.partition(":")
             key, value = k.strip().lower(), v.strip()
@@ -1200,8 +1198,8 @@ class IrisClient:
         d = await self._post(self.paths["case"], body)
         return d.get("case_id") or d.get("id")
 
-    async def update_case_description(self, case_id: int, doc: dict) -> bool:
-        if not self.case_update_enabled:
+    async def update_case_description(self, case_id: int, doc: dict, *, force: bool = False) -> bool:
+        if not self.case_update_enabled and not force:
             log.info("Case %s: update deskripsi dimatikan (IRIS_CASE_UPDATE=false).", case_id)
             return False
         if case_id in self._missing_cases:
@@ -1339,10 +1337,18 @@ class IrisClient:
         body = {"iocs_import_list": iocs, "assets_import_list": assets, "import_as_event": False,
                 "note": "Diekskalasi otomatis oleh Analisis_Log (risk tinggi).",
                 "case_title": p["alert_title"][:250], "case_tags": p["alert_tags"]}
-        if self.escalate_description:
-            body["case_description"] = self._case_text(p)
         d = await self._post_with_import(self.paths["escalate"].format(id=alert_id), body)
-        return d.get("case_id") or d.get("id")
+        case_id = d.get("case_id") or d.get("id")
+        if case_id is None:
+            log.error("IRIS tidak mengembalikan ID case setelah alert %s dieskalasi; Summary tidak dapat diperbarui.",
+                      alert_id)
+            return None
+
+        updated = await self.update_case_description(int(case_id), doc, force=True)
+        if not updated:
+            log.warning("Case %s dibuat dari alert %s, tetapi Summary tidak berubah atau case belum dapat dibaca.",
+                        case_id, alert_id)
+        return int(case_id)
 
     async def merge_alert(self, alert_id: int, case_id: int, doc: dict) -> None:
         risk = _d(doc.get("risk"))

@@ -84,13 +84,16 @@ Pengiriman alert dilakukan melalui antrean worker IRIS. Satu kombinasi sumber da
 aksi dideduplikasi selama `IRIS_DEDUP_WINDOW_S`. `IRIS_WORKERS` mengatur jumlah
 worker; `IRIS_QUEUE_MAX` membatasi antrean.
 
+Saat alert dieskalasi menjadi case, deskripsi Overview alert otomatis disalin ke
+Case Summary melalui update case setelah proses eskalasi. Ini tetap dilakukan
+meskipun `IRIS_CASE_UPDATE=false`; pengaturan tersebut hanya menonaktifkan update
+case berikutnya dari enrichment.
+
 Layanan `stream-receiver` menerima laporan dari `TARGET_STREAM_URL` dalam JSON
 yang memuat `log_uuid` dan `incident_report`. Laporan ditambahkan sebagai section
 Markdown di Summary alert/case dan disimpan juga sebagai Note case. Case eskalasi
-dicocokkan melalui `log_uuid` pada deskripsinya; karena itu, aktifkan
-`IRIS_ESCALATE_DESCRIPTION=true`. Jika `.env` sudah dibuat sebelumnya, pastikan
-nilainya tidak ditimpa oleh definisi duplikat dan buat ulang container setelah
-mengubahnya.
+dicocokkan melalui `log_uuid` pada deskripsinya. Jika `.env` sudah dibuat
+sebelumnya, buat ulang container setelah memperbarui image aplikasi.
 
 ## Konfigurasi dan menjalankan
 
