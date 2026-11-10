@@ -1395,9 +1395,9 @@ class App:
         alert_id = int(alert_part) or None
         if alert_id:
             try:
-                await self.iris.update_alert(alert_id, doc)
-                log.info("IRIS alert %s diperbarui dari event berulang (pengulangan=%s skor=%s)",
-                         alert_id, repeat, r.risk_score)
+                if await self.iris.update_alert(alert_id, doc):
+                    log.info("IRIS alert %s diperbarui dari event berulang (pengulangan=%s skor=%s)",
+                             alert_id, repeat, r.risk_score)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1421,8 +1421,8 @@ class App:
                 alert_id, case_id = await self.db.get_iris_ids(r.log_uuid)
                 if alert_id is not None:
                     try:
-                        await self.iris.update_alert(int(alert_id), r.doc)
-                        log.info("IRIS alert %s diperbarui log=%s", alert_id, r.log_uuid)
+                        if await self.iris.update_alert(int(alert_id), r.doc):
+                            log.info("IRIS alert %s diperbarui log=%s", alert_id, r.log_uuid)
                     except Exception as exc:
                         if "404" in str(exc) or "Not Found" in str(exc):
                             log.warning("⚠️ Alert %s tidak ditemukan di IRIS (mungkin sudah dihapus).", alert_id)

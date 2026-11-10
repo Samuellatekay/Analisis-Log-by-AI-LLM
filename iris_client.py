@@ -441,6 +441,7 @@ class IrisClient:
         self.case_summary_field = ""
         self.case_update_enabled = True
         self._missing_cases: set[int] = set()
+        self._missing_alerts: set[int] = set()
         self.escalate_description = True
         self.ioc_type_ids: dict[str, int] = {}
         self._ioc_type_override: dict[str, int] = {}
@@ -869,7 +870,10 @@ class IrisClient:
         await self._safe_sync_assets(doc)
         return d.get("alert_id") or d.get("id")
 
-    async def update_alert(self, alert_id: int, doc: dict) -> None:
+    async def update_alert(self, alert_id: int, doc: dict) -> bool:
+        if alert_id in self._missing_alerts:
+            return False
+
         payload = self.build_payload(doc)
         update = {
             key: payload[key]
@@ -880,22 +884,39 @@ class IrisClient:
         }
         # alert_assets diabaikan IRIS saat update; aset diperbarui lewat _safe_sync_assets().
         # Pertahankan section "Analisis AI (LLM)" yang sudah ditambahkan stream_receiver.
+        path = self.paths["alert_update"].format(id=alert_id)
         try:
-            current = await self.get_alert(alert_id)
+            current = await self._get(path)
             cur_desc = (current or {}).get("alert_description")
             if isinstance(cur_desc, str):
                 _, ai_sections = split_ai_sections(cur_desc)
                 if ai_sections:
                     update["alert_description"] = (update["alert_description"].rstrip() + "\n\n"
                                                    + "\n\n".join(ai_sections.values()))
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                self._missing_alerts.add(alert_id)
+                log.warning("⚠️ Alert %s tidak ditemukan di IRIS (mungkin sudah dihapus); update dilewati.", alert_id)
+                return False
+            log.warning("IRIS: gagal membaca deskripsi alert %s untuk menjaga Analisis AI (%s)",
+                        alert_id, type(exc).__name__)
         except Exception as exc:
             log.warning("IRIS: gagal membaca deskripsi alert %s untuk menjaga Analisis AI (%s)", alert_id, type(exc).__name__)
-        path = self.paths["alert_update"].format(id=alert_id)
-        if self.api_version == "legacy":
-            await self._post(path, update)
-        else:
-            await self._put(path, update)
+
+        try:
+            if self.api_version == "legacy":
+                await self._post(path, update)
+            else:
+                await self._put(path, update)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                self._missing_alerts.add(alert_id)
+                log.warning("⚠️ Alert %s tidak ditemukan di IRIS (mungkin sudah dihapus); update dilewati.",
+                            alert_id)
+                return False
+            raise
         await self._safe_sync_assets(doc, alert_id)
+        return True
 
     # ============================================================
     # SINKRONISASI MANAGED ASSET (data GLPI -> aset IRIS)
