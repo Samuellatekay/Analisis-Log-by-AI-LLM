@@ -15,6 +15,15 @@ log = logging.getLogger("stream-receiver")
 
 TARGET_STREAM_URL = os.getenv("TARGET_STREAM_URL", "http://38.47.66.253:17772/stream")
 
+
+def log_incident_report(log_uuid: str, report: str) -> None:
+    """Tampilkan seluruh laporan AI di log, dengan penanda tiap baris."""
+    log.info("===== BEGIN LLM REPORT uuid=%s chars=%s =====", log_uuid, len(report))
+    for line in report.splitlines():
+        log.info("LLM | %s", line)
+    log.info("===== END LLM REPORT uuid=%s =====", log_uuid)
+
+
 async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> bool:
     log_uuid = str(raw_data.get("log_uuid") or raw_data.get("id", "")).strip()
     incident_report = raw_data.get("incident_report")
@@ -27,6 +36,7 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
         return False
 
     log.info("incident_report diterima untuk %s: %s karakter.", log_uuid, len(incident_report))
+    log_incident_report(log_uuid, incident_report)
     log.info("🔍 Mencari Alert dan Case dengan UUID: %s...", log_uuid)
     
     # ==========================================================
