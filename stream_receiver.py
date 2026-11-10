@@ -112,28 +112,33 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
         log.error(" Gagal mencari case: %s", e)
 
     # ==========================================================
-    # 3. UPDATE CASE DESCRIPTION (DENGAN HTML CONVERSION)
+    # 3. UPDATE CASE DESCRIPTION (AKAL-AKALAN 3 & 4)
     # ==========================================================
     if target_case_id:
-        log.info("🔄 Mengupdate Case Description dengan HTML...")
+        log.info("🔄 Memproses update deskripsi Case ID: %s...", target_case_id)
         try:
             current_case = await iris_client._get(f"/api/v2/cases/{target_case_id}")
-            if current_case:
-                old_desc = current_case.get("case_description") or ""
+            if not current_case:
+                log.warning("⚠️ Gagal mengambil detail Case %s", target_case_id)
+            else:
+                old_desc = current_case.get("case_description") or current_case.get("description") or ""
                 
-                # KONVERSI MARKDOWN KE HTML
-                try:
-                    import markdown
-                    html_report = markdown.markdown(incident_report, extensions=['extra', 'fenced_code', 'tables'])
-                    combined_desc = f"{old_desc}<hr><h3>🤖 Analisis AI</h3>{html_report}"
-                except ImportError:
-                    log.warning("⚠️ Library 'markdown' tidak terinstal. Menggunakan teks biasa.")
-                    combined_desc = f"{old_desc}\n\n---\n\n### 🤖 Analisis AI\n{incident_report}"
+                # --- AKAL-AKALAN 4: Format Teks Penanda Mencolok ---
+                # Jika HTML gagal di-render, blok teks raksasa ini akan langsung terlihat 
+                # saat analis tidak sengaja mengklik area kosong.
+                formatted_report = f"""
+================================================================================
+🚨 LAPORAN ANALISIS AI (KLIK AREA INI 2X UNTUK MELIHAT DETAIL) 🚨
+================================================================================
+{incident_report}
+================================================================================
+"""
                 
-                # Cek duplikasi
-                if "Analisis AI" not in old_desc and incident_report.strip() not in old_desc:
+                # Cek duplikasi agar tidak spam
+                if "LAPORAN ANALISIS AI" not in old_desc and incident_report.strip() not in old_desc:
+                    
                     update_payload = {
-                        "case_description": combined_desc[:16000],
+                        "case_description": f"{old_desc}\n\n{formatted_report}"[:16000],
                         "case_name": current_case.get("case_name") or "Unnamed Case",
                         "case_customer": current_case.get("case_customer_id") or current_case.get("case_customer") or 1,
                         "case_soc_id": current_case.get("case_soc_id") or current_case.get("soc_id") or log_uuid,
@@ -144,8 +149,29 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
                         "owner_id": current_case.get("owner_id") or current_case.get("user_id") or 1,
                     }
                     
+                    # 1. Update Deskripsi Utama
                     await iris_client._put(f"/api/v2/cases/{target_case_id}", update_payload)
-                    log.info("✅ Case Description %s berhasil diupdate dengan HTML!", target_case_id)
+                    log.info("📝 Deskripsi Case %s berhasil diupdate dengan penanda mencolok.", target_case_id)
+
+                    # --- AKAL-AKALAN 3: Trik "Dummy Update" / Goyang ---
+                    # Memaksa frontend IRIS menerima notifikasi perubahan case 
+                    # dan me-refresh state komponen Summary.
+                    try:
+                        import asyncio
+                        current_tags = update_payload["case_tags"]
+                        
+                        await asyncio.sleep(0.5) # Jeda setengah detik
+                        # Tambah spasi dummy di tags
+                        await iris_client._put(f"/api/v2/cases/{target_case_id}", {"case_tags": current_tags + " "})
+                        
+                        await asyncio.sleep(0.5)
+                        # Kembalikan tags ke semula
+                        await iris_client._put(f"/api/v2/cases/{target_case_id}", {"case_tags": current_tags})
+                        
+                        log.info("🔄 Trik 'Dummy Update' dilakukan untuk memaksa refresh frontend Case %s.", target_case_id)
+                    except Exception as e:
+                        log.warning("⚠️ Gagal melakukan trik dummy update: %s", e)
+                        
                 else:
                     log.info("ℹ️ Laporan AI sudah ada di Case %s.", target_case_id)
                     
