@@ -16,29 +16,41 @@ log = logging.getLogger("stream-receiver")
 TARGET_STREAM_URL = os.getenv("TARGET_STREAM_URL", "http://38.47.66.253:17772/stream")
 
 
-def log_incident_report(log_uuid: str, report: str) -> None:
+def log_incident_report(reference: str, report: str) -> None:
     """Tampilkan seluruh laporan AI di log tanpa mengubah isi atau line ending."""
-    log.info("===== BEGIN LLM REPORT uuid=%s chars=%s =====", log_uuid, len(report))
+    log.info("===== BEGIN LLM REPORT ref=%s chars=%s =====", reference, len(report))
     log.info("%s", report)
-    log.info("===== END LLM REPORT uuid=%s =====", log_uuid)
+    log.info("===== END LLM REPORT ref=%s =====", reference)
 
 
 async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> bool:
     log_uuid = str(raw_data.get("log_uuid") or raw_data.get("id", "")).strip()
     source_alert_id = raw_data.get("alert_id")
+    if source_alert_id is None and log_uuid.isdecimal():
+        source_alert_id = log_uuid
+    try:
+        source_alert_id = int(source_alert_id) if source_alert_id is not None else None
+    except (TypeError, ValueError):
+        log.warning("ID Alert tidak valid: %r.", source_alert_id)
+        source_alert_id = None
     incident_report = raw_data.get("incident_report")
     
     if not isinstance(incident_report, str) or not incident_report.strip():
         log.debug("ℹ️ Tidak ada incident_report. Melewati.")
         return False
-    if not log_uuid:
-        log.warning("⚠️ Ada incident_report tapi Tidak ada UUID. Melewati.")
+    if not log_uuid and source_alert_id is None:
+        log.warning("⚠️ Ada incident_report tapi tidak ada UUID atau ID Alert. Melewati.")
         return False
 
-    log.info("incident_report diterima untuk %s: %s karakter.", log_uuid, len(incident_report))
+    log.info(
+        "incident_report diterima untuk reference=%s alert_id=%s: %s karakter.",
+        log_uuid or "(none)",
+        source_alert_id if source_alert_id is not None else "(none)",
+        len(incident_report),
+    )
     log_incident_report(log_uuid, incident_report)
     log.info(
-        "🔍 Mencari Alert untuk UUID %s%s...",
+        "🔍 Mencari Alert untuk reference %s%s...",
         log_uuid,
         f" dan ID {source_alert_id}" if source_alert_id is not None else "",
     )
@@ -46,88 +58,99 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
     # ==========================================================
     # 1. UPDATE ALERT
     # ==========================================================
-    target_alert_id = None
-    try:
-        resp = await iris_client._client.get("/api/v2/alerts", params={"per_page": 50, "page": 1, "sort": "alert_source_event_time:desc"})
-        resp.raise_for_status()
-        resp_json = resp.json()
-        alerts = resp_json.get("data", []) if isinstance(resp_json, dict) else resp_json
-        
-        for alert in alerts:
-            if not isinstance(alert, dict): continue
-            a_id = alert.get("id") or alert.get("alert_id")
-            if a_id is None and isinstance(alert.get("data"), dict):
-                a_id = alert["data"].get("id") or alert["data"].get("alert_id")
-            
-            source_ref = str(alert.get("alert_source_ref", ""))
-            desc = str(alert.get("alert_description", ""))
-            
-            if (
-                source_alert_id is not None and str(source_alert_id) == str(a_id)
-            ) or str(log_uuid) == source_ref or str(log_uuid) in desc:
-                target_alert_id = a_id
-                break
-    except Exception as e:
-        log.error("❌ Gagal mencari alert: %s", e)
-
-    if target_alert_id:
-        log.info("✅ Alert DITEMUKAN! ID: %s", target_alert_id)
+    target_alert_id = source_alert_id
+    current_alert = None
+    if target_alert_id is not None:
         current_alert = await iris_client.get_alert(target_alert_id)
-        if current_alert:
-            alert_source_ref = str(current_alert.get("alert_source_ref") or "").strip()
-            if alert_source_ref and alert_source_ref != log_uuid:
-                if source_alert_id is not None and str(source_alert_id) == str(target_alert_id):
-                    log.warning(
-                        "UUID laporan %s berbeda dari UUID Alert %s; menggunakan UUID Alert.",
-                        log_uuid,
-                        alert_source_ref,
-                    )
-                    log_uuid = alert_source_ref
-                else:
-                    log.error(
-                        "UUID Alert %s (%s) tidak cocok dengan laporan (%s); "
-                        "laporan tidak ditulis untuk menghindari salah Alert.",
-                        target_alert_id,
-                        alert_source_ref,
-                        log_uuid,
-                    )
-                    target_alert_id = None
+        if not current_alert:
+            log.warning("Alert ID %s tidak ditemukan saat mengambil detail.", target_alert_id)
+            target_alert_id = None
 
-        if target_alert_id and current_alert:
-            current_desc = current_alert.get("alert_description", "")
-            if isinstance(current_desc, str):
-                updated_desc = upsert_ai_section(current_desc, log_uuid, incident_report)
-                current_note = current_alert.get("alert_note") or ""
-                if isinstance(current_note, str):
-                    updated_note = upsert_ai_section(current_note, log_uuid, incident_report)
-                else:
-                    updated_note = upsert_ai_section("", log_uuid, incident_report)
+    if target_alert_id is None and log_uuid and not log_uuid.isdecimal():
+        try:
+            resp = await iris_client._client.get(
+                "/api/v2/alerts",
+                params={"per_page": 50, "page": 1, "sort": "alert_source_event_time:desc"},
+            )
+            resp.raise_for_status()
+            resp_json = resp.json()
+            alerts = resp_json.get("data", []) if isinstance(resp_json, dict) else resp_json
 
-                if updated_desc != current_desc or updated_note != current_note:
-                    if await iris_client.update_alert_description(
-                        target_alert_id, updated_desc, alert_note=updated_note
-                    ):
-                        saved_alert = await iris_client.get_alert(target_alert_id)
-                        saved_note = saved_alert.get("alert_note") if saved_alert else None
-                        if isinstance(saved_note, str) and incident_report in saved_note:
-                            log.info(
-                                "📝 Deskripsi dan Alert Note %s diupdate; laporan utuh tersimpan (%s karakter).",
-                                target_alert_id,
-                                len(incident_report),
-                            )
-                        else:
-                            saved_note_len = len(saved_note) if isinstance(saved_note, str) else 0
-                            log.warning(
-                                "⚠️ Verifikasi Alert Note %s gagal: laporan masuk %s karakter, "
-                                "Note terbaca %s karakter.",
-                                target_alert_id,
-                                len(incident_report),
-                                saved_note_len,
-                            )
+            for alert in alerts:
+                if not isinstance(alert, dict):
+                    continue
+                alert_id = alert.get("id") or alert.get("alert_id")
+                if alert_id is None and isinstance(alert.get("data"), dict):
+                    alert_id = alert["data"].get("id") or alert["data"].get("alert_id")
+
+                source_ref = str(alert.get("alert_source_ref", ""))
+                description = str(alert.get("alert_description", ""))
+                if log_uuid == source_ref or log_uuid in description:
+                    target_alert_id = int(alert_id) if alert_id is not None else None
+                    break
+        except Exception as e:
+            log.error("❌ Gagal mencari alert: %s", e)
+
+        if target_alert_id is not None:
+            current_alert = await iris_client.get_alert(target_alert_id)
+
+    if target_alert_id and current_alert:
+        log.info("✅ Alert DITEMUKAN! ID: %s", target_alert_id)
+        alert_source_ref = str(current_alert.get("alert_source_ref") or "").strip()
+        if alert_source_ref and alert_source_ref != log_uuid:
+            if source_alert_id == target_alert_id:
+                log.info(
+                    "ID Alert %s terverifikasi; menggunakan UUID kanonis %s (UUID payload: %s).",
+                    target_alert_id,
+                    alert_source_ref,
+                    log_uuid or "(tidak dikirim)",
+                )
+                log_uuid = alert_source_ref
+            else:
+                log.error(
+                    "UUID Alert %s (%s) tidak cocok dengan laporan (%s); "
+                    "laporan tidak ditulis untuk menghindari salah Alert.",
+                    target_alert_id,
+                    alert_source_ref,
+                    log_uuid,
+                )
+                target_alert_id = None
+
+    if target_alert_id and current_alert:
+        current_desc = current_alert.get("alert_description", "")
+        if isinstance(current_desc, str):
+            updated_desc = upsert_ai_section(current_desc, log_uuid, incident_report)
+            current_note = current_alert.get("alert_note") or ""
+            if isinstance(current_note, str):
+                updated_note = upsert_ai_section(current_note, log_uuid, incident_report)
+            else:
+                updated_note = upsert_ai_section("", log_uuid, incident_report)
+
+            if updated_desc != current_desc or updated_note != current_note:
+                if await iris_client.update_alert_description(
+                    target_alert_id, updated_desc, alert_note=updated_note
+                ):
+                    saved_alert = await iris_client.get_alert(target_alert_id)
+                    saved_note = saved_alert.get("alert_note") if saved_alert else None
+                    if isinstance(saved_note, str) and incident_report in saved_note:
+                        log.info(
+                            "📝 Deskripsi dan Alert Note %s diupdate; laporan utuh tersimpan (%s karakter).",
+                            target_alert_id,
+                            len(incident_report),
+                        )
                     else:
-                        log.warning("⚠️ Gagal mengupdate deskripsi Alert %s.", target_alert_id)
+                        saved_note_len = len(saved_note) if isinstance(saved_note, str) else 0
+                        log.warning(
+                            "⚠️ Verifikasi Alert Note %s gagal: laporan masuk %s karakter, "
+                            "Note terbaca %s karakter.",
+                            target_alert_id,
+                            len(incident_report),
+                            saved_note_len,
+                        )
                 else:
-                    log.info("ℹ️ Laporan sudah ada di Alert %s.", target_alert_id)
+                    log.warning("⚠️ Gagal mengupdate deskripsi Alert %s.", target_alert_id)
+            else:
+                log.info("ℹ️ Laporan sudah ada di Alert %s.", target_alert_id)
 
     # ==========================================================
     # 2. UPDATE CASE (JIKA SUDAH ADA) - VERSI ROBUST
