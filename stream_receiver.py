@@ -153,14 +153,18 @@ async def add_case_note(iris: IrisClient, case_id: int, log_uuid: str, report: s
     if directory_id is None:
         log.error("❌ Tidak ada folder Notes yang bisa dipakai di Case %s.", case_id)
         return False
+        
+    # PERBAIKAN: Ganti "note_content" menjadi "note_text"
     await iris._post(f"/api/v2/cases/{case_id}/notes", {
         "note_title": f"Analisis AI - {log_uuid[:8]}"[:154],
-        "note_content": report,
+        "note_text": report,  # <-- Diubah di sini
         "directory_id": int(directory_id),
     })
+    
     _notes_done.add((case_id, log_uuid))
     log.info("✅ Analisis AI ditambahkan ke tab NOTES Case %s.", case_id)
     return True
+
 
 
 # ------------------------------------------------------------------ alur utama
