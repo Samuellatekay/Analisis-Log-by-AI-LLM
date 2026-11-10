@@ -1,6 +1,6 @@
 """
 stream_receiver.py - Menerima stream incident_report dan inject ke DFIR-IRIS
-Mode: Update Alert Description + Case Description (HTML) + Notes
+Mode: Update Alert Description + Case Description (Text/HTML) + Notes Fallback
 """
 import asyncio
 import json
@@ -85,7 +85,7 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
     # ==========================================================
     # 2. SMART SEARCH: CARI CASE (via soc_id, name, atau desc)
     # ==========================================================
-    log.info(" Memulai pencarian Case untuk UUID: %s...", log_uuid)
+    log.info("🔎 Memulai pencarian Case untuk UUID: %s...", log_uuid)
     try:
         resp_case = await iris_client._client.get("/api/v2/cases", params={"per_page": 100, "page": 1, "sort": "open_date:desc"})
         resp_case.raise_for_status()
@@ -109,7 +109,7 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
             log.info("ℹ️ Case untuk UUID ini belum di-escalate atau tidak ditemukan.")
             
     except Exception as e:
-        log.error(" Gagal mencari case: %s", e)
+        log.error("❌ Gagal mencari case: %s", e)
 
     # ==========================================================
     # 3. UPDATE CASE DESCRIPTION (AKAL-AKALAN 3 & 4)
@@ -124,8 +124,6 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
                 old_desc = current_case.get("case_description") or current_case.get("description") or ""
                 
                 # --- AKAL-AKALAN 4: Format Teks Penanda Mencolok ---
-                # Jika HTML gagal di-render, blok teks raksasa ini akan langsung terlihat 
-                # saat analis tidak sengaja mengklik area kosong.
                 formatted_report = f"""
 ================================================================================
 🚨 LAPORAN ANALISIS AI (KLIK AREA INI 2X UNTUK MELIHAT DETAIL) 🚨
@@ -154,10 +152,7 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
                     log.info("📝 Deskripsi Case %s berhasil diupdate dengan penanda mencolok.", target_case_id)
 
                     # --- AKAL-AKALAN 3: Trik "Dummy Update" / Goyang ---
-                    # Memaksa frontend IRIS menerima notifikasi perubahan case 
-                    # dan me-refresh state komponen Summary.
                     try:
-                        import asyncio
                         current_tags = update_payload["case_tags"]
                         
                         await asyncio.sleep(0.5) # Jeda setengah detik
@@ -191,7 +186,7 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
             if isinstance(dirs_data, list) and len(dirs_data) > 0:
                 directory_id = dirs_data[0].get("id")
             else:
-                log.info(" Membuat folder 'Laporan AI' di Notes...")
+                log.info("📁 Membuat folder 'Laporan AI' di Notes...")
                 new_dir = await iris_client._post(
                     f"/api/v2/cases/{target_case_id}/notes-directories", 
                     {"name": "Laporan AI"}
@@ -201,7 +196,7 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
             # Buat Note
             if directory_id:
                 note_payload = {
-                    "note_title": f" Analisis AI - {log_uuid[:8]}",
+                    "note_title": f"🤖 Analisis AI - {log_uuid[:8]}",
                     "note_content": incident_report,
                     "directory_id": int(directory_id)
                 }
@@ -216,14 +211,14 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
 
 
 async def run_receiver():
-    log.info(" Receiver aktif (Mode: Inject IR ke Alert & Case).")
+    log.info("🎧 Receiver aktif (Mode: Inject IR ke Alert & Case).")
     
     env = {
         "IRIS_ENABLED": "true",
-        "IRIS_URL": os.getenv("IRIS_URL", "https://iris.local"),
+        "IRIS_URL": os.getenv("IRIS_URL", "https://192.168.51.40"),
         "IRIS_API_KEY": os.getenv("IRIS_API_KEY", ""),
         "IRIS_CA_CERT": os.getenv("IRIS_CA_CERT", ""),
-        "IRIS_VERIFY_SSL": os.getenv("IRIS_VERIFY_SSL", "true"),
+        "IRIS_VERIFY_SSL": os.getenv("IRIS_VERIFY_SSL", "false"),
         "IRIS_CUSTOMER_ID": os.getenv("IRIS_CUSTOMER_ID", "1"),
         "IRIS_API_VERSION": os.getenv("IRIS_API_VERSION", "v2"),
     }
@@ -236,10 +231,10 @@ async def run_receiver():
         status, msg = await iris_client.check()
         log.info("✅ Koneksi ke IRIS: %s", msg)
     except Exception as e:
-        log.critical(" Gagal membuat IRIS Client: %s", e)
+        log.critical("❌ Gagal membuat IRIS Client: %s", e)
         return
 
-    log.info(" Menghubungkan ke stream: %s", TARGET_STREAM_URL)
+    log.info("🔌 Menghubungkan ke stream: %s", TARGET_STREAM_URL)
     
     async with httpx.AsyncClient(timeout=None) as client:
         while True:
@@ -264,7 +259,9 @@ async def run_receiver():
                                 log.warning("⚠️ Data diterima, tapi TIDAK ADA 'incident_report'. Melewati.")
                                 continue
                                 
-                            await inject_report(client, raw_data)
+                            # PERBAIKAN: Nama fungsi disesuaikan dengan definisi di atas
+                            await inject_incident_report(iris_client, raw_data)
+                            
                         except json.JSONDecodeError as e:
                             log.error(f"❌ Data BUKAN JSON valid: {line[:100]} | Error: {e}")
                         except Exception as e:
