@@ -91,9 +91,11 @@ case berikutnya dari enrichment.
 
 Layanan `stream-receiver` menerima laporan dari `TARGET_STREAM_URL` dalam JSON
 yang memuat `log_uuid` dan `incident_report`. Laporan ditambahkan sebagai section
-Markdown di Summary alert/case dan disimpan juga sebagai Note case. Case eskalasi
-dicocokkan melalui `log_uuid` pada deskripsinya. Jika `.env` sudah dibuat
-sebelumnya, buat ulang container setelah memperbarui image aplikasi.
+Markdown di Description alert/case dan disimpan juga sebagai Alert Note serta
+Note case. Salinan Alert Note menjaga laporan lengkap tetap tersedia di Alert
+jika Description dibatasi saat ditampilkan. Case eskalasi dicocokkan melalui
+`log_uuid` pada deskripsinya. Jika `.env` sudah dibuat sebelumnya, buat ulang
+container setelah memperbarui image aplikasi.
 Laporan AI tidak dipotong oleh batas karakter tetap aplikasi; jika IRIS menolak
 deskripsi yang terlalu panjang, kegagalan update dicatat di log receiver.
 

@@ -1151,13 +1151,17 @@ class IrisClient:
             log.error("Gagal mengambil detail alert %s: %s", alert_id, e)
             return None
 
-    async def update_alert_description(self, alert_id: int, new_description: str) -> bool:
+    async def update_alert_description(
+        self, alert_id: int, new_description: str, *, alert_note: str | None = None
+    ) -> bool:
         """
         Mengupdate seluruh deskripsi alert dengan string baru.
         Digunakan untuk menyisipkan incident_report di tengah deskripsi.
         """
         path = self.paths["alert_update"].format(id=alert_id)
         update_payload = {"alert_description": new_description}
+        if alert_note is not None:
+            update_payload["alert_note"] = alert_note
 
         try:
             if self.api_version == "legacy":

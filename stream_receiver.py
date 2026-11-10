@@ -26,6 +26,7 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
         log.warning("⚠️ Ada incident_report tapi Tidak ada UUID. Melewati.")
         return False
 
+    log.info("incident_report diterima untuk %s: %s karakter.", log_uuid, len(incident_report))
     log.info("🔍 Mencari Alert dan Case dengan UUID: %s...", log_uuid)
     
     # ==========================================================
@@ -60,9 +61,33 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
             current_desc = current_alert.get("alert_description", "")
             if isinstance(current_desc, str):
                 updated_desc = upsert_ai_section(current_desc, log_uuid, incident_report)
-                if updated_desc != current_desc:
-                    if await iris_client.update_alert_description(target_alert_id, updated_desc):
-                        log.info("📝 Deskripsi Alert %s berhasil diupdate.", target_alert_id)
+                current_note = current_alert.get("alert_note") or ""
+                if isinstance(current_note, str):
+                    updated_note = upsert_ai_section(current_note, log_uuid, incident_report)
+                else:
+                    updated_note = upsert_ai_section("", log_uuid, incident_report)
+
+                if updated_desc != current_desc or updated_note != current_note:
+                    if await iris_client.update_alert_description(
+                        target_alert_id, updated_desc, alert_note=updated_note
+                    ):
+                        saved_alert = await iris_client.get_alert(target_alert_id)
+                        saved_note = saved_alert.get("alert_note") if saved_alert else None
+                        if isinstance(saved_note, str) and incident_report.strip() in saved_note:
+                            log.info(
+                                "📝 Deskripsi dan Alert Note %s diupdate; laporan utuh tersimpan (%s karakter).",
+                                target_alert_id,
+                                len(incident_report),
+                            )
+                        else:
+                            saved_note_len = len(saved_note) if isinstance(saved_note, str) else 0
+                            log.warning(
+                                "⚠️ Verifikasi Alert Note %s gagal: laporan masuk %s karakter, "
+                                "Note terbaca %s karakter.",
+                                target_alert_id,
+                                len(incident_report),
+                                saved_note_len,
+                            )
                     else:
                         log.warning("⚠️ Gagal mengupdate deskripsi Alert %s.", target_alert_id)
                 else:
