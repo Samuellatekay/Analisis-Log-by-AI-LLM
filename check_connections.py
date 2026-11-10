@@ -136,7 +136,7 @@ async def check_iris():
 
 
 async def iris_ids():
-    """Show IRIS severity and alert-status IDs."""
+    """Show IRIS severity, alert-status, and IOC-type IDs."""
     try:
         from iris_client import IrisClient
         client = IrisClient.from_env(os.environ)
@@ -144,10 +144,14 @@ async def iris_ids():
             return SKIP, "IRIS ID", "-", "IRIS_ENABLED=false"
         try:
             severities, statuses = await client.list_ids()
+            ioc_types = await client.list_ioc_types()
         finally:
             await client.aclose()
         fmt = lambda values: ", ".join(f"{i}={name}" for i, name in values) or "tidak terbaca otomatis (lihat UI IRIS: Advanced)"
-        return OK, "IRIS ID", "-", f"severity: {fmt(severities)} | status alert: {fmt(statuses)}"
+        return OK, "IRIS ID", "-", (
+            f"severity: {fmt(severities)} | status alert: {fmt(statuses)} | "
+            f"tipe IOC: {fmt(ioc_types)}"
+        )
     except Exception as exc:
         return FAIL, "IRIS ID", "-", explain(exc)
 

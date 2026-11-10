@@ -1344,6 +1344,9 @@ class IrisClient:
     async def list_ids(self) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
         return (await self._list(self.paths["severity_list"]), await self._list(self.paths["status_list"]))
 
+    async def list_ioc_types(self) -> list[tuple[int, str]]:
+        return await self._list(self.paths["ioc_type_list"])
+
     async def _ensure_ids(self) -> None:
         if self._ids_ready:
             return
