@@ -3,9 +3,8 @@ import json
 import logging
 import os
 import httpx
-import markdown
 
-from iris_client import IrisClient
+from iris_client import IrisClient, upsert_ai_section
 
 logging.basicConfig(
     level="INFO",
@@ -20,7 +19,7 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
     log_uuid = str(raw_data.get("log_uuid") or raw_data.get("id", "")).strip()
     incident_report = raw_data.get("incident_report")
     
-    if not incident_report:
+    if not isinstance(incident_report, str) or not incident_report.strip():
         log.debug("ℹ️ Tidak ada incident_report. Melewati.")
         return False
     if not log_uuid:
@@ -60,19 +59,9 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
         if current_alert:
             current_desc = current_alert.get("alert_description", "")
             if isinstance(current_desc, str):
-                first_line_report = incident_report.split('\n')[0].strip()
-                if first_line_report and first_line_report not in current_desc:
-                    lines = current_desc.split('\n')
-                    injected = False
-                    for i, line in enumerate(lines):
-                        if line.strip().startswith('# Source') or line.strip() == 'Source':
-                            lines.insert(i, f"\n{incident_report}\n")
-                            injected = True
-                            break
-                    if not injected:
-                        lines.append(f"\n\n## Analisis AI (Incident Report)\n{incident_report}")
-                    
-                    await iris_client.update_alert_description(target_alert_id, '\n'.join(lines))
+                updated_desc = upsert_ai_section(current_desc, log_uuid, incident_report)
+                if updated_desc != current_desc:
+                    await iris_client.update_alert_description(target_alert_id, updated_desc)
                     log.info("📝 Deskripsi Alert %s berhasil diupdate.", target_alert_id)
                 else:
                     log.info("ℹ️ Laporan sudah ada di Alert %s.", target_alert_id)
@@ -82,18 +71,36 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
     # ==========================================================
     target_case_id = None
     try:
-        resp_case = await iris_client._client.get("/api/v2/cases", params={"per_page": 50, "page": 1, "sort": "open_date:desc"})
-        resp_case.raise_for_status()
-        cases_data = resp_case.json()
-        cases = cases_data.get("data", []) if isinstance(cases_data, dict) else cases_data
-        
-        for case in cases:
-            if not isinstance(case, dict): continue
-            c_id = case.get("case_id") or case.get("id")
-            soc_id = str(case.get("case_soc_id") or case.get("soc_id") or "")
-            
-            if str(log_uuid) == soc_id:
-                target_case_id = c_id
+        for page in range(1, 11):
+            resp_case = await iris_client._client.get(
+                "/api/v2/cases",
+                params={"per_page": 100, "page": page, "sort": "open_date:desc"},
+            )
+            resp_case.raise_for_status()
+            cases_data = resp_case.json()
+            cases = cases_data.get("data", []) if isinstance(cases_data, dict) else cases_data
+            if isinstance(cases, dict):
+                cases = cases.get("data", [])
+            if not isinstance(cases, list):
+                log.warning("⚠️ Format daftar Case IRIS tidak dikenali.")
+                break
+
+            for case in cases:
+                if not isinstance(case, dict):
+                    continue
+                c_id = case.get("case_id") or case.get("id")
+                soc_id = str(case.get("case_soc_id") or case.get("soc_id") or "")
+                description = case.get("case_description") or case.get("description") or ""
+                has_log_uuid = (
+                    isinstance(description, str)
+                    and f"log_uuid: {log_uuid}" in description.splitlines()
+                )
+
+                if str(log_uuid) == soc_id or has_log_uuid:
+                    target_case_id = c_id
+                    break
+
+            if target_case_id or len(cases) < 100:
                 break
     except Exception as e:
         log.error("❌ Gagal mencari case: %s", e)
@@ -106,38 +113,21 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
                 log.warning("⚠️ Gagal mengambil detail Case %s", target_case_id)
             else:
                 old_desc = current_case.get("case_description") or current_case.get("description") or ""
-                
-                # 1. KONVERSI MARKDOWN KE HTML DI SINI
-                # Ekstensi 'extra', 'fenced_code', dan 'tables' memastikan format AI rapi
-                html_report = markdown.markdown(
-                    incident_report, 
-                    extensions=['extra', 'fenced_code', 'tables']
-                )
-                
-                # 2. Gabungkan dengan deskripsi lama (yang juga sebaiknya di-HTML-kan jika perlu, 
-                # tapi untuk amannya kita append HTML baru di bawah)
-                combined_desc = f"{old_desc}<hr><h3>🤖 Update Analisis AI</h3>{html_report}"
-                
-                if incident_report.strip() not in old_desc: # Cek sederhana
-                    update_payload = {
-                        "case_description": combined_desc[:16000],
-                        "case_name": current_case.get("case_name") or "Unnamed Case",
-                        "case_customer": current_case.get("case_customer_id") or current_case.get("case_customer") or 1,
-                        "case_soc_id": current_case.get("case_soc_id") or current_case.get("soc_id") or log_uuid,
-                        "case_tags": current_case.get("case_tags") or "",
-                        "state_id": current_case.get("state_id") or 3,
-                        "severity_id": current_case.get("severity_id") or 4,
-                        "status_id": current_case.get("status_id") or 0,
-                        "owner_id": current_case.get("owner_id") or current_case.get("user_id") or 1,
-                    }
-                    
-                    await iris_client._put(f"/api/v2/cases/{target_case_id}", update_payload)
-                    log.info("📝 Deskripsi Case %s berhasil diupdate dengan HTML Laporan AI.", target_case_id)
+                updated_desc = upsert_ai_section(old_desc, log_uuid, incident_report)
+
+                if updated_desc != old_desc:
+                    await iris_client._put(
+                        f"/api/v2/cases/{target_case_id}",
+                        {"case_description": updated_desc[:16000]},
+                    )
+                    log.info("📝 Summary Case %s berhasil diupdate dengan analisis AI.", target_case_id)
                 else:
                     log.info("ℹ️ Laporan AI sudah ada di Case %s.", target_case_id)
                     
         except Exception as e:
             log.error("❌ Gagal mengupdate Case %s: %s", target_case_id, e)
+    else:
+        log.warning("⚠️ Case untuk log_uuid %s tidak ditemukan; laporan hanya diproses untuk Alert.", log_uuid)
 
     # ==========================================================
     # 3. TAMBAHKAN KE NOTES (DENGAN LOGIKA DIRECTORY OTOMATIS)

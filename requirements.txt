@@ -2,5 +2,4 @@ redis>=5.0,<6
 asyncpg>=0.29
 httpx>=0.27
 orjson>=3.10
-markdown==3.5.1
 uvloop>=0.19; sys_platform != "win32"
