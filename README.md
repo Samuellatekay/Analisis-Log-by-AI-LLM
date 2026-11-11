@@ -96,6 +96,8 @@ Note case. Salinan Alert Note menjaga laporan lengkap tetap tersedia di Alert
 jika Description dibatasi saat ditampilkan. Case eskalasi dicocokkan melalui
 `log_uuid` pada deskripsinya. Jika `.env` sudah dibuat sebelumnya, buat ulang
 container setelah memperbarui image aplikasi.
+Pembaruan Case Summary diverifikasi dengan membaca ulang Case dari IRIS; status
+HTTP 200 saja tidak dianggap bukti bahwa Summary sudah tersimpan.
 `stream_iris.py` menyertakan `alert_id` dan `log_uuid` (`alert_source_ref`) pada
 payload ke layanan eksternal agar laporan dapat dikaitkan ke alert asal. Receiver
 mengutamakan kecocokan ID alert yang eksplisit dan menggunakan UUID dari IRIS

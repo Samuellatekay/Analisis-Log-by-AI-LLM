@@ -202,11 +202,40 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
                 updated_desc = upsert_ai_section(old_desc, log_uuid, incident_report)
 
                 if updated_desc != old_desc:
+                    summary_fields = ["case_description"]
+                    summary_fields.extend(
+                        field for field in ("description", "summary", "case_summary")
+                        if field in current_case
+                    )
+                    configured_field = getattr(iris_client, "case_summary_field", "")
+                    if configured_field and configured_field not in summary_fields:
+                        summary_fields.append(configured_field)
+
+                    update_payload = {field: updated_desc for field in summary_fields}
                     await iris_client._put(
                         f"/api/v2/cases/{target_case_id}",
-                        {"case_description": updated_desc},
+                        update_payload,
                     )
-                    log.info("📝 Summary Case %s berhasil diupdate dengan analisis AI.", target_case_id)
+                    saved_case = await iris_client._get(f"/api/v2/cases/{target_case_id}")
+                    saved_values = {
+                        field: saved_case.get(field)
+                        for field in summary_fields
+                        if isinstance(saved_case.get(field), str)
+                    }
+                    if any(value == updated_desc for value in saved_values.values()):
+                        log.info(
+                            "📝 Summary Case %s terverifikasi tersimpan di field %s.",
+                            target_case_id,
+                            [field for field, value in saved_values.items() if value == updated_desc],
+                        )
+                    else:
+                        log.error(
+                            "❌ PUT Case %s mendapat respons tetapi Summary tidak terverifikasi. "
+                            "Field dikirim=%s; panjang yang terbaca=%s.",
+                            target_case_id,
+                            summary_fields,
+                            {field: len(value) for field, value in saved_values.items()},
+                        )
                 else:
                     log.info("ℹ️ Laporan AI sudah ada di Case %s.", target_case_id)
                     
@@ -268,6 +297,7 @@ async def run_receiver():
         "IRIS_VERIFY_SSL": os.getenv("IRIS_VERIFY_SSL", "true"),
         "IRIS_CUSTOMER_ID": os.getenv("IRIS_CUSTOMER_ID", "1"),
         "IRIS_API_VERSION": os.getenv("IRIS_API_VERSION", "v2"),
+        "IRIS_CASE_SUMMARY_FIELD": os.getenv("IRIS_CASE_SUMMARY_FIELD", ""),
     }
     
     try:
