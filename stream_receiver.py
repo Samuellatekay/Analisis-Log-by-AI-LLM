@@ -48,7 +48,7 @@ def upsert_alert_description(summary: str, alert_id: int, description: str) -> s
     if pattern.search(summary):
         return pattern.sub(lambda _: block, summary, count=1)
     if description and description in summary:
-        return summary
+        return summary.replace(description, block, 1)
     return f"{summary.rstrip()}\n\n{block}" if summary.strip() else block
 
 
@@ -64,6 +64,10 @@ async def sync_alert_description_to_case(
 
     description = alert.get("alert_description")
     if not isinstance(description, str) or not description.strip():
+        log.warning(
+            "Description Alert %s kosong atau tidak dikembalikan API (field alert_description).",
+            alert_id,
+        )
         return 0
 
     synced = 0
@@ -84,6 +88,13 @@ async def sync_alert_description_to_case(
             )
             updated_summary = upsert_alert_description(old_summary, alert_id, description)
             if updated_summary == old_summary:
+                log.info(
+                    "Summary Case %s sudah tersinkron dengan Alert %s (summary=%s, description=%s karakter).",
+                    case_id,
+                    alert_id,
+                    len(old_summary),
+                    len(description),
+                )
                 continue
 
             summary_fields = ["case_description"]
