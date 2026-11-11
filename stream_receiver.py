@@ -99,22 +99,14 @@ async def sync_alert_description_to_case(
                 )
                 continue
 
-            summary_fields = ["case_description"]
-            summary_fields.extend(
-                field for field in ("description", "summary", "case_summary")
-                if field in case
-            )
-            configured_field = getattr(iris_client, "case_summary_field", "")
-            if configured_field and configured_field not in summary_fields:
-                summary_fields.append(configured_field)
-
             await iris_client._put(
                 f"/api/v2/cases/{case_id}",
-                {field: updated_summary for field in summary_fields},
+                {"case_description": updated_summary},
             )
             saved_case = await iris_client._get(f"/api/v2/cases/{case_id}")
-            if isinstance(saved_case, dict) and any(
-                saved_case.get(field) == updated_summary for field in summary_fields
+            if (
+                isinstance(saved_case, dict)
+                and saved_case.get("case_description") == updated_summary
             ):
                 log.info(
                     "Description Alert %s tersinkron ke Summary Case %s.",
@@ -405,39 +397,27 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
                     )
 
                 if updated_desc != old_desc:
-                    summary_fields = ["case_description"]
-                    summary_fields.extend(
-                        field for field in ("description", "summary", "case_summary")
-                        if field in current_case
-                    )
-                    configured_field = getattr(iris_client, "case_summary_field", "")
-                    if configured_field and configured_field not in summary_fields:
-                        summary_fields.append(configured_field)
-
-                    update_payload = {field: updated_desc for field in summary_fields}
                     await iris_client._put(
                         f"/api/v2/cases/{target_case_id}",
-                        update_payload,
+                        {"case_description": updated_desc},
                     )
                     saved_case = await iris_client._get(f"/api/v2/cases/{target_case_id}")
-                    saved_values = {
-                        field: saved_case.get(field)
-                        for field in summary_fields
-                        if isinstance(saved_case.get(field), str)
-                    }
-                    if any(value == updated_desc for value in saved_values.values()):
+                    saved_description = (
+                        saved_case.get("case_description")
+                        if isinstance(saved_case, dict)
+                        else None
+                    )
+                    if saved_description == updated_desc:
                         log.info(
-                            "📝 Summary Case %s terverifikasi tersimpan di field %s.",
+                            "📝 Summary Case %s terverifikasi tersimpan di case_description.",
                             target_case_id,
-                            [field for field, value in saved_values.items() if value == updated_desc],
                         )
                     else:
                         log.error(
                             "❌ PUT Case %s mendapat respons tetapi Summary tidak terverifikasi. "
-                            "Field dikirim=%s; panjang yang terbaca=%s.",
+                            "Field dikirim=case_description; panjang yang terbaca=%s.",
                             target_case_id,
-                            summary_fields,
-                            {field: len(value) for field, value in saved_values.items()},
+                            len(saved_description) if isinstance(saved_description, str) else 0,
                         )
                 else:
                     log.info("ℹ️ Laporan AI sudah ada di Case %s.", target_case_id)
