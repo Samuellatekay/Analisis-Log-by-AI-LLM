@@ -128,6 +128,9 @@ async def sync_alert_description_to_case(
 async def sync_escalated_alerts(iris_client: IrisClient, interval: int) -> None:
     while True:
         try:
+            scanned_alerts = 0
+            linked_alerts = 0
+            synced_cases = 0
             for page in range(1, 11):
                 response = await iris_client._client.get(
                     "/api/v2/alerts",
@@ -136,6 +139,7 @@ async def sync_escalated_alerts(iris_client: IrisClient, interval: int) -> None:
                         "page": page,
                         "sort": "alert_source_event_time:desc",
                         "observables": "summary",
+                        "fields": "alert_id,alert_description,cases",
                     },
                 )
                 response.raise_for_status()
@@ -147,18 +151,30 @@ async def sync_escalated_alerts(iris_client: IrisClient, interval: int) -> None:
                     raise ValueError("Format daftar Alert IRIS tidak dikenali.")
 
                 for item in alerts:
-                    if not isinstance(item, dict) or not linked_case_ids(item):
+                    if not isinstance(item, dict):
                         continue
+                    scanned_alerts += 1
+                    case_ids = linked_case_ids(item)
+                    if not case_ids:
+                        continue
+                    linked_alerts += 1
                     alert_id = item.get("alert_id") or item.get("id")
                     try:
                         alert_id = int(alert_id)
                     except (TypeError, ValueError):
                         log.warning("ID Alert tidak valid pada daftar IRIS: %r", alert_id)
                         continue
-                    await sync_alert_description_to_case(iris_client, alert_id)
+                    synced_cases += await sync_alert_description_to_case(iris_client, alert_id)
 
                 if len(alerts) < 100:
                     break
+            log.info(
+                "Pemeriksaan eskalasi IRIS selesai: %s Alert dipindai, "
+                "%s Alert terkait Case, %s Summary diperbarui.",
+                scanned_alerts,
+                linked_alerts,
+                synced_cases,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -487,6 +503,10 @@ async def run_receiver():
     except ValueError:
         log.error("IRIS_CASE_SUMMARY_SYNC_INTERVAL_S harus berupa bilangan bulat.")
         return
+    log.info(
+        "Sinkronisasi Alert–Case native IRIS aktif (interval %s detik).",
+        sync_interval,
+    )
     sync_task = asyncio.create_task(sync_escalated_alerts(iris_client, sync_interval))
     
     async with httpx.AsyncClient(timeout=None) as client:
