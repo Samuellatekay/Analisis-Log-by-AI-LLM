@@ -1198,7 +1198,9 @@ class IrisClient:
         d = await self._post(self.paths["case"], body)
         return d.get("case_id") or d.get("id")
 
-    async def update_case_description(self, case_id: int, doc: dict, *, force: bool = False) -> bool:
+    async def update_case_description(
+        self, case_id: int, doc: dict, *, force: bool = False, description: str | None = None
+    ) -> bool:
         if not self.case_update_enabled and not force:
             log.info("Case %s: update deskripsi dimatikan (IRIS_CASE_UPDATE=false).", case_id)
             return False
@@ -1227,11 +1229,20 @@ class IrisClient:
         if not isinstance(current_description, str):
             current_description = ""
 
-        updated_description = self._case_text(self.build_payload(doc))
+        updated_description = (
+            description if description is not None else self._case_text(self.build_payload(doc))
+        )
         # Pertahankan section "Analisis AI (LLM)" di Summary agar tidak tertimpa update otomatis.
         _, ai_sections = split_ai_sections(current_description)
-        if ai_sections:
-            updated_description = updated_description.rstrip() + "\n\n" + "\n\n".join(ai_sections.values())
+        _, included_ai_sections = split_ai_sections(updated_description)
+        missing_ai_sections = {
+            key: section for key, section in ai_sections.items()
+            if key not in included_ai_sections
+        }
+        if missing_ai_sections:
+            updated_description = updated_description.rstrip() + "\n\n" + "\n\n".join(
+                missing_ai_sections.values()
+            )
 
         # IRIS v3 beta bisa memakai nama field berbeda untuk Summary (description/summary/...).
         # Kirim ke setiap field yang ada di data case, ditambah field dari IRIS_CASE_SUMMARY_FIELD.
@@ -1269,7 +1280,23 @@ class IrisClient:
                 legacy_body[k] = updated_description
             await self._post(self.paths["case_update"].format(id=case_id), legacy_body)
 
-        log.info("✅ Case %s: Deskripsi berhasil diperbarui.", case_id)
+        saved = await self._get(self.paths["case_read"].format(id=case_id))
+        saved_fields = ("case_description", "description", "summary", "case_summary", *extra_fields)
+        saved_values = {
+            field: saved[field]
+            for field in dict.fromkeys(saved_fields)
+            if isinstance(saved.get(field), str)
+        }
+        matching_fields = [field for field, value in saved_values.items() if value == updated_description]
+        if not matching_fields:
+            log.error(
+                "❌ Case %s: Summary update tidak terverifikasi; field yang dibaca=%s.",
+                case_id,
+                {field: len(value) for field, value in saved_values.items()},
+            )
+            return False
+
+        log.info("✅ Case %s: Summary terverifikasi tersimpan di %s.", case_id, matching_fields)
         return True
 
     async def delete_case(self, case_id: int) -> bool:
@@ -1344,7 +1371,17 @@ class IrisClient:
                       alert_id)
             return None
 
-        updated = await self.update_case_description(int(case_id), doc, force=True)
+        alert = await self.get_alert(alert_id) or {}
+        alert_description = alert.get("alert_description")
+        if not isinstance(alert_description, str) or not alert_description:
+            alert_description = None
+
+        updated = await self.update_case_description(
+            int(case_id),
+            doc,
+            force=True,
+            description=alert_description,
+        )
         if not updated:
             log.warning("Case %s dibuat dari alert %s, tetapi Summary tidak berubah atau case belum dapat dibaca.",
                         case_id, alert_id)

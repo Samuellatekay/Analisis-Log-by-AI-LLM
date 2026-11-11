@@ -87,7 +87,9 @@ worker; `IRIS_QUEUE_MAX` membatasi antrean.
 Saat alert dieskalasi menjadi case, deskripsi Overview alert otomatis disalin ke
 Case Summary melalui update case setelah proses eskalasi. Ini tetap dilakukan
 meskipun `IRIS_CASE_UPDATE=false`; pengaturan tersebut hanya menonaktifkan update
-case berikutnya dari enrichment.
+case berikutnya dari enrichment. Deskripsi alert yang sudah berisi analisis AI
+dipakai sebagai sumber Summary, lalu hasil update dibaca ulang dari IRIS untuk
+memastikan Summary benar-benar tersimpan.
 
 Layanan `stream-receiver` menerima laporan dari `TARGET_STREAM_URL` dalam JSON
 yang memuat `log_uuid` dan `incident_report`. Laporan ditambahkan sebagai section
