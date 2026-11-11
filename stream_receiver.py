@@ -56,6 +56,7 @@ async def sync_alert_description_to_case(
     iris_client: IrisClient,
     alert_id: int,
     alert: dict | None = None,
+    case_ids: list[int] | None = None,
 ) -> int:
     if alert is None:
         alert = await iris_client.get_alert(alert_id)
@@ -71,7 +72,8 @@ async def sync_alert_description_to_case(
         return 0
 
     synced = 0
-    for case_id in linked_case_ids(alert):
+    related_case_ids = case_ids if case_ids is not None else linked_case_ids(alert)
+    for case_id in related_case_ids:
         try:
             case = await iris_client._get(f"/api/v2/cases/{case_id}")
             if not case:
@@ -175,7 +177,11 @@ async def sync_escalated_alerts(iris_client: IrisClient, interval: int) -> None:
                     except (TypeError, ValueError):
                         log.warning("ID Alert tidak valid pada daftar IRIS: %r", alert_id)
                         continue
-                    synced_cases += await sync_alert_description_to_case(iris_client, alert_id)
+                    synced_cases += await sync_alert_description_to_case(
+                        iris_client,
+                        alert_id,
+                        case_ids=case_ids,
+                    )
 
                 if len(alerts) < 100:
                     break
