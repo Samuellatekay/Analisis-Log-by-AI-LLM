@@ -84,20 +84,21 @@ Pengiriman alert dilakukan melalui antrean worker IRIS. Satu kombinasi sumber da
 aksi dideduplikasi selama `IRIS_DEDUP_WINDOW_S`. `IRIS_WORKERS` mengatur jumlah
 worker; `IRIS_QUEUE_MAX` membatasi antrean.
 
-Saat alert dieskalasi menjadi case, deskripsi Overview alert otomatis disalin ke
-Case Summary melalui update case setelah proses eskalasi. Ini tetap dilakukan
-meskipun `IRIS_CASE_UPDATE=false`; pengaturan tersebut hanya menonaktifkan update
-case berikutnya dari enrichment. Deskripsi alert yang sudah berisi analisis AI
-dipakai sebagai sumber Summary, lalu hasil update dibaca ulang dari IRIS untuk
-memastikan Summary benar-benar tersimpan.
+Saat alert dieskalasi menjadi case, deskripsi alert disalin ke Case Summary.
+Eskalasi otomatis ditangani langsung; `stream-receiver` juga memeriksa relasi
+Alert–Case IRIS secara berkala agar eskalasi melalui tombol UI ikut tersinkron,
+termasuk bila dilakukan setelah laporan AI diterima. Konten Summary yang sudah
+ada tetap dipertahankan. Hasil update dibaca ulang dari IRIS untuk memastikan
+Summary benar-benar tersimpan. Interval pemeriksaan dapat diatur melalui
+`IRIS_CASE_SUMMARY_SYNC_INTERVAL_S` (default 30 detik, minimum 5 detik).
 
 Layanan `stream-receiver` menerima laporan dari `TARGET_STREAM_URL` dalam JSON
 yang memuat `log_uuid` dan `incident_report`. Laporan ditambahkan sebagai section
 Markdown di Description alert/case dan disimpan juga sebagai Alert Note serta
 Note case. Salinan Alert Note menjaga laporan lengkap tetap tersedia di Alert
 jika Description dibatasi saat ditampilkan. Case eskalasi dicocokkan melalui
-`log_uuid` pada deskripsinya. Jika `.env` sudah dibuat sebelumnya, buat ulang
-container setelah memperbarui image aplikasi.
+relasi Alert–Case IRIS, dengan pencocokan `log_uuid` sebagai fallback. Jika
+`.env` sudah dibuat sebelumnya, buat ulang container setelah memperbarui image.
 Pembaruan Case Summary diverifikasi dengan membaca ulang Case dari IRIS; status
 HTTP 200 saja tidak dianggap bukti bahwa Summary sudah tersimpan.
 `stream_iris.py` menyertakan `alert_id` dan `log_uuid` (`alert_source_ref`) pada

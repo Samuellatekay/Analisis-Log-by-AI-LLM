@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import httpx
 
 from iris_client import IrisClient, upsert_ai_section
@@ -14,6 +15,155 @@ logging.basicConfig(
 log = logging.getLogger("stream-receiver")
 
 TARGET_STREAM_URL = os.getenv("TARGET_STREAM_URL", "http://38.47.66.253:17772/stream")
+
+
+def linked_case_ids(alert: dict) -> list[int]:
+    cases = alert.get("cases")
+    if not isinstance(cases, list):
+        return []
+
+    case_ids = []
+    for case in cases:
+        if isinstance(case, dict):
+            value = case.get("case_id") or case.get("id")
+        else:
+            value = case
+        try:
+            case_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if case_id not in case_ids:
+            case_ids.append(case_id)
+    return case_ids
+
+
+def upsert_alert_description(summary: str, alert_id: int, description: str) -> str:
+    start = f"<!-- iris-alert-description:{alert_id}:start -->"
+    end = f"<!-- iris-alert-description:{alert_id}:end -->"
+    block = f"{start}\n{description}\n{end}"
+    pattern = re.compile(
+        rf"{re.escape(start)}.*?{re.escape(end)}",
+        re.DOTALL,
+    )
+    if pattern.search(summary):
+        return pattern.sub(lambda _: block, summary, count=1)
+    if description and description in summary:
+        return summary
+    return f"{summary.rstrip()}\n\n{block}" if summary.strip() else block
+
+
+async def sync_alert_description_to_case(
+    iris_client: IrisClient,
+    alert_id: int,
+    alert: dict | None = None,
+) -> int:
+    if alert is None:
+        alert = await iris_client.get_alert(alert_id)
+    if not isinstance(alert, dict):
+        return 0
+
+    description = alert.get("alert_description")
+    if not isinstance(description, str) or not description.strip():
+        return 0
+
+    synced = 0
+    for case_id in linked_case_ids(alert):
+        try:
+            case = await iris_client._get(f"/api/v2/cases/{case_id}")
+            if not case:
+                log.warning("Case %s terkait Alert %s tidak ditemukan.", case_id, alert_id)
+                continue
+
+            old_summary = next(
+                (
+                    case[field]
+                    for field in ("case_description", "description", "summary", "case_summary")
+                    if isinstance(case.get(field), str) and case[field]
+                ),
+                "",
+            )
+            updated_summary = upsert_alert_description(old_summary, alert_id, description)
+            if updated_summary == old_summary:
+                continue
+
+            summary_fields = ["case_description"]
+            summary_fields.extend(
+                field for field in ("description", "summary", "case_summary")
+                if field in case
+            )
+            configured_field = getattr(iris_client, "case_summary_field", "")
+            if configured_field and configured_field not in summary_fields:
+                summary_fields.append(configured_field)
+
+            await iris_client._put(
+                f"/api/v2/cases/{case_id}",
+                {field: updated_summary for field in summary_fields},
+            )
+            saved_case = await iris_client._get(f"/api/v2/cases/{case_id}")
+            if isinstance(saved_case, dict) and any(
+                saved_case.get(field) == updated_summary for field in summary_fields
+            ):
+                log.info(
+                    "Description Alert %s tersinkron ke Summary Case %s.",
+                    alert_id,
+                    case_id,
+                )
+                synced += 1
+            else:
+                log.error(
+                    "Description Alert %s belum terverifikasi di Summary Case %s.",
+                    alert_id,
+                    case_id,
+                )
+        except Exception as e:
+            log.error(
+                "Gagal menyinkronkan Description Alert %s ke Case %s: %s",
+                alert_id,
+                case_id,
+                e,
+            )
+    return synced
+
+
+async def sync_escalated_alerts(iris_client: IrisClient, interval: int) -> None:
+    while True:
+        try:
+            for page in range(1, 11):
+                response = await iris_client._client.get(
+                    "/api/v2/alerts",
+                    params={
+                        "per_page": 100,
+                        "page": page,
+                        "sort": "alert_source_event_time:desc",
+                        "observables": "summary",
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+                alerts = payload.get("data", []) if isinstance(payload, dict) else payload
+                if isinstance(alerts, dict):
+                    alerts = alerts.get("data", [])
+                if not isinstance(alerts, list):
+                    raise ValueError("Format daftar Alert IRIS tidak dikenali.")
+
+                for item in alerts:
+                    if not isinstance(item, dict) or not linked_case_ids(item):
+                        continue
+                    alert_id = item.get("alert_id") or item.get("id")
+                    try:
+                        alert_id = int(alert_id)
+                    except (TypeError, ValueError):
+                        log.warning("ID Alert tidak valid pada daftar IRIS: %r", alert_id)
+                        continue
+                    await sync_alert_description_to_case(iris_client, alert_id)
+
+                if len(alerts) < 100:
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error("Gagal memeriksa Alert yang sudah dieskalasi: %s", e)
+        await asyncio.sleep(interval)
 
 
 def log_incident_report(reference: str, report: str) -> None:
@@ -133,6 +283,8 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
                     saved_alert = await iris_client.get_alert(target_alert_id)
                     saved_note = saved_alert.get("alert_note") if saved_alert else None
                     if isinstance(saved_note, str) and incident_report in saved_note:
+                        if isinstance(saved_alert, dict):
+                            current_alert = saved_alert
                         log.info(
                             "📝 Deskripsi dan Alert Note %s diupdate; laporan utuh tersimpan (%s karakter).",
                             target_alert_id,
@@ -152,42 +304,53 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
             else:
                 log.info("ℹ️ Laporan sudah ada di Alert %s.", target_alert_id)
 
+    if target_alert_id and current_alert:
+        refreshed_alert = await iris_client.get_alert(target_alert_id)
+        if refreshed_alert:
+            current_alert = refreshed_alert
+    related_case_ids = (
+        linked_case_ids(current_alert)
+        if target_alert_id and current_alert
+        else []
+    )
+
     # ==========================================================
     # 2. UPDATE CASE (JIKA SUDAH ADA) - VERSI ROBUST
     # ==========================================================
-    target_case_id = None
+    target_case_id = related_case_ids[0] if related_case_ids else None
     try:
-        for page in range(1, 11):
-            resp_case = await iris_client._client.get(
-                "/api/v2/cases",
-                params={"per_page": 100, "page": page, "sort": "open_date:desc"},
-            )
-            resp_case.raise_for_status()
-            cases_data = resp_case.json()
-            cases = cases_data.get("data", []) if isinstance(cases_data, dict) else cases_data
-            if isinstance(cases, dict):
-                cases = cases.get("data", [])
-            if not isinstance(cases, list):
-                log.warning("⚠️ Format daftar Case IRIS tidak dikenali.")
-                break
-
-            for case in cases:
-                if not isinstance(case, dict):
-                    continue
-                c_id = case.get("case_id") or case.get("id")
-                soc_id = str(case.get("case_soc_id") or case.get("soc_id") or "")
-                description = case.get("case_description") or case.get("description") or ""
-                has_log_uuid = (
-                    isinstance(description, str)
-                    and f"log_uuid: {log_uuid}" in description.splitlines()
+        if target_case_id is None:
+            for page in range(1, 11):
+                resp_case = await iris_client._client.get(
+                    "/api/v2/cases",
+                    params={"per_page": 100, "page": page, "sort": "open_date:desc"},
                 )
-
-                if str(log_uuid) == soc_id or has_log_uuid:
-                    target_case_id = c_id
+                resp_case.raise_for_status()
+                cases_data = resp_case.json()
+                cases = cases_data.get("data", []) if isinstance(cases_data, dict) else cases_data
+                if isinstance(cases, dict):
+                    cases = cases.get("data", [])
+                if not isinstance(cases, list):
+                    log.warning("⚠️ Format daftar Case IRIS tidak dikenali.")
                     break
 
-            if target_case_id or len(cases) < 100:
-                break
+                for case in cases:
+                    if not isinstance(case, dict):
+                        continue
+                    c_id = case.get("case_id") or case.get("id")
+                    soc_id = str(case.get("case_soc_id") or case.get("soc_id") or "")
+                    description = case.get("case_description") or case.get("description") or ""
+                    has_log_uuid = (
+                        isinstance(description, str)
+                        and f"log_uuid: {log_uuid}" in description.splitlines()
+                    )
+
+                    if str(log_uuid) == soc_id or has_log_uuid:
+                        target_case_id = c_id
+                        break
+
+                if target_case_id or len(cases) < 100:
+                    break
     except Exception as e:
         log.error("❌ Gagal mencari case: %s", e)
 
@@ -200,6 +363,13 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
             else:
                 old_desc = current_case.get("case_description") or current_case.get("description") or ""
                 updated_desc = upsert_ai_section(old_desc, log_uuid, incident_report)
+                alert_description = current_alert.get("alert_description") if current_alert else None
+                if target_alert_id and isinstance(alert_description, str):
+                    updated_desc = upsert_alert_description(
+                        updated_desc,
+                        target_alert_id,
+                        alert_description,
+                    )
 
                 if updated_desc != old_desc:
                     summary_fields = ["case_description"]
@@ -312,33 +482,46 @@ async def run_receiver():
         return
 
     log.info("🔌 Menghubungkan ke stream: %s", TARGET_STREAM_URL)
+    try:
+        sync_interval = max(5, int(os.getenv("IRIS_CASE_SUMMARY_SYNC_INTERVAL_S", "30")))
+    except ValueError:
+        log.error("IRIS_CASE_SUMMARY_SYNC_INTERVAL_S harus berupa bilangan bulat.")
+        return
+    sync_task = asyncio.create_task(sync_escalated_alerts(iris_client, sync_interval))
     
     async with httpx.AsyncClient(timeout=None) as client:
-        while True:
+        try:
+            while True:
+                try:
+                    async with client.stream("GET", TARGET_STREAM_URL) as response:
+                        response.raise_for_status()
+                        log.info("✅ Terhubung ke /stream! Menunggu data...")
+
+                        async for line in response.aiter_lines():
+                            if not line.strip():
+                                continue
+
+                            try:
+                                raw_data = json.loads(line)
+                                await inject_incident_report(iris_client, raw_data)
+                            except json.JSONDecodeError:
+                                log.warning("⚠️ Data bukan JSON valid: %s", line[:50])
+                            except Exception as e:
+                                log.error("❌ Error memproses data: %s", e)
+
+                except httpx.RequestError as e:
+                    log.error("❌ Koneksi stream terputus: %s", e)
+                except Exception as e:
+                    log.error("❌ Error tidak terduga: %s", e)
+
+                log.info("🔄 Reconnect dalam 5 detik...")
+                await asyncio.sleep(5)
+        finally:
+            sync_task.cancel()
             try:
-                async with client.stream("GET", TARGET_STREAM_URL) as response:
-                    response.raise_for_status()
-                    log.info("✅ Terhubung ke /stream! Menunggu data...")
-                    
-                    async for line in response.aiter_lines():
-                        if not line.strip():
-                            continue
-                        
-                        try:
-                            raw_data = json.loads(line)
-                            await inject_incident_report(iris_client, raw_data)
-                        except json.JSONDecodeError:
-                            log.warning("⚠️ Data bukan JSON valid: %s", line[:50])
-                        except Exception as e:
-                            log.error("❌ Error memproses data: %s", e)
-                            
-            except httpx.RequestError as e:
-                log.error("❌ Koneksi stream terputus: %s", e)
-            except Exception as e:
-                log.error("❌ Error tidak terduga: %s", e)
-            
-            log.info("🔄 Reconnect dalam5 detik...")
-            await asyncio.sleep(5)
+                await sync_task
+            except asyncio.CancelledError:
+                pass
 
 if __name__ == "__main__":
     try:
