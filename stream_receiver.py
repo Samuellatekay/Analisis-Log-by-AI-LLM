@@ -52,6 +52,49 @@ def upsert_alert_description(summary: str, alert_id: int, description: str) -> s
     return f"{summary.rstrip()}\n\n{block}" if summary.strip() else block
 
 
+def remove_duplicate_ai_sections(summary: str, alert_description: str) -> str:
+    ai_keys = set(
+        re.findall(
+            r"(?m)^## Analisis AI \(LLM\) - ([0-9A-Za-z]{8})[^\n]*$",
+            alert_description,
+        )
+    )
+    if not ai_keys:
+        return summary
+
+    marker_pattern = re.compile(
+        r"<!-- iris-alert-description:\d+:start -->.*?"
+        r"<!-- iris-alert-description:\d+:end -->",
+        re.DOTALL,
+    )
+    markers: list[str] = []
+
+    def preserve_marker(match: re.Match[str]) -> str:
+        token = f"\x00IRIS_ALERT_DESCRIPTION_{len(markers)}\x00"
+        markers.append(match.group(0))
+        return token
+
+    result = marker_pattern.sub(preserve_marker, summary)
+    for key in ai_keys:
+        section_pattern = re.compile(
+            rf"(?m)^## Analisis AI \(LLM\) - {re.escape(key)}[^\n]*$"
+        )
+        while match := section_pattern.search(result):
+            next_section = re.search(
+                r"(?m)^## Analisis AI \(LLM\) - [0-9A-Za-z]{8}[^\n]*$"
+                r"|^\x00IRIS_ALERT_DESCRIPTION_\d+\x00$",
+                result[match.end():],
+            )
+            end = match.end() + next_section.start() if next_section else len(result)
+            before = result[:match.start()].rstrip()
+            after = result[end:].lstrip()
+            result = before + ("\n\n" if before and after else "") + after
+
+    for index, marker in enumerate(markers):
+        result = result.replace(f"\x00IRIS_ALERT_DESCRIPTION_{index}\x00", marker)
+    return result
+
+
 async def sync_alert_description_to_case(
     iris_client: IrisClient,
     alert_id: int,
@@ -88,6 +131,7 @@ async def sync_alert_description_to_case(
                 ),
                 "",
             )
+            old_summary = remove_duplicate_ai_sections(old_summary, description)
             updated_summary = upsert_alert_description(old_summary, alert_id, description)
             if updated_summary == old_summary:
                 log.info(
@@ -387,14 +431,16 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
                 log.warning("⚠️ Gagal mengambil detail Case %s", target_case_id)
             else:
                 old_desc = current_case.get("case_description") or current_case.get("description") or ""
-                updated_desc = upsert_ai_section(old_desc, log_uuid, incident_report)
                 alert_description = current_alert.get("alert_description") if current_alert else None
-                if target_alert_id and isinstance(alert_description, str):
+                if target_alert_id and isinstance(alert_description, str) and alert_description.strip():
+                    old_desc = remove_duplicate_ai_sections(old_desc, alert_description)
                     updated_desc = upsert_alert_description(
-                        updated_desc,
+                        old_desc,
                         target_alert_id,
                         alert_description,
                     )
+                else:
+                    updated_desc = upsert_ai_section(old_desc, log_uuid, incident_report)
 
                 if updated_desc != old_desc:
                     await iris_client._put(
