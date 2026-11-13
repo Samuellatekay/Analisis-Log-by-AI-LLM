@@ -40,16 +40,34 @@ def linked_case_ids(alert: dict) -> list[int]:
 def upsert_alert_description(summary: str, alert_id: int, description: str) -> str:
     start = f"<!-- iris-alert-description:{alert_id}:start -->"
     end = f"<!-- iris-alert-description:{alert_id}:end -->"
-    block = f"{start}\n{description}\n{end}"
     pattern = re.compile(
         rf"{re.escape(start)}.*?{re.escape(end)}",
         re.DOTALL,
     )
-    if pattern.search(summary):
-        return pattern.sub(lambda _: block, summary, count=1)
+    existing = pattern.search(summary)
+    if existing:
+        summary = (summary[:existing.start()] + summary[existing.end():]).rstrip()
+    summary = remove_duplicate_ai_sections(summary, description)
+    description = remove_repeated_prefix(summary, description)
+    if not description:
+        return summary
+    block = f"{start}\n{description}\n{end}"
     if description and description in summary:
         return summary.replace(description, block, 1)
     return f"{summary.rstrip()}\n\n{block}" if summary.strip() else block
+
+
+def remove_repeated_prefix(summary: str, description: str) -> str:
+    summary_lines = summary.rstrip("\r\n").splitlines(keepends=True)
+    description_lines = description.splitlines(keepends=True)
+    summary_tail = [line.rstrip("\r\n") for line in summary_lines]
+    description_head = [line.rstrip("\r\n") for line in description_lines]
+
+    max_overlap = min(len(summary_tail), len(description_head))
+    for overlap in range(max_overlap, 0, -1):
+        if summary_tail[-overlap:] == description_head[:overlap]:
+            return "".join(description_lines[overlap:]).lstrip("\r\n")
+    return description
 
 
 def remove_duplicate_ai_sections(summary: str, alert_description: str) -> str:
@@ -131,7 +149,6 @@ async def sync_alert_description_to_case(
                 ),
                 "",
             )
-            old_summary = remove_duplicate_ai_sections(old_summary, description)
             updated_summary = upsert_alert_description(old_summary, alert_id, description)
             if updated_summary == old_summary:
                 log.info(
@@ -433,7 +450,6 @@ async def inject_incident_report(iris_client: IrisClient, raw_data: dict) -> boo
                 old_desc = current_case.get("case_description") or current_case.get("description") or ""
                 alert_description = current_alert.get("alert_description") if current_alert else None
                 if target_alert_id and isinstance(alert_description, str) and alert_description.strip():
-                    old_desc = remove_duplicate_ai_sections(old_desc, alert_description)
                     updated_desc = upsert_alert_description(
                         old_desc,
                         target_alert_id,
