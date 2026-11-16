@@ -89,9 +89,10 @@ Eskalasi otomatis ditangani langsung; `stream-receiver` juga memeriksa relasi
 Alert–Case IRIS secara berkala agar eskalasi melalui tombol UI ikut tersinkron,
 termasuk bila dilakukan setelah laporan AI diterima. Konten Summary yang sudah
 ada tetap dipertahankan; bagian awal deskripsi Alert yang sama dengan akhir
-Summary tidak disalin ulang. Section AI yang sudah ada juga tidak diduplikasi.
-Hasil update dibaca ulang dari IRIS untuk memastikan Summary benar-benar
-tersimpan. Interval pemeriksaan dapat diatur melalui
+Summary tidak disalin ulang. Untuk `log_uuid` yang sama, bagian Risiko diganti
+dengan nilai terbaru, bukan ditambahkan sebagai salinan baru. Section AI yang
+sudah ada juga tidak diduplikasi. Hasil update dibaca ulang dari IRIS untuk
+memastikan Summary benar-benar tersimpan. Interval pemeriksaan diatur melalui
 `IRIS_CASE_SUMMARY_SYNC_INTERVAL_S` (default 30 detik, minimum 5 detik).
 
 Layanan `stream-receiver` menerima laporan dari `TARGET_STREAM_URL` dalam JSON

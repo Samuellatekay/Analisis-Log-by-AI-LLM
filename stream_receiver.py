@@ -48,6 +48,7 @@ def upsert_alert_description(summary: str, alert_id: int, description: str) -> s
     if existing:
         summary = (summary[:existing.start()] + summary[existing.end():]).rstrip()
     summary = remove_duplicate_ai_sections(summary, description)
+    summary, description = replace_latest_risk_section(summary, description)
     description = remove_repeated_prefix(summary, description)
     if not description:
         return summary
@@ -55,6 +56,89 @@ def upsert_alert_description(summary: str, alert_id: int, description: str) -> s
     if description and description in summary:
         return summary.replace(description, block, 1)
     return f"{summary.rstrip()}\n\n{block}" if summary.strip() else block
+
+
+def replace_latest_risk_section(summary: str, description: str) -> tuple[str, str]:
+    source_uuid = re.search(r"(?m)^log_uuid:\s*(\S+)\s*$", description)
+    source_risk = re.search(r"(?m)^# Risiko\s*$", description)
+    if not source_uuid or not source_risk:
+        return summary, description
+
+    source_headings = list(re.finditer(r"(?m)^#{1,6}\s+.*$", description))
+    source_heading = next(
+        (heading for heading in source_headings if heading.start() == source_risk.start()),
+        None,
+    )
+    if source_heading is None:
+        return summary, description
+    source_end = next(
+        (heading.start() for heading in source_headings if heading.start() > source_heading.start()),
+        len(description),
+    )
+    latest_risk = description[source_heading.start():source_end]
+    latest_risk = re.sub(r"(?m)^log_uuid:\s*\S+\s*$", "", latest_risk).strip()
+    if not latest_risk:
+        return summary, description
+
+    uuid_pattern = re.compile(
+        rf"(?m)^log_uuid:\s*{re.escape(source_uuid.group(1))}\s*$"
+    )
+    uuid_matches = list(uuid_pattern.finditer(summary))
+    headings = list(re.finditer(r"(?m)^#{1,6}\s+.*$", summary))
+    risk_headings = [
+        heading for heading in headings
+        if re.fullmatch(r"# Risiko\s*", heading.group(0))
+    ]
+
+    associated: list[tuple[re.Match[str], re.Match[str] | None]] = []
+    previous_uuid_end = 0
+    for uuid_match in uuid_matches:
+        candidates = [
+            heading for heading in risk_headings
+            if previous_uuid_end <= heading.start() < uuid_match.start()
+        ]
+        associated.extend((heading, uuid_match) for heading in candidates)
+        previous_uuid_end = uuid_match.end()
+
+    if not associated and not uuid_matches and len(risk_headings) == 1:
+        associated.append((risk_headings[0], None))
+    if not associated:
+        return summary, description
+
+    risk_ranges: list[tuple[int, int]] = []
+    for heading, uuid_match in associated:
+        next_heading = next(
+            (item.start() for item in headings if item.start() > heading.start()),
+            len(summary),
+        )
+        end = min(next_heading, uuid_match.start() if uuid_match else next_heading)
+        risk_ranges.append((heading.start(), end))
+
+    edits: list[tuple[int, int, str]] = []
+    for index, (start, end) in enumerate(risk_ranges):
+        if index == 0:
+            uuid_line = "" if uuid_matches else f"\nlog_uuid: {source_uuid.group(1)}"
+            replacement = f"{latest_risk}{uuid_line}\n\n"
+        else:
+            replacement = ""
+        edits.append((start, end, replacement))
+    for duplicate in uuid_matches[1:]:
+        edits.append((duplicate.start(), duplicate.end(), ""))
+
+    updated_summary = summary
+    for start, end, replacement in sorted(edits, reverse=True):
+        updated_summary = updated_summary[:start] + replacement + updated_summary[end:]
+    updated_summary = re.sub(r"\n{3,}", "\n\n", updated_summary).strip()
+
+    description = re.sub(
+        r"(?ms)^# Risiko\s*$.*?(?=^#{1,6}\s+|\Z)",
+        "",
+        description,
+        count=1,
+    )
+    description = uuid_pattern.sub("", description, count=1)
+    description = re.sub(r"\n{3,}", "\n\n", description).strip()
+    return updated_summary, description
 
 
 def remove_repeated_prefix(summary: str, description: str) -> str:
