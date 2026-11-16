@@ -80,6 +80,7 @@ class Settings:
     iris_workers: int
     iris_queue_max: int
     iris_mode: str
+    iris_auto_escalate: bool
     iris_case_min_risk: float
     iris_case_window_s: int
     risk_normalize: bool
@@ -117,6 +118,7 @@ class Settings:
             iris_workers=int(_e("IRIS_WORKERS", "1")),
             iris_queue_max=int(_e("IRIS_QUEUE_MAX", "500")),
             iris_mode=_e("IRIS_MODE", "alert").lower(),
+            iris_auto_escalate=_e("IRIS_AUTO_ESCALATE", "true").lower() == "true",
             iris_case_min_risk=float(_e("IRIS_CASE_MIN_RISK", "75")),
             iris_case_window_s=int(_e("IRIS_CASE_WINDOW_S", "3600")),
             risk_normalize=_e("RISK_NORMALIZE", "false").lower() == "true",
@@ -1458,7 +1460,13 @@ class App:
                     except Exception:
                         log.warning("Gagal menyimpan ID alert di key dedup %s", key)
                 if s.iris_mode == "alert_case" and alert_id and r.risk_score >= s.iris_case_min_risk:
-                    case_id = await self._case_for(r, int(alert_id))
+                    if s.iris_auto_escalate:
+                        case_id = await self._case_for(r, int(alert_id))
+                    else:
+                        log.info(
+                            "IRIS alert %s tidak dieskalasi otomatis; IRIS_AUTO_ESCALATE=false.",
+                            alert_id,
+                        )
                 if alert_id is not None or case_id is not None:
                     await self.db.set_iris(r.log_uuid, int(alert_id) if alert_id else None,
                                            int(case_id) if case_id else None)

@@ -79,6 +79,10 @@ Atur `IRIS_ENABLED`, `IRIS_URL`, `IRIS_API_KEY`, dan `IRIS_CUSTOMER_ID` di `.env
 Pilih `IRIS_MODE=alert`, `alert_case`, atau `case`. Gunakan `IRIS_MIN_RISK` dan
 `IRIS_MIN_WAZUH_LEVEL` untuk mengatur ambang pengiriman. Skor risiko dihitung
 terpisah dari level Wazuh.
+Untuk tetap membuat Alert tetapi mematikan eskalasi otomatis ke Case, atur
+`IRIS_AUTO_ESCALATE=false` (berlaku saat `IRIS_MODE=alert_case`). Alert tetap
+dapat dieskalasi manual dari UI IRIS. Mode `IRIS_MODE=case` tetap membuat Case
+secara langsung dan tidak dipengaruhi sakelar ini.
 
 Pengiriman alert dilakukan melalui antrean worker IRIS. Satu kombinasi sumber dan
 aksi dideduplikasi selama `IRIS_DEDUP_WINDOW_S`. `IRIS_WORKERS` mengatur jumlah
