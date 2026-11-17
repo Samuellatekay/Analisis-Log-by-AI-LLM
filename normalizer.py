@@ -1,7 +1,7 @@
 """
 normalizer.py - Adaptor skema per sumber -> skema internal.
 
-Skema internal (dibaca risk_calculator dan iris_client):
+Skema internal (dibaca Risk Engine dan iris_client):
   event.{severity,outcome,category,action}, source.ip, host.name, asset.{criticality,name},
   reputation.{score,ioc_match}, geolocation, domain.{name,age_days}, threat.base_weight
 

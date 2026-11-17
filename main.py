@@ -28,7 +28,6 @@ import redis.asyncio as aioredis
 from redis.exceptions import ResponseError
 from iris_client import IrisClient
 from normalizer import normalize
-# HAPUS: from risk_calculator import assess_event
 
 try:
     import uvloop

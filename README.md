@@ -1,15 +1,15 @@
 # Analisis_Log
 
 Layanan ini menerima event dari Redis, menormalisasi dan menghitung skor risiko
-secara deterministik, menyimpan event sementara di PostgreSQL, meneruskan dokumen
+melalui `soc-risk-engine`, menyimpan event sementara di PostgreSQL, meneruskan dokumen
 ke Logstash, dan mengirim alert berisiko ke DFIR-IRIS.
 
 ## Alur event
 
 1. Event masuk melalui list Redis pada `REDIS_LISTS`, atau Redis Stream jika
    `REDIS_MODE=stream`.
-2. Aplikasi menormalkan event dan menghitung skor risiko menggunakan
-   `risk_calculator.py`.
+2. Aplikasi menormalkan event dan menghitung skor risiko melalui Risk Engine
+   eksternal (`RISK_ENGINE_URL`).
 3. Dokumen disimpan di PostgreSQL, diteruskan ke Logstash, dan diproses untuk
    pengiriman ke IRIS sesuai ambang risiko dan level Wazuh.
 4. Alert Wazuh meminta lookup GLPI melalui `outbound-glpi` berdasarkan IP sumber,
