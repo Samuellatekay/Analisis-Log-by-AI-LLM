@@ -79,6 +79,41 @@ Atur `IRIS_ENABLED`, `IRIS_URL`, `IRIS_API_KEY`, dan `IRIS_CUSTOMER_ID` di `.env
 Pilih `IRIS_MODE=alert`, `alert_case`, atau `case`. Gunakan `IRIS_MIN_RISK` dan
 `IRIS_MIN_WAZUH_LEVEL` untuk mengatur ambang pengiriman. Skor risiko dihitung
 terpisah dari level Wazuh.
+
+### Risk level dan severity IRIS
+
+Risk Engine mengembalikan skor `0`–`100` dan level berdasarkan skor akhir:
+
+| Skor | Risk level |
+| --- | --- |
+| `< 40` | `low` |
+| `40`–`< 60` | `medium` |
+| `60`–`< 80` | `high` |
+| `80`–`100` | `critical` |
+
+`RISK_ENVIRONMENT_MULTIPLIER` dikonfigurasi pada `.env` milik Risk Engine.
+Nilai `1.0` mempertahankan skor; `1.2` menaikkan skor akhir 20%, lalu level
+dihitung ulang. Skor dibatasi maksimum `100`.
+
+Judul alert seperti `[MEDIUM]` memakai risk level dari Risk Engine. Badge severity
+IRIS memakai ID numerik dari `IRIS_SEVERITY_MAP`; ID dapat berbeda pada tiap
+instalasi IRIS. Jadi, judul `[MEDIUM]` dengan badge `LOW` biasanya berarti ID
+`medium` dipetakan ke severity `LOW` di IRIS, bukan skor kalkulator yang berbeda.
+
+Periksa nama dan ID severity pada instalasi IRIS:
+
+```sh
+docker compose run --rm app python check_connections.py --iris-ids
+```
+
+Isi `IRIS_SEVERITY_MAP` di `.env` dengan ID yang sesuai, misalnya
+`low:<id_low>,medium:<id_medium>,high:<id_high>,critical:<id_critical>`.
+ID pada `.env.example` bukan nilai universal. Jika map diisi, auto-discovery
+berdasarkan nama severity tidak dijalankan; jika kosong, aplikasi mencoba
+mencocokkan nama severity dari IRIS. Setelah mengubah `.env`, buat ulang container
+`app`. Perubahan berlaku untuk alert yang dibuat atau diperbarui berikutnya;
+severity alert lama tidak otomatis berubah.
+
 Untuk tetap membuat Alert tetapi mematikan eskalasi otomatis ke Case, atur
 `IRIS_AUTO_ESCALATE=false` (berlaku saat `IRIS_MODE=alert_case`). Alert tetap
 dapat dieskalasi manual dari UI IRIS. Mode `IRIS_MODE=case` tetap membuat Case
