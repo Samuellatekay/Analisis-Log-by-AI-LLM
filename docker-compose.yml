@@ -5,8 +5,8 @@ services:
     env_file: .env
     environment:
       - IRIS_CA_CERT=/app/iris-ca.crt
-      - RISK_ENGINE_URL=http://192.168.51.39:8000
-      - RISK_STRATEGY=ahp_2026
+      - RISK_ENGINE_URL=${RISK_ENGINE_URL:-http://192.168.51.39:8000}
+      - RISK_STRATEGY=${RISK_STRATEGY:-ahp_2026}
     restart: unless-stopped
     depends_on:
       postgres: { condition: service_healthy }

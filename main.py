@@ -47,6 +47,13 @@ def _error_label(exc: Exception) -> str:
         return str(public_message)[:200]
     return type(exc).__name__
 
+
+class RiskEngineRejected(Exception):
+    def __init__(self, msg_id: str, status_code: int):
+        super().__init__(f"risk_engine_rejected:HTTP{status_code}")
+        self.msg_id = msg_id
+
+
 # ----------------------------------------------------------------- Konfigurasi
 def _e(name: str, default: str) -> str:
     return os.environ.get(name, default)
@@ -84,12 +91,14 @@ class Settings:
     iris_case_window_s: int
     risk_normalize: bool
     shutdown_grace_s: float
-    # TAMBAHKAN 2 BARIS INI UNTUK RISK ENGINE:
     risk_engine_url: str
     risk_strategy: str
 
     @classmethod
     def from_env(cls) -> "Settings":
+        risk_strategy = _e("RISK_STRATEGY", "ahp_2026").strip().lower()
+        if risk_strategy not in ("linear", "ahp_2026"):
+            raise ValueError("RISK_STRATEGY harus: linear | ahp_2026")
         return cls(
             redis_url=_e("REDIS_URL", "redis://localhost:6379/0"),
             stream_key=_e("REDIS_STREAM", "logs:raw"),
@@ -122,9 +131,8 @@ class Settings:
             iris_case_window_s=int(_e("IRIS_CASE_WINDOW_S", "3600")),
             risk_normalize=_e("RISK_NORMALIZE", "false").lower() == "true",
             shutdown_grace_s=float(_e("SHUTDOWN_GRACE_S", "20")),
-            # INISIALISASI VARIABEL BARU DARI .env:
             risk_engine_url=_e("RISK_ENGINE_URL", "http://soc-risk-engine:8000"),
-            risk_strategy=_e("RISK_STRATEGY", "ahp_2026"),
+            risk_strategy=risk_strategy,
         )
 
 # ------------------------------------------------------------------ Data model
@@ -898,18 +906,28 @@ class App:
             extras = await self._enrich([d for _, d in parsed])
             now = datetime.now(timezone.utc)
             
-            # UBAH DARI LIST COMPREHENSION MENJADI ASYNCIO.GATHER
-            records = await asyncio.gather(*[
+            build_results = await asyncio.gather(*[
                 self._build_record(it.msg_id, data, repeat, crit, now)
                 for (it, data), (repeat, crit) in zip(parsed, extras)
-            ])
+            ], return_exceptions=True)
+            records: list[Record] = []
+            for (item, _), result in zip(parsed, build_results):
+                if isinstance(result, RiskEngineRejected):
+                    dlq.append((result.msg_id, str(result), item.raw or ""))
+                elif isinstance(result, BaseException):
+                    raise result
+                else:
+                    records.append(result)
             
-            rejected = {r.msg_id for r in await self.db.insert_many(records)}
+            rejected = {
+                r.msg_id for r in await self.db.insert_many(records)
+            } if records else set()
             for r in records:
                 if r.msg_id in rejected:
                     dlq.append((r.msg_id, "db_rejected", orjson.dumps(r.doc).decode()))
             records = [r for r in records if r.msg_id not in rejected]
-            accepted_data = [data for item, data in parsed if item.msg_id not in rejected]
+            accepted_ids = {r.msg_id for r in records if r.msg_id not in rejected}
+            accepted_data = [data for item, data in parsed if item.msg_id in accepted_ids]
             if accepted_data:
                 await self._queue_glpi_asset_lookups(accepted_data)
             ok = await self.logstash.send([r.doc for r in records]) if records else True
@@ -1210,43 +1228,60 @@ class App:
                             now: datetime) -> Record:
         # 1. Siapkan payload untuk soc-risk-engine
         ev = data.get("event") if isinstance(data.get("event"), dict) else {}
+        asset = data.get("asset") if isinstance(data.get("asset"), dict) else {}
+        threat = data.get("threat") if isinstance(data.get("threat"), dict) else {}
+        reputation = data.get("reputation") if isinstance(data.get("reputation"), dict) else {}
+        domain = data.get("domain") if isinstance(data.get("domain"), dict) else {}
         category = ev.get("category", ["network"])
         if isinstance(category, list):
             category = category[0] if category else "network"
+        outcome = ev.get("outcome", "alert")
+        blocked_outcomes = {
+            "deny", "blocked", "failure", "fail", "denied",
+            "drop", "dropped", "reject", "rejected",
+        }
+        is_blocked = (
+            outcome == 0
+            or str(outcome).lower() in blocked_outcomes
+        )
         
         payload = {
             "strategy": self.s.risk_strategy,
             "asset": {
                 "criticality": crit if crit is not None else 3.0,
-                "business_value": data.get("asset", {}).get("business_value", "support"),
-                "data_sensitivity": data.get("asset", {}).get("data_sensitivity", "internal")
+                "business_value": asset.get("business_value", "support"),
+                "data_sensitivity": asset.get("data_sensitivity", "internal")
             },
             "event": {
                 "severity": float(ev.get("severity", 1)),
-                "outcome": 1 if str(ev.get("outcome", "alert")).lower() not in ("deny", "blocked", "failure", "fail", "denied", "drop", "dropped", "reject", "rejected") else 0,
-                "category": str(category).lower()
+                "outcome": 0 if is_blocked else 1,
+                "category": str(category or "network").lower()
             },
             "threat": {
-                "base_weight": 2.0,
-                "ioc_match": bool(data.get("reputation", {}).get("ioc_match", False)),
-                "reputation_score": data.get("reputation", {}).get("score"),
-                "domain_age_days": data.get("domain", {}).get("age_days"),
+                "base_weight": threat.get("base_weight", 2.0),
+                "ioc_match": bool(reputation.get("ioc_match", False)),
+                "reputation_score": reputation.get("score"),
+                "domain_age_days": domain.get("age_days"),
                 "repeat_count": repeat
             },
             "environment": {"external_multiplier": 1.0, "internal_multiplier": 1.0}
         }
 
-        # 2. Panggil Microservice (dengan fallback jika error)
-        risk_score, risk_level, risk_breakdown = 0.0, "low", {}
-        try:
-            response = await self.risk_client.post("/calculate", json=payload)
-            response.raise_for_status()
-            res_data = response.json()
-            risk_score = res_data.get("score", 0.0)
-            risk_level = res_data.get("level", "low")
-            risk_breakdown = res_data.get("breakdown", {})
-        except Exception as e:
-            log.error("Gagal menghubungi Risk Engine (%s). Menggunakan skor 0.", _error_label(e))
+        # 2. Jika Risk Engine gagal, biarkan batch di-retry oleh consumer.
+        response = await self.risk_client.post("/calculate", json=payload)
+        if 400 <= response.status_code < 500 and response.status_code != 429:
+            raise RiskEngineRejected(msg_id, response.status_code)
+        response.raise_for_status()
+        res_data = response.json()
+        risk_score = float(res_data["score"])
+        risk_level = str(res_data["level"])
+        risk_breakdown = res_data["breakdown"]
+        if not 0 <= risk_score <= 100:
+            raise ValueError("Risk Engine mengembalikan score di luar rentang 0-100")
+        if risk_level not in ("low", "medium", "high", "critical"):
+            raise ValueError("Risk Engine mengembalikan level yang tidak dikenal")
+        if not isinstance(risk_breakdown, dict):
+            raise ValueError("Risk Engine mengembalikan breakdown yang tidak valid")
 
         # 3. Bangun Record (Mapping agar iris_client.py tidak error)
         log_uuid = uuid.uuid5(UUID_NS, msg_id)

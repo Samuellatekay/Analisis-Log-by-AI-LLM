@@ -122,6 +122,11 @@ layanan pengirim; receiver tidak dapat memulihkan teks yang tidak dikirim.
 Salin `.env.example` menjadi `.env`, lalu isi nilai konfigurasi Redis, PostgreSQL,
 Logstash, dan IRIS:
 
+`RISK_ENGINE_URL` harus menunjuk ke Risk Engine yang dapat dijangkau dari container
+`app`; `RISK_STRATEGY` menerima `linear` atau `ahp_2026`. Kegagalan sementara saat
+menghubungi Risk Engine akan membuat batch dicoba ulang, sedangkan respons HTTP 4xx
+selain 429 dikirim ke dead-letter stream.
+
 ```sh
 docker compose up -d --build
 docker compose logs -f app
