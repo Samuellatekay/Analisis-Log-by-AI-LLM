@@ -36,6 +36,12 @@ serial, nomor inventaris, sistem operasi, status, lokasi, tipe, produsen, model,
 entity/grup, kontak, catatan, dan tanggal inventaris, selama kolom tersebut terisi
 di GLPI. Alamat IP aset dipisahkan menjadi IP privat (RFC1918/IPv6 ULA), IP publik
 yang dapat dirutekan global, dan IP lainnya yang tidak termasuk dua kategori tersebut.
+Untuk scoring AHP, Risk Engine membaca `business_value` dan `data_sensitivity` dari
+field aset GLPI jika tersedia, atau dari format `business_value=support
+data_sensitivity=internal` di Catatan/Description. Aset GLPI tujuan diprioritaskan
+sebagai host yang diserang. Nilai yang diterima adalah `core`/`support`/`test` dan
+`top_secret`/`confidential`/`internal`/`public`; jika tidak valid atau tidak tersedia,
+nilai bawaan adalah `support` dan `internal`.
 
 Lookup OpenCTI dijadwalkan untuk IP sumber/tujuan, domain, dan hash file yang
 terekstrak dari alert Wazuh. GLPI dicari berdasarkan IP sumber/tujuan dan hostname

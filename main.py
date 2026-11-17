@@ -14,6 +14,7 @@ import hashlib
 import ipaddress
 import logging
 import os
+import re
 import signal
 import socket
 import time
@@ -169,8 +170,36 @@ GLPI_ASSET_FIELDS = (
     "public_ip_addresses", "other_ip_addresses", "owner", "user", "serial_number", "asset_tag",
     "operating_system", "status", "location", "type", "manufacturer", "model",
     "entity", "group", "contact", "contact_number", "description",
+    "business_value", "data_sensitivity",
     "created_at", "updated_at", "purchase_date",
 )
+
+
+def _risk_asset_values(asset: dict) -> dict[str, str]:
+    allowed_values = {
+        "business_value": {"core", "support", "test"},
+        "data_sensitivity": {"top_secret", "confidential", "internal", "public"},
+    }
+    defaults = {"business_value": "support", "data_sensitivity": "internal"}
+    description = asset.get("description")
+    note_values = {}
+    if isinstance(description, str):
+        for field, allowed in allowed_values.items():
+            match = re.search(rf"\b{field}\s*=\s*([a-z_]+)\b", description, re.IGNORECASE)
+            if match:
+                value = match.group(1).strip().lower()
+                if value in allowed:
+                    note_values[field] = value
+
+    values = {}
+    for field, allowed in allowed_values.items():
+        value = asset.get(field)
+        value = value.strip().lower() if isinstance(value, str) else None
+        if value not in allowed:
+            value = note_values.get(field)
+        values[field] = value if value in allowed else defaults[field]
+    return values
+
 
 def merge_enrichment(target: dict, event: dict) -> None:
     entity_type = str(event.get("entity_type") or "").lower()
@@ -1229,6 +1258,17 @@ class App:
         # 1. Siapkan payload untuk soc-risk-engine
         ev = data.get("event") if isinstance(data.get("event"), dict) else {}
         asset = data.get("asset") if isinstance(data.get("asset"), dict) else {}
+        destination = data.get("destination") if isinstance(data.get("destination"), dict) else {}
+        destination_asset = destination.get("asset")
+        if isinstance(destination_asset, dict) and (
+            destination_asset.get("found") is True
+            or destination_asset.get("inventory_source") == "GLPI"
+            or any(destination_asset.get(key) for key in (
+                "business_value", "data_sensitivity", "description"
+            ))
+        ):
+            asset = destination_asset
+        asset_risk_values = _risk_asset_values(asset)
         threat = data.get("threat") if isinstance(data.get("threat"), dict) else {}
         reputation = data.get("reputation") if isinstance(data.get("reputation"), dict) else {}
         domain = data.get("domain") if isinstance(data.get("domain"), dict) else {}
@@ -1249,8 +1289,8 @@ class App:
             "strategy": self.s.risk_strategy,
             "asset": {
                 "criticality": crit if crit is not None else 3.0,
-                "business_value": asset.get("business_value", "support"),
-                "data_sensitivity": asset.get("data_sensitivity", "internal")
+                "business_value": asset_risk_values["business_value"],
+                "data_sensitivity": asset_risk_values["data_sensitivity"]
             },
             "event": {
                 "severity": float(ev.get("severity", 1)),
