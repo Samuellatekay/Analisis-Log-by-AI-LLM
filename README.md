@@ -82,80 +82,7 @@ terpisah dari level Wazuh.
 
 ### Risk level dan severity IRIS
 
-Strategi `ahp_2026` menerapkan enam bobot kriteria dari Table 5 jurnal Guo et al.,
-“Intelligent priority awareness method for alert data in SOC threat response”
-(2026, DOI: `10.1007/s44443-026-01172-w`):
-target `0.16`, attack-stage `0.31`, intelligence `0.18`, feasibility `0.22`,
-persistence `0.07`, dan environment `0.06`. Tiap kriteria mengagregasi
-sub-indikator Table 4 sesuai bobotnya; skor dasar `Rb = 100 × Σ(Wi × Ci)`,
-lalu skor akhir mengikuti Eq. (10): `R = min(100, Rb × Eext × Eint)`.
-
-Sub-indikator yang belum dikirim oleh sumber log memakai fallback eksplisit:
-
-- Target: business value `support` (0.6), sensitivitas `internal` (0.5), dan
-  attack surface `internal` (0.6).
-- Attack-stage: hazard memakai pemetaan kategori event sebagai fallback;
-  stage policy memakai 0.5.
-- Intelligence: confidence memakai skor reputasi / 100, atau IOC match (1/0)
-  jika tidak ada skor; vulnerability, APT association, dan freshness memakai 0.
-- Feasibility: exploitability `none` (0.3), reachability `unknown` (0.5),
-  dan bypass tanpa bukti (0.8).
-- Persistence: korelasi `min(1, 0.5 + 0.1 × repeat_count)`, progression tanpa
-  bukti (0.5), dan lateral movement `unknown` (0.7).
-- Environment criterion: rata-rata intensitas eksternal dan internal yang
-  dinormalisasi. Jurnal tidak memberi sub-bobot untuk dua indikator ini, jadi
-  implementasi memakai bobot sama (0.5 masing-masing).
-
-`RISK_EXTERNAL_MULTIPLIER` dan `RISK_INTERNAL_MULTIPLIER` di `.env` milik
-Risk Engine mengatur `Eext` dan `Eint` (normal `1.0`; kampanye industri `1.2`;
-anomali internal `1.1`). Nilai environment yang dikirim langsung pada payload
-Risk Engine meng-override nilai konfigurasi. Field baru dapat dikirim melalui
-`asset.attack_surface_exposure`, `event.phase_hazard`,
-`event.stage_policy_weight`, dan `threat` sub-indikator terkait. `domain_age_days`
-dipertahankan untuk kompatibilitas payload lama, tetapi tidak digunakan oleh
-strategi AHP jurnal.
-
-Jika `.env` lama masih memakai `RISK_ENVIRONMENT_MULTIPLIER`, ganti dengan
-`RISK_EXTERNAL_MULTIPLIER=<nilai_lama>` dan `RISK_INTERNAL_MULTIPLIER=1.0`
-untuk mempertahankan efek pengali skor global sebelumnya. Untuk konfigurasi jurnal,
-gunakan nilai external dan internal secara terpisah seperti di atas.
-
-Jurnal tidak menetapkan batas label level; batas aplikasi tetap:
-`<40` low, `40–<60` medium, `60–<80` high, dan `80–100` critical. Implementasi
-ini juga memvalidasi graph event/OpenCTI sebelum evidence graph dipakai:
-identifier IP/domain/CVE/CWE dinormalisasi, node dan edge diperiksa tipe serta
-endpoint-nya, dan fakta eksternal harus punya source/provenance, waktu pengambilan,
-waktu pembaruan, serta confidence yang valid. Fakta revoked, belum berlaku, atau
-sudah melewati `valid_until` dikarantina. Jurnal tidak menentukan freshness limit
-berupa angka hari, jadi implementasi hanya memakai metadata validitas yang tersedia;
-fakta tanpa metadata wajib tidak mengaktifkan gate dan skor kembali ke fallback.
-Graph snapshot ID, status, evidence gate, jumlah fakta tervalidasi/dikarantina, dan
-kode pelanggaran tercantum di `risk.graph_validation`.
-
-OpenCTI lookup berjalan asynchronous. Skor awal hanya dapat memakai enrichment
-yang sudah tersedia di cache saat alert diproses; enrichment yang baru datang
-setelah kalkulasi memperbarui konteks alert tetapi tidak menghitung ulang skor
-lama. Karena itu, alert tanpa cache memakai fallback, dan event berikutnya dapat
-memakai graph setelah enrichment tersedia. Deploy ulang collector agar hasil
-lookup baru menyimpan `acquired_at`; cache lama yang belum memiliki waktu tersebut
-akan dikarantina sampai enrichment baru diterima.
-
-Gate mengeluarkan `retain` jika ada bukti IOC OpenCTI tervalidasi, kerentanan
-exploitable atau attack-pattern dari relasi graph yang valid, atau indikator risiko
-tinggi dari event (aset criticality >= 4 pada skala 1–5, phase hazard > 0, atau
-kill-chain progression). Jurnal tidak menetapkan batas numerik untuk aset
-“high-criticality”, jadi nilai 4 adalah kebijakan lokal. IOC dianggap terkonfirmasi
-jika ada relasi exact-match aktif dengan confidence positif; jurnal juga tidak
-menetapkan batas confidence numerik. APT association yang tervalidasi ikut menjadi
-bukti scoring, tetapi tidak sendirian mengaktifkan retain.
-Selain itu keputusan `fallback` dan kalkulator tetap memproses event memakai nilai
-fallback yang terdokumentasi. Gate ini belum menghapus alert: pipeline FFT-PCC
-jurnal tidak ada dalam implementasi. Graph sekarang terbatas ke event dan enrichment
-OpenCTI; graph asosiasi aset-vulnerability internal, validasi ontology lengkap,
-perbaikan deterministik, pemeriksaan konflik lintas sumber, FFT-PCC, dan BERT
-multi-agent belum diimplementasikan.
-
-Risk level dihitung dari skor akhir `0`–`100`:
+Risk Engine mengembalikan skor `0`–`100` dan level berdasarkan skor akhir:
 
 | Skor | Risk level |
 | --- | --- |
@@ -163,6 +90,10 @@ Risk level dihitung dari skor akhir `0`–`100`:
 | `40`–`< 60` | `medium` |
 | `60`–`< 80` | `high` |
 | `80`–`100` | `critical` |
+
+`RISK_ENVIRONMENT_MULTIPLIER` dikonfigurasi pada `.env` milik Risk Engine.
+Nilai `1.0` mempertahankan skor; `1.2` menaikkan skor akhir 20%, lalu level
+dihitung ulang. Skor dibatasi maksimum `100`.
 
 Judul alert seperti `[MEDIUM]` memakai risk level dari Risk Engine. Badge severity
 IRIS memakai ID numerik dari `IRIS_SEVERITY_MAP`; ID dapat berbeda pada tiap

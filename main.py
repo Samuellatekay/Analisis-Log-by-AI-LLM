@@ -28,7 +28,6 @@ import redis.asyncio as aioredis
 from redis.exceptions import ResponseError
 from iris_client import IrisClient
 from normalizer import normalize
-from risk_graph import build_event_opencti_graph
 
 try:
     import uvloop
@@ -1233,7 +1232,6 @@ class App:
         threat = data.get("threat") if isinstance(data.get("threat"), dict) else {}
         reputation = data.get("reputation") if isinstance(data.get("reputation"), dict) else {}
         domain = data.get("domain") if isinstance(data.get("domain"), dict) else {}
-        environment = data.get("environment") if isinstance(data.get("environment"), dict) else {}
         category = ev.get("category", ["network"])
         if isinstance(category, list):
             category = category[0] if category else "network"
@@ -1252,46 +1250,21 @@ class App:
             "asset": {
                 "criticality": crit if crit is not None else 3.0,
                 "business_value": asset.get("business_value", "support"),
-                "data_sensitivity": asset.get("data_sensitivity", "internal"),
-                "attack_surface_exposure": asset.get("attack_surface_exposure", "internal"),
+                "data_sensitivity": asset.get("data_sensitivity", "internal")
             },
             "event": {
                 "severity": float(ev.get("severity", 1)),
                 "outcome": 0 if is_blocked else 1,
-                "category": str(category or "network").lower(),
-                "phase_hazard": ev.get("phase_hazard"),
-                "stage_policy_weight": ev.get("stage_policy_weight"),
+                "category": str(category or "network").lower()
             },
             "threat": {
                 "base_weight": threat.get("base_weight", 2.0),
                 "ioc_match": bool(reputation.get("ioc_match", False)),
                 "reputation_score": reputation.get("score"),
                 "domain_age_days": domain.get("age_days"),
-                "repeat_count": repeat,
-                "ioc_confidence": threat.get("ioc_confidence"),
-                "vulnerability_existence": threat.get(
-                    "vulnerability_existence", "none"
-                ),
-                "apt_association": threat.get("apt_association", 0.0),
-                "intelligence_freshness": threat.get(
-                    "intelligence_freshness", 0.0
-                ),
-                "exploitability": threat.get("exploitability", "none"),
-                "path_reachability": threat.get("path_reachability", "unknown"),
-                "protection_bypass_evidence": threat.get(
-                    "protection_bypass_evidence", False
-                ),
-                "kill_chain_progression": threat.get("kill_chain_progression", False),
-                "lateral_movement_potential": threat.get(
-                    "lateral_movement_potential", "unknown"
-                ),
+                "repeat_count": repeat
             },
-            "environment": {
-                key: environment[key]
-                for key in ("external_multiplier", "internal_multiplier")
-                if key in environment
-            },
-            "graph": build_event_opencti_graph(data.get("enrichment"), msg_id),
+            "environment": {"external_multiplier": 1.0, "internal_multiplier": 1.0}
         }
 
         # 2. Jika Risk Engine gagal, biarkan batch di-retry oleh consumer.
@@ -1309,13 +1282,6 @@ class App:
             raise ValueError("Risk Engine mengembalikan level yang tidak dikenal")
         if not isinstance(risk_breakdown, dict):
             raise ValueError("Risk Engine mengembalikan breakdown yang tidak valid")
-        graph_validation = res_data.get("graph_validation")
-        if not isinstance(graph_validation, dict):
-            raise ValueError("Risk Engine tidak mengembalikan hasil validasi graph")
-        if graph_validation.get("status") not in (
-            "not_provided", "valid", "partial", "invalid"
-        ) or graph_validation.get("gate_decision") not in ("retain", "fallback"):
-            raise ValueError("Risk Engine mengembalikan hasil risk gate yang tidak valid")
 
         # 3. Bangun Record (Mapping agar iris_client.py tidak error)
         log_uuid = uuid.uuid5(UUID_NS, msg_id)
@@ -1341,7 +1307,6 @@ class App:
                 "score": risk_score, 
                 "level": risk_level, 
                 "breakdown": risk_breakdown,
-                "graph_validation": graph_validation,
                 # Mapping baru yang lebih deskriptif untuk analis manusia
                 "asset_criticality": crit if crit is not None else 3.0, # Tampilkan nilai asli 1-5 dari GLPI
                 "event_severity": payload["event"]["severity"],
