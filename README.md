@@ -29,8 +29,10 @@ event dan severity internal; extension seperti `dhost`, user, process ID,
 command line, hash file, waktu deteksi, serta tactic/technique dipetakan ke
 field `host`, `user`, `process`, `file`, `@timestamp`, dan `threat`. Untuk alert
 CrowdStrike yang dibungkus Wazuh, `host.name` mengikuti `dhost` (endpoint yang
-terdeteksi), sedangkan `agent.name` tetap menunjukkan agent/collector Wazuh. Setiap
-pesan Redis sebaiknya memuat satu baris CEF. Alert Wazuh yang berasal dari CEF
+terdeteksi), `user.name` mengikuti `duser`, sedangkan `agent.name` tetap
+menunjukkan agent/collector Wazuh. Hash file CEF dikirim sebagai IOC alert agar
+tersedia di tab IOCs sejak alert dibuat. Setiap pesan Redis sebaiknya memuat satu
+baris CEF. Alert Wazuh yang berasal dari CEF
 CrowdStrike digabungkan di integrasi IRIS berdasarkan `CompositeId` yang sama;
 informasi dari event terkait ditambahkan ke Alert yang sudah dibuat. Ini tidak
 mencegah Wazuh sendiri mencatat dua Alert, dan tidak menghapus event individual

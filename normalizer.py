@@ -231,6 +231,8 @@ def norm_wazuh(p: dict) -> dict:
                 **_dict(cef_event.get("asset")),
             }
         out["crowdstrike"] = cef_event["crowdstrike"]
+        if cef_event.get("user"):
+            out["user"] = {**_dict(out.get("user")), **cef_event["user"]}
         if cef_event.get("threat"):
             out["threat"] = cef_event["threat"]
         if cef_event.get("process"):

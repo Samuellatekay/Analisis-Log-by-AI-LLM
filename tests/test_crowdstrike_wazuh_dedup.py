@@ -93,6 +93,7 @@ class CrowdStrikeWazuhDedupTests(unittest.TestCase):
         self.assertEqual(detection["data_source"], "wazuh")
         self.assertEqual(mitre["data_source"], "wazuh")
         self.assertEqual(detection["host"]["name"], "ubuntu2402-soclab")
+        self.assertEqual(detection["user"]["name"], "root")
         self.assertEqual(detection["agent"]["name"], "hids-soclab")
         self.assertEqual(detection["crowdstrike"]["host_name"], "ubuntu2402-soclab")
         self.assertEqual(detection["crowdstrike"]["detection_id"], COMPOSITE_ID)
@@ -119,6 +120,7 @@ class CrowdStrikeWazuhDedupTests(unittest.TestCase):
 
         self.assertEqual(detection["crowdstrike"]["detection_id"], COMPOSITE_ID)
         self.assertEqual(detection["host"]["name"], "ubuntu2402-soclab")
+        self.assertEqual(detection["user"]["name"], "root")
         self.assertEqual(detection["agent"]["name"], "hids-soclab")
         self.assertEqual(mitre["threat"]["technique"], "Automated Exfiltration")
         self.assertEqual(mitre["crowdstrike"]["technique_id"], "T1020")

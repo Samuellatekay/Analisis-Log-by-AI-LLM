@@ -610,6 +610,9 @@ class IrisClient:
             *([f"- Wazuh Level: {_display(ev.get('wazuh_level'), 30)}"] if is_wazuh else []),
             f"- IP tujuan (host yang diserang): {destination_label}",
         ]
+        user_name = _display(_d(doc.get("user")).get("name"), 100)
+        if user_name:
+            event_block.append(f"- User: {user_name}")
         crowdstrike = _d(doc.get("crowdstrike"))
         threat = _d(doc.get("threat"))
         detection_id = crowdstrike.get("detection_id") or crowdstrike.get("composite_id")
@@ -792,6 +795,7 @@ class IrisClient:
             "sha256": ["sha256", "sha-256"],
             "sha1": ["sha1", "sha-1"],
             "md5": ["md5"],
+            "sha512": ["sha512", "sha-512"],
             "filename": ["filename", "file-name"],
         }.get(kind, [])
         return next((ids[n] for n in order if n in ids), None)
@@ -809,6 +813,11 @@ class IrisClient:
         # supaya update berikutnya punya IOC yang bisa diisi data OpenCTI/geolokasi.
         known = {str(o.get("value") or "").strip().lower() for o in observables if isinstance(o, dict)}
         base = []
+        file_hashes = _d(_d(doc.get("file")).get("hash"))
+        for algorithm in ("md5", "sha1", "sha256", "sha512"):
+            value = file_hashes.get(algorithm)
+            if isinstance(value, str) and value.strip() and value.strip().lower() not in known:
+                base.append({"entity_type": algorithm, "value": value.strip()})
         for ip in (src_ip, _d(doc.get("destination")).get("ip")):
             if not ip or str(ip).strip().lower() in known:
                 continue

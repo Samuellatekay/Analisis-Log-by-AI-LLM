@@ -74,5 +74,23 @@ class CrowdStrikeAlertAssetTests(unittest.TestCase):
         )
 
 
+class CrowdStrikeAlertIocTests(unittest.TestCase):
+    def test_file_hash_is_attached_as_ioc_before_enrichment(self):
+        client = IrisClient.__new__(IrisClient)
+        client.ioc_type_ids = {"md5": 17}
+        client.tlp_id = 2
+        file_hash = "38cdcffd5d19eddfdbb4457c5bac7899"
+
+        iocs = client._build_alert_iocs({
+            "file": {"hash": {"md5": file_hash}},
+            "enrichment": {"observables": []},
+        })
+
+        self.assertEqual(len(iocs), 1)
+        self.assertEqual(iocs[0]["ioc_value"], file_hash)
+        self.assertEqual(iocs[0]["ioc_type_id"], 17)
+        self.assertEqual(iocs[0]["ioc_tlp_id"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()
