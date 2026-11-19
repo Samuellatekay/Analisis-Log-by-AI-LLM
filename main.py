@@ -28,7 +28,7 @@ import orjson
 import redis.asyncio as aioredis
 from redis.exceptions import ResponseError
 from iris_client import IrisClient
-from normalizer import normalize
+from normalizer import crowdstrike_detection_id, normalize
 
 try:
     import uvloop
@@ -53,6 +53,48 @@ class RiskEngineRejected(Exception):
     def __init__(self, msg_id: str, status_code: int):
         super().__init__(f"risk_engine_rejected:HTTP{status_code}")
         self.msg_id = msg_id
+
+
+def merge_crowdstrike_event(primary: dict, related: dict) -> bool:
+    """Keep distinct Wazuh records for one CrowdStrike detection on one alert."""
+    primary_detection_id = crowdstrike_detection_id(primary)
+    if (
+        primary_detection_id is None
+        or primary_detection_id != crowdstrike_detection_id(related)
+    ):
+        return False
+    related_uuid = str(related.get("log_uuid") or "")
+    if not related_uuid or related_uuid == str(primary.get("log_uuid") or ""):
+        return False
+
+    related_events = primary.setdefault("related_events", [])
+    if not isinstance(related_events, list):
+        related_events = primary["related_events"] = []
+    if any(
+        isinstance(item, dict) and str(item.get("log_uuid") or "") == related_uuid
+        for item in related_events
+    ):
+        return False
+
+    event_fields = (
+        "log_uuid", "@timestamp", "event", "crowdstrike", "threat",
+        "process", "file", "host", "user", "original",
+    )
+    related_events.append({
+        field: related[field]
+        for field in event_fields
+        if field in related
+    })
+    for field in ("crowdstrike", "threat", "process", "file", "user"):
+        incoming = related.get(field)
+        if isinstance(incoming, dict):
+            current = primary.get(field)
+            merged = dict(current) if isinstance(current, dict) else {}
+            for key, value in incoming.items():
+                if value not in (None, "") and merged.get(key) in (None, ""):
+                    merged[key] = value
+            primary[field] = merged
+    return True
 
 
 # ----------------------------------------------------------------- Konfigurasi
@@ -672,16 +714,48 @@ class Database:
             )
         return (row["iris_alert_id"], row["iris_case_id"]) if row else (None, None)
 
-    async def bump_risk(self, log_uuid: uuid.UUID, risk: dict, risk_score: float) -> dict | None:
+    async def bump_risk(
+        self,
+        log_uuid: uuid.UUID,
+        risk: dict,
+        risk_score: float,
+        related_event: dict | None = None,
+    ) -> dict | None:
         async with self.pool.acquire() as conn:
-            payload = await conn.fetchval(
-                "UPDATE log_events SET payload = jsonb_set(payload, '{risk}', $2::jsonb), "
-                "risk_score = $3::real WHERE log_uuid = $1 AND risk_score <= $3::real "
-                "RETURNING payload",
-                log_uuid, orjson.dumps(risk).decode(), float(risk_score))
-        if isinstance(payload, str):
-            payload = orjson.loads(payload)
-        return payload if isinstance(payload, dict) else None
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT payload, risk_score FROM log_events WHERE log_uuid=$1 FOR UPDATE",
+                    log_uuid,
+                )
+                if not row:
+                    return None
+                payload = row["payload"]
+                if isinstance(payload, str):
+                    payload = orjson.loads(payload)
+                if not isinstance(payload, dict):
+                    return None
+
+                current_score = float(row["risk_score"])
+                risk_changed = float(risk_score) >= current_score
+                if risk_changed:
+                    payload["risk"] = risk
+                event_merged = (
+                    merge_crowdstrike_event(payload, related_event)
+                    if related_event is not None
+                    else False
+                )
+                if not risk_changed and not event_merged:
+                    return None
+
+                updated_score = max(current_score, float(risk_score))
+                await conn.execute(
+                    "UPDATE log_events SET payload=$2::jsonb, risk_score=$3::real "
+                    "WHERE log_uuid=$1",
+                    log_uuid,
+                    orjson.dumps(payload).decode(),
+                    updated_score,
+                )
+                return payload
 
     async def purge_old(self, minutes: int) -> int:
         async with self.pool.acquire() as conn:
@@ -1356,7 +1430,7 @@ class App:
                 "repeat_count": repeat
             },
         }
-        for k in ("destination", "file"):
+        for k in ("destination", "file", "crowdstrike", "threat", "process", "user"):
             if data.get(k): doc[k] = data[k]
             
         return Record(msg_id, log_uuid, now, log_day, risk_score, doc)
@@ -1392,6 +1466,10 @@ class App:
 
     @classmethod
     def _dedup_key(cls, doc: dict) -> str:
+        detection_id = crowdstrike_detection_id(doc)
+        if detection_id:
+            fingerprint = hashlib.sha256(detection_id.encode()).hexdigest()
+            return f"iris:dedup:crowdstrike:{fingerprint}"
         ev = doc.get("event") if isinstance(doc.get("event"), dict) else {}
         what = str(ev.get("action") or ev.get("category") or "unknown")[:80]
         return f"iris:dedup:{cls._who(doc)}:{what}"
@@ -1446,34 +1524,68 @@ class App:
             for item in observables
         )
 
-    async def _update_deduped_alert(self, key: str, r: Record) -> None:
+    async def _update_deduped_alert(self, key: str, r: Record) -> bool:
         s = self.s
-        if s.iris_update_s <= 0:
-            return
-        alert_part, _, uuid_part = str(await self.redis.get(key) or "").partition(":")
+        detection_id = crowdstrike_detection_id(r.doc)
+        if s.iris_update_s <= 0 and detection_id is None:
+            return True
+        stored_value = await self.redis.get(key)
+        if detection_id and stored_value == "1":
+            for _ in range(120):
+                await asyncio.sleep(0.25)
+                stored_value = await self.redis.get(key)
+                if stored_value != "1":
+                    break
+            if stored_value == "1":
+                log.warning(
+                    "CrowdStrike detection %s masih diproses oleh worker lain; "
+                    "event duplikat tidak membuat Alert baru.",
+                    detection_id,
+                )
+                return True
+        alert_part, _, uuid_part = str(stored_value or "").partition(":")
         if not alert_part.isdigit() or not uuid_part:
-            return
+            return detection_id is None
         throttle = key.replace("iris:dedup:", "iris:upd:", 1)
-        if not await self.redis.set(throttle, "1", nx=True, ex=s.iris_update_s):
-            return
+        if (
+            detection_id is None
+            and not await self.redis.set(throttle, "1", nx=True, ex=s.iris_update_s)
+        ):
+            return True
         try:
             origin = uuid.UUID(uuid_part)
-            doc = await self.db.bump_risk(origin, r.doc.get("risk") or {}, r.risk_score)
-            if doc is None:
-                return
+            alert_id = int(alert_part) or None
+            doc = await self.db.bump_risk(
+                origin,
+                r.doc.get("risk") or {},
+                r.risk_score,
+                related_event=r.doc if detection_id else None,
+            )
             _, case_id = await self.db.get_iris_ids(origin)
+            if detection_id and r.log_uuid != origin:
+                await self.db.set_iris(r.log_uuid, alert_id, case_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             log.error("Gagal membaca record asli untuk event berulang: %s", _error_label(exc))
-            return
+            return True
+        if doc is None:
+            return True
         repeat = (r.doc.get("risk") or {}).get("repeat_count")
-        alert_id = int(alert_part) or None
         if alert_id:
             try:
                 if await self.iris.update_alert(alert_id, doc):
-                    log.info("IRIS alert %s diperbarui dari event berulang (pengulangan=%s skor=%s)",
-                             alert_id, repeat, r.risk_score)
+                    if detection_id:
+                        log.info(
+                            "IRIS alert %s digabung dengan CrowdStrike detection %s "
+                            "(log_uuid=%s).",
+                            alert_id,
+                            detection_id,
+                            r.log_uuid,
+                        )
+                    else:
+                        log.info("IRIS alert %s diperbarui dari event berulang (pengulangan=%s skor=%s)",
+                                 alert_id, repeat, r.risk_score)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -1487,6 +1599,7 @@ class App:
                 raise
             except Exception as exc:
                 log.error("Gagal memperbarui case IRIS %s dari event berulang: %s", case_id, _error_label(exc))
+        return True
 
     async def _iris_worker(self) -> None:
         s = self.s
@@ -1513,8 +1626,11 @@ class App:
                         await self._update_case_from_enrichment(int(case_id), r)
                     continue
                 if not await self.redis.set(key, "1", nx=True, ex=s.iris_dedup_s):
-                    await self._update_deduped_alert(key, r)
-                    continue
+                    if await self._update_deduped_alert(key, r):
+                        continue
+                    if not await self.redis.set(key, "1", nx=True, ex=s.iris_dedup_s):
+                        await self._update_deduped_alert(key, r)
+                        continue
                 alert_id = case_id = None
                 try:
                     if s.iris_mode == "case":

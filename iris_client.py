@@ -570,6 +570,46 @@ class IrisClient:
             *([f"- Wazuh Level: {_display(ev.get('wazuh_level'), 30)}"] if is_wazuh else []),
             f"- IP tujuan (host yang diserang): {destination_label}",
         ]
+        crowdstrike = _d(doc.get("crowdstrike"))
+        threat = _d(doc.get("threat"))
+        detection_id = crowdstrike.get("detection_id") or crowdstrike.get("composite_id")
+        if detection_id:
+            event_block.append(f"- CrowdStrike Detection ID: {_display(detection_id, 180)}")
+        for field, label in (
+            ("tactic", "Tactic"),
+            ("technique", "Technique"),
+            ("technique_id", "Technique ID"),
+            ("objective", "Objective"),
+        ):
+            value = threat.get(field) or crowdstrike.get(field)
+            if value:
+                event_block.append(f"- {label}: {_display(value, 180)}")
+        related_events = doc.get("related_events")
+        if isinstance(related_events, list):
+            for related in related_events:
+                if not isinstance(related, dict):
+                    continue
+                related_crowdstrike = _d(related.get("crowdstrike"))
+                related_threat = _d(related.get("threat"))
+                related_name = (
+                    related_crowdstrike.get("event_name")
+                    or _d(related.get("event")).get("action")
+                )
+                details = [
+                    f"{label}: {_display(value, 120)}"
+                    for field, label in (
+                        ("tactic", "Tactic"),
+                        ("technique", "Technique"),
+                        ("technique_id", "Technique ID"),
+                        ("objective", "Objective"),
+                    )
+                    if (value := related_threat.get(field) or related_crowdstrike.get(field))
+                ]
+                event_block.append(
+                    "- Event CrowdStrike terkait: "
+                    + _display(related_name or "detail tambahan", 160)
+                    + (f" ({'; '.join(details)})" if details else "")
+                )
         asset_block = ["# Source", *src_lines, "# Destination", *dst_lines]
         # Bagian "# Event" bisa disembunyikan lewat IRIS_SHOW_EVENT=false.
         if self.show_event:

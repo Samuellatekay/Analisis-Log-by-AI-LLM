@@ -221,6 +221,22 @@ def norm_wazuh(p: dict) -> dict:
     domain = _wazuh_domain(data)
     if domain:
         out["domain"] = {"name": domain}
+    cef_event = norm_crowdstrike({"full_log": p.get("full_log", "")})
+    if "crowdstrike" in cef_event:
+        out["crowdstrike"] = cef_event["crowdstrike"]
+        if cef_event.get("threat"):
+            out["threat"] = cef_event["threat"]
+        if cef_event.get("process"):
+            out["process"] = cef_event["process"]
+        if cef_event.get("file"):
+            out["file"] = {
+                **_dict(out.get("file")),
+                **cef_event["file"],
+                "hash": {
+                    **_dict(_dict(out.get("file")).get("hash")),
+                    **_dict(cef_event["file"].get("hash")),
+                },
+            }
     return out
 
 
@@ -354,7 +370,7 @@ _CEF_EXTENSION_KEYS = frozenset({
     "technique", "objective", "url", "userAgent", "CompositeId", "sourceProducts",
     "sourceProductsLabel", "sourceVendors", "sourceVendorsLabel", "dataDomains",
     "dataDomainsLabel", "FalconHostLink", "FalconHostLinkLabel", "ProcessId",
-    "ParentProcessId", "Offset",
+    "ParentProcessId", "Offset", "tacticId", "techniqueId", "patternId",
 })
 _CEF_EXTENSION_KEY_RE = re.compile(
     r"(?<!\\)(?:^|\s)([A-Za-z][A-Za-z0-9]*)="
@@ -559,8 +575,14 @@ def norm_crowdstrike(payload: dict) -> dict:
     out["crowdstrike"] = {
         "cef_version": version.removeprefix("CEF:"),
         "device_version": device_version,
+        "event_name": name,
+        "signature_id": signature_id,
         "external_id": extensions.get("externalId"),
         "detection_id": extensions.get("CompositeId") or extensions.get("externalId"),
+        "composite_id": extensions.get("CompositeId"),
+        "pattern_id": extensions.get("patternId"),
+        "tactic_id": extensions.get("tacticId"),
+        "technique_id": extensions.get("techniqueId"),
         "falcon_host_link": _cef_label_value(extensions, "FalconHostLink"),
         "source_products": extensions.get("sourceProducts"),
         "source_vendors": extensions.get("sourceVendors"),
@@ -569,6 +591,33 @@ def norm_crowdstrike(payload: dict) -> dict:
     }
     out["original"] = orjson.dumps(payload, default=str).decode()[:MAX_ORIGINAL_CHARS]
     return out
+
+
+def crowdstrike_detection_id(payload: dict) -> str | None:
+    crowdstrike = _dict(payload.get("crowdstrike"))
+    detection_id = crowdstrike.get("detection_id") or crowdstrike.get("composite_id")
+    if isinstance(detection_id, str) and detection_id.strip():
+        return detection_id.strip()
+
+    cef = _extract_cef(payload)
+    if cef is None:
+        original = payload.get("original")
+        if isinstance(original, str):
+            try:
+                original_payload = orjson.loads(original)
+            except orjson.JSONDecodeError:
+                original_payload = {}
+            if isinstance(original_payload, dict):
+                cef = _extract_cef(original_payload)
+    if cef is None:
+        return None
+
+    parts = _cef_header(cef)
+    if parts is None or parts[1].casefold() != "crowdstrike":
+        return None
+    extensions = _cef_extensions(parts[7])
+    value = extensions.get("CompositeId") or extensions.get("externalId")
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 NORMALIZERS.update({
@@ -587,10 +636,12 @@ NORMALIZERS.update({
 def normalize(source: str, payload: dict) -> dict:
     source_key = source.strip().lower().replace("_", "-")
     fn = NORMALIZERS.get(source_key)
-    if fn is None and _extract_cef(payload):
-        fn = norm_crowdstrike
-    if fn is None and is_wazuh(payload):
+    if is_wazuh(payload) and source_key not in {
+        "opencti-events", "opencti", "glpi-logs", "glpi",
+    }:
         fn = norm_wazuh
+    elif fn is None and _extract_cef(payload):
+        fn = norm_crowdstrike
     data = fn(payload) if fn else dict(payload)
     data.setdefault("data_source", source)
     # Skema tidak dikenali: sertakan payload asli agar tetap terlihat di Logstash/IRIS

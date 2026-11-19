@@ -28,7 +28,11 @@ sebagai string `message`/`full_log` maupun pada field `data`. Header CEF menjadi
 event dan severity internal; extension seperti hostname, user, process ID,
 command line, hash file, waktu deteksi, serta tactic/technique dipetakan ke
 field `host`, `user`, `process`, `file`, `@timestamp`, dan `threat`. Setiap
-pesan Redis sebaiknya memuat satu baris CEF.
+pesan Redis sebaiknya memuat satu baris CEF. Alert Wazuh yang berasal dari CEF
+CrowdStrike digabungkan di integrasi IRIS berdasarkan `CompositeId` yang sama;
+informasi dari event terkait ditambahkan ke Alert yang sudah dibuat. Ini tidak
+mencegah Wazuh sendiri mencatat dua Alert, dan tidak menghapus event individual
+dari PostgreSQL atau Logstash.
 
 ## GLPI dan OpenCTI
 
