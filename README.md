@@ -22,6 +22,14 @@ ke Logstash, dan mengirim alert berisiko ke DFIR-IRIS.
 dan collector memakai Redis DB yang sama dan tidak ada proses lain yang mengambil
 list tersebut.
 
+## CrowdStrike Falcon
+Log CrowdStrike Falcon dalam format CEF dinormalisasi otomatis, baik dikirim
+sebagai string `message`/`full_log` maupun pada field `data`. Header CEF menjadi
+event dan severity internal; extension seperti hostname, user, process ID,
+command line, hash file, waktu deteksi, serta tactic/technique dipetakan ke
+field `host`, `user`, `process`, `file`, `@timestamp`, dan `threat`. Setiap
+pesan Redis sebaiknya memuat satu baris CEF.
+
 ## GLPI dan OpenCTI
 
 Lookup aset dijadwalkan untuk IP sumber dan tujuan pada event Wazuh serta nama

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 import orjson
@@ -332,11 +334,252 @@ def norm_glpi(payload: dict) -> dict:
     return out
 
 
+_CEF_EXTENSION_KEYS = frozenset({
+    "act", "app", "cat", "cn1", "cn1Label", "cn2", "cn2Label", "cn3", "cn3Label",
+    "cs1", "cs1Label", "cs2", "cs2Label", "cs3", "cs3Label", "cs4", "cs4Label",
+    "cs5", "cs5Label", "cs6", "cs6Label", "cnt", "destinationAddress",
+    "destinationDnsDomain", "destinationHostName", "destinationNtDomain",
+    "destinationPort", "destinationServiceName", "destinationTranslatedAddress",
+    "destinationTranslatedPort", "deviceDirection", "deviceEventClassId",
+    "deviceFacility", "deviceHostName", "deviceProduct", "deviceSeverity",
+    "deviceVendor", "deviceVersion", "dhost", "dmac", "dntdom", "dpid", "dpriv",
+    "dproc", "dpt", "dst", "duid", "duser", "dvchost", "end", "externalId",
+    "fileHash", "filePath", "fileType", "fname", "fsize", "in", "msg",
+    "oldFileId", "out", "outcome", "patternDisposition", "proto", "reason",
+    "request", "requestClientApplication", "requestContext", "requestCookies",
+    "requestMethod", "requestUrl", "rt", "sourceAddress", "sourceDnsDomain",
+    "sourceHostName", "sourceNtDomain", "sourcePort", "sourceServiceName",
+    "sourceTranslatedAddress", "sourceTranslatedPort", "sourceUserName", "sproc",
+    "spt", "src", "start", "subject", "suid", "suser", "tactic", "target",
+    "technique", "objective", "url", "userAgent", "CompositeId", "sourceProducts",
+    "sourceProductsLabel", "sourceVendors", "sourceVendorsLabel", "dataDomains",
+    "dataDomainsLabel", "FalconHostLink", "FalconHostLinkLabel", "ProcessId",
+    "ParentProcessId", "Offset",
+})
+_CEF_EXTENSION_KEY_RE = re.compile(
+    r"(?<!\\)(?:^|\s)([A-Za-z][A-Za-z0-9]*)="
+)
+
+
+def _extract_cef(payload: dict) -> str | None:
+    candidates = [payload]
+    for key in ("data", "event", "log", "raw"):
+        nested = payload.get(key)
+        if isinstance(nested, str) and nested.lstrip().startswith("CEF:"):
+            return nested.strip()
+        if isinstance(nested, dict):
+            candidates.append(nested)
+
+    for candidate in candidates:
+        for key in ("message", "full_log", "log", "raw", "cef", "original"):
+            value = candidate.get(key)
+            if isinstance(value, str) and value.lstrip().startswith("CEF:"):
+                return value.strip()
+    return None
+
+
+def _cef_unescape(value: str) -> str:
+    return (
+        value.replace(r"\=", "=")
+        .replace(r"\|", "|")
+        .replace(r"\n", "\n")
+        .replace(r"\r", "\r")
+        .replace(r"\\", "\\")
+        .strip()
+    )
+
+
+def _cef_header(line: str) -> list[str] | None:
+    fields: list[str] = []
+    start = 0
+    index = 0
+    while index < len(line) and len(fields) < 7:
+        if line[index] == "|":
+            backslashes = 0
+            cursor = index - 1
+            while cursor >= start and line[cursor] == "\\":
+                backslashes += 1
+                cursor -= 1
+            if backslashes % 2 == 0:
+                fields.append(_cef_unescape(line[start:index]))
+                start = index + 1
+        index += 1
+    if len(fields) != 7:
+        return None
+    fields.append(line[start:])
+    if not fields[0].startswith("CEF:"):
+        return None
+    return fields
+
+
+def _cef_extensions(value: str) -> dict[str, str]:
+    matches = [
+        match for match in _CEF_EXTENSION_KEY_RE.finditer(value)
+        if match.group(1) in _CEF_EXTENSION_KEYS
+        or match.group(1).endswith("Label")
+    ]
+    extensions: dict[str, str] = {}
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(value)
+        extensions[match.group(1)] = _cef_unescape(value[match.end():end])
+    return extensions
+
+
+def _cef_severity(value: str) -> int:
+    try:
+        severity = float(value)
+    except (TypeError, ValueError):
+        return 1
+    if severity > 10:
+        severity /= 10
+    if severity <= 3:
+        return 2
+    if severity <= 6:
+        return 3
+    if severity <= 8:
+        return 4
+    return 5
+
+
+def _cef_timestamp(value: str) -> str | None:
+    try:
+        timestamp = datetime.fromtimestamp(float(value) / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, TypeError, ValueError):
+        return None
+    return timestamp.isoformat().replace("+00:00", "Z")
+
+
+def _cef_label_value(extensions: dict[str, str], label: str) -> str | None:
+    for key, value in extensions.items():
+        if key.endswith("Label") and value.casefold() == label.casefold():
+            field = key[:-5]
+            return extensions.get(field)
+    return None
+
+
+def _cef_hash(value: str) -> dict[str, str]:
+    normalized = value.strip().lower()
+    for algorithm, length in (("md5", 32), ("sha1", 40), ("sha256", 64), ("sha512", 128)):
+        if len(normalized) == length and re.fullmatch(r"[0-9a-f]+", normalized):
+            return {algorithm: normalized}
+    return {"value": normalized}
+
+
+def norm_crowdstrike(payload: dict) -> dict:
+    """Normalize CrowdStrike Falcon CEF events and common message envelopes."""
+    cef = _extract_cef(payload)
+    if cef is None:
+        return dict(payload)
+
+    parts = _cef_header(cef)
+    if parts is None:
+        return dict(payload)
+
+    version, vendor, product, device_version, signature_id, name, severity, raw_ext = parts
+    extensions = _cef_extensions(raw_ext)
+    host_name = extensions.get("dhost") or extensions.get("deviceHostName")
+    user_name = extensions.get("duser") or extensions.get("suser")
+    action = extensions.get("msg") or name or signature_id
+    event: dict[str, Any] = {
+        "severity": _cef_severity(severity),
+        "outcome": "alert",
+        "category": ["intrusion_detection"],
+        "action": action[:200],
+        "code": signature_id,
+        "kind": "alert",
+        "provider": f"{vendor}/{product}",
+    }
+    if extensions.get("outcome"):
+        event["outcome_code"] = extensions["outcome"]
+
+    out = dict(payload)
+    out["event"] = {**_dict(payload.get("event")), **event}
+    out["data_source"] = "crowdstrike"
+    out["message"] = extensions.get("msg") or name
+    if host_name:
+        out["host"] = {**_dict(payload.get("host")), "name": host_name}
+        out["asset"] = {**_dict(payload.get("asset")), "name": host_name}
+    if user_name:
+        out["user"] = {**_dict(payload.get("user")), "name": user_name}
+
+    process: dict[str, Any] = {}
+    process_id = _cef_label_value(extensions, "ProcessId")
+    parent_process_id = _cef_label_value(extensions, "ParentProcessId")
+    command_line = _cef_label_value(extensions, "CommandLine")
+    if process_id:
+        process["pid"] = process_id
+    if parent_process_id:
+        process["parent"] = {"pid": parent_process_id}
+    if command_line:
+        process["command_line"] = command_line
+    if extensions.get("fname"):
+        process["name"] = extensions["fname"]
+    if extensions.get("filePath"):
+        process["executable"] = extensions["filePath"]
+    if process:
+        out["process"] = {**_dict(payload.get("process")), **process}
+
+    file_hash = extensions.get("fileHash")
+    if file_hash:
+        out["file"] = {
+            **_dict(payload.get("file")),
+            "hash": {**_dict(_dict(payload.get("file")).get("hash")), **_cef_hash(file_hash)},
+            **({"name": extensions["fname"]} if extensions.get("fname") else {}),
+            **({"path": extensions["filePath"]} if extensions.get("filePath") else {}),
+        }
+
+    threat = {
+        key: extensions[key]
+        for key in ("tactic", "technique", "objective", "patternDisposition")
+        if extensions.get(key)
+    }
+    if threat:
+        out["threat"] = {**_dict(payload.get("threat")), **threat}
+
+    source_ip = _valid_ip(
+        extensions.get("sourceAddress")
+        or extensions.get("sourceTranslatedAddress")
+        or extensions.get("src")
+    )
+    destination_ip = _valid_ip(
+        extensions.get("destinationAddress")
+        or extensions.get("destinationTranslatedAddress")
+        or extensions.get("dst")
+    )
+    if source_ip:
+        out["source"] = {**_dict(payload.get("source")), "ip": source_ip}
+    if destination_ip:
+        out["destination"] = {**_dict(payload.get("destination")), "ip": destination_ip}
+
+    timestamp = _cef_timestamp(extensions.get("rt", ""))
+    if timestamp:
+        out["@timestamp"] = timestamp
+    else:
+        out.setdefault("@timestamp", payload.get("timestamp"))
+    out["crowdstrike"] = {
+        "cef_version": version.removeprefix("CEF:"),
+        "device_version": device_version,
+        "external_id": extensions.get("externalId"),
+        "detection_id": extensions.get("CompositeId") or extensions.get("externalId"),
+        "falcon_host_link": _cef_label_value(extensions, "FalconHostLink"),
+        "source_products": extensions.get("sourceProducts"),
+        "source_vendors": extensions.get("sourceVendors"),
+        "data_domains": extensions.get("dataDomains"),
+        "offset": _cef_label_value(extensions, "Offset"),
+    }
+    out["original"] = orjson.dumps(payload, default=str).decode()[:MAX_ORIGINAL_CHARS]
+    return out
+
+
 NORMALIZERS.update({
     "opencti-events": norm_opencti,
     "opencti": norm_opencti,
     "glpi-logs": norm_glpi,
     "glpi": norm_glpi,
+    "crowdstrike": norm_crowdstrike,
+    "crowdstrike-falcon": norm_crowdstrike,
+    "crowdstrike-falconhost": norm_crowdstrike,
+    "falcon": norm_crowdstrike,
 })
 
 
@@ -344,6 +587,8 @@ NORMALIZERS.update({
 def normalize(source: str, payload: dict) -> dict:
     source_key = source.strip().lower().replace("_", "-")
     fn = NORMALIZERS.get(source_key)
+    if fn is None and _extract_cef(payload):
+        fn = norm_crowdstrike
     if fn is None and is_wazuh(payload):
         fn = norm_wazuh
     data = fn(payload) if fn else dict(payload)
