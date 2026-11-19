@@ -1,12 +1,15 @@
 import asyncio
 import unittest
+import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from main import App, merge_crowdstrike_event
+from iris_client import IrisClient
+from main import App, Record, merge_crowdstrike_event
 from normalizer import crowdstrike_detection_id, normalize
 
 
+FILE_HASH = "38cdcffd5d19eddfdbb4457c5bac7899"
 COMPOSITE_ID = (
     "150efeb191b3436ab095c30d81bbb9a4:ind:"
     "82cbc83af15b46daa02afa032564fd41:"
@@ -17,7 +20,8 @@ DETECTION_CEF = (
     "CEF:0|CrowdStrike|FalconHost|1.0|EppDetectionSummaryEvent|"
     "EppDetectionSummaryEvent|70|"
     "externalId=82cbc83af15b46daa02afa032564fd41 "
-    "dhost=ubuntu2402-soclab duser=root "
+    "dhost=ubuntu2402-soclab duser=root fname=cp filePath=/usr/bin/cp "
+    f"fileHash={FILE_HASH} "
     "msg=The activity may be related to data exfiltration. "
     "cs5Label=CommandLine cs5=cp /etc/shadow /tmp/shadow_direct.txt "
     f"CompositeIdLabel=CompositeId CompositeId={COMPOSITE_ID}"
@@ -172,6 +176,111 @@ class CrowdStrikeWazuhDedupTests(unittest.TestCase):
 
         doc = {"original": json.dumps({"full_log": MITRE_CEF})}
         self.assertEqual(crowdstrike_detection_id(doc), COMPOSITE_ID)
+
+    def test_mitre_event_waits_for_detection_so_alert_contains_file_hash(self):
+        class FakeRedis:
+            def __init__(self):
+                self.values = {}
+
+            async def get(self, key: str):
+                return self.values.get(key)
+
+            async def set(self, key: str, value: str, *, nx=False, ex=None, xx=False, keepttl=False):
+                if nx and key in self.values:
+                    return None
+                if xx and key not in self.values:
+                    return None
+                self.values[key] = value
+                return True
+
+            async def delete(self, key: str):
+                self.values.pop(key, None)
+
+        class FakeDatabase:
+            def __init__(self, documents):
+                self.documents = documents
+                self.iris_ids = {}
+
+            async def get_iris_ids(self, log_uuid):
+                return self.iris_ids.get(log_uuid, (None, None))
+
+            async def bump_risk(self, log_uuid, risk, risk_score, related_event=None):
+                doc = self.documents[log_uuid]
+                if related_event:
+                    merge_crowdstrike_event(doc, related_event)
+                return doc
+
+            async def set_iris(self, log_uuid, alert_id, case_id):
+                self.iris_ids[log_uuid] = (alert_id, case_id)
+
+        class FakeIris(IrisClient):
+            def __init__(self):
+                self.created = asyncio.Event()
+                self.doc = None
+                self.ioc_type_ids = {"md5": 17}
+                self.tlp_id = 2
+                self.iocs = []
+
+            async def create_alert(self, doc):
+                self.doc = doc
+                self.iocs = self._build_alert_iocs(doc)
+                self.created.set()
+                return 2999
+
+        mitre_uuid = uuid.UUID("11111111-1111-4111-8111-111111111111")
+        detection_uuid = uuid.UUID("22222222-2222-4222-8222-222222222222")
+        mitre = normalize(
+            "crowdstrike",
+            wazuh_alert("mitre", "MitreAttack", MITRE_CEF, "hids-soclab"),
+        )
+        detection = normalize(
+            "wazuh-alerts",
+            wazuh_alert("detection", "Data Exfiltration Detected", DETECTION_CEF, "hids-soclab"),
+        )
+        for doc, log_uuid in ((mitre, mitre_uuid), (detection, detection_uuid)):
+            doc["log_uuid"] = str(log_uuid)
+            doc["risk"] = {"score": 64.84, "level": "high", "repeat_count": 1}
+
+        app = App.__new__(App)
+        app.s = SimpleNamespace(
+            iris_dedup_s=300,
+            iris_mode="alert",
+            iris_update_s=10,
+            iris_auto_escalate=False,
+            iris_case_min_risk=75,
+        )
+        app.redis = FakeRedis()
+        app.db = FakeDatabase({mitre_uuid: mitre, detection_uuid: detection})
+        app.iris = FakeIris()
+        app.iris_queue = asyncio.Queue()
+        app.iris_queue.put_nowait(Record(
+            "mitre", mitre_uuid, datetime.now(timezone.utc), "2026.11.19", 64.84, mitre
+        ))
+        app.iris_queue.put_nowait(Record(
+            "detection", detection_uuid, datetime.now(timezone.utc), "2026.11.19", 64.84, detection
+        ))
+
+        async def run_worker():
+            worker = asyncio.create_task(app._iris_worker())
+            try:
+                await asyncio.wait_for(app.iris.created.wait(), timeout=1)
+            finally:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+
+        asyncio.run(run_worker())
+
+        self.assertEqual(app.iris.doc["file"]["hash"]["md5"], FILE_HASH)
+        self.assertEqual(app.iris.iocs[0]["ioc_value"], FILE_HASH)
+        self.assertEqual(app.iris.iocs[0]["ioc_type_id"], 17)
+        self.assertEqual(app.iris.doc["user"]["name"], "root")
+        self.assertEqual(len(app.iris.doc["related_events"]), 1)
+        self.assertEqual(
+            app.iris.doc["related_events"][0]["crowdstrike"]["event_name"],
+            "MitreAttack",
+        )
+        self.assertEqual(app.db.iris_ids[mitre_uuid], (2999, None))
+        self.assertEqual(app.db.iris_ids[detection_uuid], (2999, None))
 
 
 if __name__ == "__main__":

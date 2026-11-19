@@ -1504,6 +1504,24 @@ class App:
         what = str(ev.get("action") or ev.get("category") or "unknown")[:80]
         return f"iris:dedup:{cls._who(doc)}:{what}"
 
+    @classmethod
+    def _crowdstrike_pending_key(cls, doc: dict) -> str | None:
+        if not crowdstrike_detection_id(doc):
+            return None
+        return cls._dedup_key(doc).replace(
+            "iris:dedup:crowdstrike:",
+            "iris:pending:crowdstrike:",
+            1,
+        )
+
+    @staticmethod
+    def _is_crowdstrike_mitre_event(doc: dict) -> bool:
+        crowdstrike = doc.get("crowdstrike")
+        return (
+            isinstance(crowdstrike, dict)
+            and str(crowdstrike.get("event_name") or "").casefold() == "mitreattack"
+        )
+
     async def _case_for(self, r: Record, alert_id: int) -> int | None:
         who = self._who(r.doc)
         case_key, lock = f"iris:case:{who}", f"iris:case-lock:{who}"
@@ -1651,6 +1669,30 @@ class App:
                     if case_id is not None and self._has_enrichment_update(r.doc):
                         await self._update_case_from_enrichment(int(case_id), r)
                     continue
+                if (
+                    case_id is None
+                    and self._is_crowdstrike_mitre_event(r.doc)
+                    and not await self.redis.get(key)
+                ):
+                    pending_key = self._crowdstrike_pending_key(r.doc)
+                    if pending_key:
+                        pending = {
+                            "log_uuid": str(r.log_uuid),
+                            "doc": r.doc,
+                        }
+                        await self.redis.set(
+                            pending_key,
+                            orjson.dumps(pending).decode(),
+                            nx=True,
+                            ex=max(1, s.iris_dedup_s),
+                        )
+                        if not await self.redis.get(key):
+                            log.info(
+                                "CrowdStrike MitreAttack ditahan menunggu DetectionSummary "
+                                "(detection_id=%s).",
+                                crowdstrike_detection_id(r.doc),
+                            )
+                            continue
                 if case_id is not None:
                     if self._has_enrichment_update(r.doc):
                         await self._update_case_from_enrichment(int(case_id), r)
@@ -1661,6 +1703,56 @@ class App:
                     if not await self.redis.set(key, "1", nx=True, ex=s.iris_dedup_s):
                         await self._update_deduped_alert(key, r)
                         continue
+                pending_key = self._crowdstrike_pending_key(r.doc)
+                pending_log_uuid = None
+                pending_merged = False
+                if pending_key:
+                    pending_raw = await self.redis.get(pending_key)
+                    if pending_raw:
+                        try:
+                            pending = orjson.loads(pending_raw)
+                        except orjson.JSONDecodeError:
+                            log.error(
+                                "Payload CrowdStrike pending rusak untuk detection_id=%s.",
+                                crowdstrike_detection_id(r.doc),
+                            )
+                        else:
+                            pending_doc = pending.get("doc") if isinstance(pending, dict) else None
+                            pending_uuid_value = pending.get("log_uuid") if isinstance(pending, dict) else None
+                            if isinstance(pending_doc, dict) and pending_uuid_value:
+                                try:
+                                    candidate_uuid = uuid.UUID(str(pending_uuid_value))
+                                except ValueError:
+                                    log.error(
+                                        "log_uuid CrowdStrike pending tidak valid untuk detection_id=%s.",
+                                        crowdstrike_detection_id(r.doc),
+                                    )
+                                else:
+                                    if (
+                                        candidate_uuid != r.log_uuid
+                                        and merge_crowdstrike_event(r.doc, pending_doc)
+                                    ):
+                                        pending_log_uuid = candidate_uuid
+                                        pending_merged = True
+                                if pending_merged:
+                                    try:
+                                        merged_doc = await self.db.bump_risk(
+                                            r.log_uuid,
+                                            r.doc.get("risk") or {},
+                                            r.risk_score,
+                                            related_event=pending_doc,
+                                        )
+                                        if merged_doc is not None:
+                                            r.doc = merged_doc
+                                    except asyncio.CancelledError:
+                                        raise
+                                    except Exception as exc:
+                                        log.error(
+                                            "Gagal menyimpan CrowdStrike MitreAttack terkait "
+                                            "(log_uuid=%s): %s",
+                                            pending_log_uuid,
+                                            _error_label(exc),
+                                        )
                 alert_id = case_id = None
                 try:
                     if s.iris_mode == "case":
@@ -1690,6 +1782,14 @@ class App:
                 if alert_id is not None or case_id is not None:
                     await self.db.set_iris(r.log_uuid, int(alert_id) if alert_id else None,
                                            int(case_id) if case_id else None)
+                    if pending_merged and pending_log_uuid is not None:
+                        await self.db.set_iris(
+                            pending_log_uuid,
+                            int(alert_id) if alert_id else None,
+                            int(case_id) if case_id else None,
+                        )
+                        if pending_key:
+                            await self.redis.delete(pending_key)
                 log.info("IRIS: alert=%s case=%s log=%s", alert_id, case_id, r.log_uuid)
             except asyncio.CancelledError:
                 raise

@@ -34,11 +34,14 @@ menunjukkan agent/collector Wazuh. Hash file CEF dikirim sebagai IOC alert agar
 tersedia di tab IOCs sejak alert dibuat. Setiap pesan Redis sebaiknya memuat satu
 baris CEF. Alert Wazuh yang berasal dari CEF
 CrowdStrike digabungkan di integrasi IRIS berdasarkan `CompositeId` yang sama;
-informasi dari event terkait ditambahkan ke Alert yang sudah dibuat. Ini tidak
-mencegah Wazuh sendiri mencatat dua Alert, dan tidak menghapus event individual
-dari PostgreSQL atau Logstash. Jika Alert sudah dibuat dari event yang hanya
-memuat hostname collector, event terkait yang menyertakan `dhost` akan
-memperbarui nama aset tujuan di tab Assets IRIS.
+`MitreAttack` yang tiba lebih dulu ditahan selama `IRIS_DEDUP_WINDOW_S` agar
+`DetectionSummary` yang membawa hash dapat digabung sebelum Alert dibuat. Jika
+pasangannya datang, hash dikirim sebagai IOC saat pembuatan Alert. Jika tidak ada
+pasangan, event tetap tersimpan di PostgreSQL tetapi tidak membuat Alert IRIS
+mandiri. Penggabungan ini tidak mencegah Wazuh sendiri mencatat dua Alert dan
+tidak menghapus event individual dari PostgreSQL atau Logstash. Jika Alert sudah
+dibuat dari event yang hanya memuat hostname collector, event terkait yang
+menyertakan `dhost` akan memperbarui nama aset tujuan di tab Assets IRIS.
 
 ## GLPI dan OpenCTI
 
