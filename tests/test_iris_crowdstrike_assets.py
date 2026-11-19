@@ -26,11 +26,11 @@ class FakeIrisClient(IrisClient):
     async def get_alert(self, alert_id: int) -> dict:
         return {
             "assets": [{
-                "asset_id": 42,
-                "asset_name": "hids-soclab",
-                "asset_tags": "destination",
+                "id": 42,
+                "name": "hids-soclab",
+                "tags": [{"tag_title": "destination"}],
                 "asset_description": "Destination lama",
-                "asset_ip": "",
+                "ip": "",
                 "asset_type_id": 1,
             }]
         }

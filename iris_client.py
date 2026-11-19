@@ -298,6 +298,26 @@ def _glpi_items(asset: dict) -> list[dict]:
     return [asset]
 
 
+def _alert_asset_tags(asset: dict) -> set[str]:
+    raw_tags = asset.get("asset_tags") or asset.get("tags") or asset.get("asset_tag") or ""
+    if isinstance(raw_tags, str):
+        return {tag.strip().lower() for tag in raw_tags.split(",") if tag.strip()}
+    if isinstance(raw_tags, dict):
+        raw_tags = [raw_tags]
+    if isinstance(raw_tags, list):
+        tags = set()
+        for item in raw_tags:
+            value = (
+                item.get("tag_title") or item.get("title") or item.get("name")
+                if isinstance(item, dict)
+                else item
+            )
+            if value:
+                tags.add(str(value).strip().lower())
+        return tags
+    return set()
+
+
 def _asset_targets(doc: dict, *, include_unknown: bool = False) -> list[dict]:
     """Susun daftar {candidates, fields}: nama yang mungkin dipakai aset di IRIS + data GLPI."""
     src, dst = _d(doc.get("source")), _d(doc.get("destination"))
@@ -1088,7 +1108,19 @@ class IrisClient:
             if sig in self._asset_sync_done:
                 return 0
             alert = await self.get_alert(alert_id) or {}
-            assets = [a for a in (alert.get("assets") or []) if isinstance(a, dict) and a.get("asset_id") is not None]
+            assets = []
+            for item in alert.get("assets") or []:
+                if not isinstance(item, dict):
+                    continue
+                asset_id = item.get("asset_id") or item.get("id")
+                if asset_id is None:
+                    continue
+                assets.append({
+                    **item,
+                    "asset_id": asset_id,
+                    "asset_name": item.get("asset_name") or item.get("name"),
+                    "asset_ip": item.get("asset_ip") or item.get("ip"),
+                })
             updated, complete, used = 0, True, set()
             for t in targets:
                 cands = {c.lower() for c in t["candidates"]}
@@ -1101,22 +1133,24 @@ class IrisClient:
                         role_matches = [
                             x for x in assets
                             if x["asset_id"] not in used
-                            and role in {
-                                tag.strip()
-                                for tag in str(x.get("asset_tags") or "").lower().split(",")
-                            }
+                                and role in _alert_asset_tags(x)
                         ]
                         if len(role_matches) == 1:
                             a = role_matches[0]
+                    if a is None and len(targets) == 1:
+                        remaining_assets = [x for x in assets if x["asset_id"] not in used]
+                        if len(remaining_assets) == 1:
+                            a = remaining_assets[0]
                 if a is None:
                     complete = False
                     log.info("IRIS: alert %s: aset untuk %s belum ditemukan", alert_id, t["candidates"][:3])
                     continue
                 used.add(a["asset_id"])
-                tag = str(a.get("asset_tags") or "").lower()
-                role = ("Source (kemungkinan penyerang)" if "source" in tag
-                        else "Destination (host yang diserang)" if "destination" in tag else "")
-                new_desc = ((role + "\n") if role else "") + "\n".join(t["glpi_lines"])
+                role_label = {
+                    "source": "Source (kemungkinan penyerang)",
+                    "destination": "Destination (host yang diserang)",
+                }.get(str(t.get("role") or "").lower(), "")
+                new_desc = ((role_label + "\n") if role_label else "") + "\n".join(t["glpi_lines"])
                 new_name = t.get("asset_name") or a.get("asset_name")
                 if (a.get("asset_description") or "") == new_desc and a.get("asset_name") == new_name:
                     continue
@@ -1126,7 +1160,7 @@ class IrisClient:
                     "asset_description": new_desc,
                     "asset_ip": a.get("asset_ip") or t["fields"].get("ip") or "",
                     "asset_domain": a.get("asset_domain") or "",
-                    "asset_tags": a.get("asset_tags") or "",
+                    "asset_tags": a.get("asset_tags") or ",".join(sorted(_alert_asset_tags(a))),
                 }
                 if a.get("asset_enrichment") is not None:
                     body["asset_enrichment"] = a["asset_enrichment"]
@@ -1136,7 +1170,12 @@ class IrisClient:
                     log.warning("IRIS %s -> HTTP %s: %s", path, r.status_code, r.text[:300].replace("\n", " "))
                     r.raise_for_status()
                 updated += 1
-                log.info("IRIS: alert %s: aset %s (%s) diperbarui dengan data GLPI", alert_id, a["asset_id"], a.get("asset_name"))
+                log.info(
+                    "IRIS: alert %s: aset %s diperbarui menjadi %s",
+                    alert_id,
+                    a["asset_id"],
+                    new_name,
+                )
             if complete:
                 if len(self._asset_sync_done) > 5000:
                     self._asset_sync_done.clear()
