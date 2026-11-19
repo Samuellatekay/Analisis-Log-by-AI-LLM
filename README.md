@@ -25,9 +25,11 @@ list tersebut.
 ## CrowdStrike Falcon
 Log CrowdStrike Falcon dalam format CEF dinormalisasi otomatis, baik dikirim
 sebagai string `message`/`full_log` maupun pada field `data`. Header CEF menjadi
-event dan severity internal; extension seperti hostname, user, process ID,
+event dan severity internal; extension seperti `dhost`, user, process ID,
 command line, hash file, waktu deteksi, serta tactic/technique dipetakan ke
-field `host`, `user`, `process`, `file`, `@timestamp`, dan `threat`. Setiap
+field `host`, `user`, `process`, `file`, `@timestamp`, dan `threat`. Untuk alert
+CrowdStrike yang dibungkus Wazuh, `host.name` mengikuti `dhost` (endpoint yang
+terdeteksi), sedangkan `agent.name` tetap menunjukkan agent/collector Wazuh. Setiap
 pesan Redis sebaiknya memuat satu baris CEF. Alert Wazuh yang berasal dari CEF
 CrowdStrike digabungkan di integrasi IRIS berdasarkan `CompositeId` yang sama;
 informasi dari event terkait ditambahkan ke Alert yang sudah dibuat. Ini tidak
@@ -37,7 +39,8 @@ dari PostgreSQL atau Logstash.
 ## GLPI dan OpenCTI
 
 Lookup aset dijadwalkan untuk IP sumber dan tujuan pada event Wazuh serta nama
-Computer GLPI yang sama persis dengan hostname agent. Hasil hostname hanya
+Computer GLPI yang sama persis dengan hostname endpoint (`dhost`) atau host pelapor.
+Hasil hostname hanya
 ditampilkan sebagai aset host pelapor/sensor (atau host tujuan bila IP sumber
 tidak ada), bukan dianggap sebagai IP penyerang. Hasil hostname ambigu ditolak.
 Jika pencarian hostname sensor gagal tetapi hostname dan IP agent sama persis

@@ -94,6 +94,36 @@ def merge_crowdstrike_event(primary: dict, related: dict) -> bool:
                 if value not in (None, "") and merged.get(key) in (None, ""):
                     merged[key] = value
             primary[field] = merged
+    related_crowdstrike = related.get("crowdstrike")
+    endpoint_name = (
+        related_crowdstrike.get("host_name")
+        if isinstance(related_crowdstrike, dict)
+        else None
+    )
+    if isinstance(endpoint_name, str) and endpoint_name.strip():
+        endpoint_name = endpoint_name.strip()
+        current_host = primary.get("host")
+        primary["host"] = {
+            **(current_host if isinstance(current_host, dict) else {}),
+            "name": endpoint_name,
+        }
+        current_asset = primary.get("asset")
+        if not isinstance(current_asset, dict):
+            current_asset = {}
+        related_asset = related.get("asset")
+        if not isinstance(related_asset, dict):
+            related_asset = {}
+        if current_asset.get("name") != endpoint_name:
+            primary["asset"] = {**related_asset, "name": endpoint_name}
+        else:
+            primary["asset"] = {
+                **current_asset,
+                **{
+                    key: value
+                    for key, value in related_asset.items()
+                    if value not in (None, "") and current_asset.get(key) in (None, "")
+                },
+            }
     return True
 
 

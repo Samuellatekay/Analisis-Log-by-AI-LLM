@@ -223,6 +223,13 @@ def norm_wazuh(p: dict) -> dict:
         out["domain"] = {"name": domain}
     cef_event = norm_crowdstrike({"full_log": p.get("full_log", "")})
     if "crowdstrike" in cef_event:
+        cef_host = _dict(cef_event.get("host"))
+        if cef_host.get("name"):
+            out["host"] = {**_dict(out.get("host")), **cef_host}
+            out["asset"] = {
+                **_dict(out.get("asset")),
+                **_dict(cef_event.get("asset")),
+            }
         out["crowdstrike"] = cef_event["crowdstrike"]
         if cef_event.get("threat"):
             out["threat"] = cef_event["threat"]
@@ -580,6 +587,7 @@ def norm_crowdstrike(payload: dict) -> dict:
         "external_id": extensions.get("externalId"),
         "detection_id": extensions.get("CompositeId") or extensions.get("externalId"),
         "composite_id": extensions.get("CompositeId"),
+        "host_name": host_name,
         "pattern_id": extensions.get("patternId"),
         "tactic_id": extensions.get("tacticId"),
         "technique_id": extensions.get("techniqueId"),

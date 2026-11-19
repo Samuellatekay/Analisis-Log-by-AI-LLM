@@ -92,6 +92,9 @@ class CrowdStrikeWazuhDedupTests(unittest.TestCase):
 
         self.assertEqual(detection["data_source"], "wazuh")
         self.assertEqual(mitre["data_source"], "wazuh")
+        self.assertEqual(detection["host"]["name"], "ubuntu2402-soclab")
+        self.assertEqual(detection["agent"]["name"], "hids-soclab")
+        self.assertEqual(detection["crowdstrike"]["host_name"], "ubuntu2402-soclab")
         self.assertEqual(detection["crowdstrike"]["detection_id"], COMPOSITE_ID)
         self.assertEqual(mitre["crowdstrike"]["detection_id"], COMPOSITE_ID)
         self.assertEqual(crowdstrike_detection_id(detection), COMPOSITE_ID)
@@ -115,6 +118,8 @@ class CrowdStrikeWazuhDedupTests(unittest.TestCase):
         )
 
         self.assertEqual(detection["crowdstrike"]["detection_id"], COMPOSITE_ID)
+        self.assertEqual(detection["host"]["name"], "ubuntu2402-soclab")
+        self.assertEqual(detection["agent"]["name"], "hids-soclab")
         self.assertEqual(mitre["threat"]["technique"], "Automated Exfiltration")
         self.assertEqual(mitre["crowdstrike"]["technique_id"], "T1020")
         self.assertEqual(App._dedup_key(detection), App._dedup_key(mitre))
@@ -141,6 +146,24 @@ class CrowdStrikeWazuhDedupTests(unittest.TestCase):
             primary["related_events"][0]["crowdstrike"]["event_name"],
             "MitreAttack",
         )
+
+    def test_related_detection_updates_endpoint_when_mitre_event_arrives_first(self):
+        primary = normalize(
+            "crowdstrike",
+            wazuh_alert("first", "MitreAttack", MITRE_CEF, "hids-soclab"),
+        )
+        related = normalize(
+            "wazuh-alerts",
+            wazuh_alert("second", "Data Exfiltration Detected", DETECTION_CEF, "hids-soclab"),
+        )
+        primary["log_uuid"] = "first-log"
+        related["log_uuid"] = "second-log"
+
+        self.assertEqual(primary["host"]["name"], "hids-soclab")
+        self.assertTrue(merge_crowdstrike_event(primary, related))
+        self.assertEqual(primary["host"]["name"], "ubuntu2402-soclab")
+        self.assertEqual(primary["asset"]["name"], "ubuntu2402-soclab")
+        self.assertEqual(primary["agent"]["name"], "hids-soclab")
 
     def test_detection_id_can_be_read_from_existing_original_json(self):
         import json
