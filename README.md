@@ -41,7 +41,9 @@ pasangan, event tetap tersimpan di PostgreSQL tetapi tidak membuat Alert IRIS
 mandiri. Penggabungan ini tidak mencegah Wazuh sendiri mencatat dua Alert dan
 tidak menghapus event individual dari PostgreSQL atau Logstash. Jika Alert sudah
 dibuat dari event yang hanya memuat hostname collector, event terkait yang
-menyertakan `dhost` akan memperbarui nama aset tujuan di tab Assets IRIS.
+menyertakan `dhost` akan memperbarui nama aset tujuan di tab Assets IRIS. Update
+CrowdStrike yang tidak membawa `dhost` dan hanya memiliki hostname collector tidak
+akan menimpa nama endpoint yang sudah tersimpan di tab Assets.
 
 ## GLPI dan OpenCTI
 
@@ -172,9 +174,11 @@ relasi Alert–Case IRIS, dengan pencocokan `log_uuid` sebagai fallback. Jika
 Pembaruan Case Summary diverifikasi dengan membaca ulang Case dari IRIS; status
 HTTP 200 saja tidak dianggap bukti bahwa Summary sudah tersimpan.
 `stream_iris.py` menyertakan `alert_id` dan `log_uuid` (`alert_source_ref`) pada
-payload ke layanan eksternal agar laporan dapat dikaitkan ke alert asal. Receiver
-mengutamakan kecocokan ID alert yang eksplisit dan menggunakan UUID dari IRIS
-sebagai UUID kanonis bila kedua nilai berbeda.
+payload ke layanan eksternal agar laporan dapat dikaitkan ke alert asal. Payload
+juga memuat `original`, seluruh `alert_source_content`, dan `related_events`
+tanpa pemotongan di normalizer atau pembentuk payload. Receiver mengutamakan
+kecocokan ID alert yang eksplisit dan menggunakan UUID dari IRIS sebagai UUID
+kanonis bila kedua nilai berbeda.
 Receiver meneruskan seluruh teks `incident_report` yang diterima tanpa batas
 karakter atau trim whitespace. Jika log jumlah karakter menunjukkan laporan
 sudah tidak lengkap saat diterima, teks yang hilang harus diperbaiki pada

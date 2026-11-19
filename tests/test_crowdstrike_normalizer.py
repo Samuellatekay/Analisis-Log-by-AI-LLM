@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from normalizer import normalize
@@ -40,6 +41,21 @@ CEF_CRITICAL = (
 
 
 class CrowdStrikeNormalizerTests(unittest.TestCase):
+    def test_wazuh_original_preserves_full_input_without_character_limit(self):
+        long_log = "CEF:0|" + ("raw-event-data|" * 700)
+        input_alert = {
+            "rule": {"id": "200002", "level": 12, "description": "CrowdStrike", "groups": []},
+            "agent": {"id": "000", "name": "hids-soclab"},
+            "decoder": {"name": "crowdstrike-cef"},
+            "location": "127.0.0.1",
+            "full_log": long_log,
+            "data": {"details": "x" * 7000},
+        }
+
+        result = normalize("wazuh-alerts", input_alert)
+
+        self.assertEqual(json.loads(result["original"]), input_alert)
+
     def test_normalizes_cef_message_and_labeled_extension_fields(self):
         result = normalize("crowdstrike-events", {"message": CEF_REVERSE_SHELL})
 

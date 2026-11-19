@@ -322,7 +322,31 @@ def _asset_targets(doc: dict, *, include_unknown: bool = False) -> list[dict]:
     """Susun daftar {candidates, fields}: nama yang mungkin dipakai aset di IRIS + data GLPI."""
     src, dst = _d(doc.get("source")), _d(doc.get("destination"))
     agent = _d(doc.get("agent"))
-    agent_host = _display(_d(doc.get("host")).get("name") or agent.get("name"), 80)
+    host_name = _display(_d(doc.get("host")).get("name"), 80)
+    agent_name = _display(agent.get("name"), 80)
+    crowdstrike = _d(doc.get("crowdstrike"))
+    crowdstrike_host = _display(crowdstrike.get("host_name"), 80)
+    if not crowdstrike_host:
+        related_events = doc.get("related_events")
+        if isinstance(related_events, list):
+            for event in related_events:
+                if isinstance(event, dict):
+                    crowdstrike_host = _display(
+                        _d(event.get("crowdstrike")).get("host_name"), 80
+                    )
+                    if crowdstrike_host:
+                        break
+    collector_only_host = (
+        bool(crowdstrike)
+        and not crowdstrike_host
+        and host_name
+        and agent_name
+        and host_name.casefold() == agent_name.casefold()
+    )
+    agent_host = (
+        crowdstrike_host
+        or (None if collector_only_host else host_name or agent_name)
+    )
     agent_ip = _display(agent.get("ip"), 80)
     dst_ip = _display(dst.get("ip"), 80)
 
@@ -751,12 +775,7 @@ class IrisClient:
 
         tags = ["analisis_log", f"risk:{level}"]
 
-        doc_json_str = orjson.dumps(doc).decode('utf-8')
-        if len(doc_json_str) > 500_000:
-            safe_doc = {"error": "Payload terlalu besar (>500KB), dipangkas untuk keamanan IRIS", "log_uuid": doc.get("log_uuid")}
-        else:
-            safe_doc = doc
-        safe_doc = {**safe_doc, "alert_description_full": full_description}
+        safe_doc = {**doc, "alert_description_full": full_description}
 
         payload: dict[str, Any] = {
             "alert_title": f"[{level.upper()}] {what} - {who}"[:250],

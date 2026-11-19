@@ -73,6 +73,27 @@ class CrowdStrikeAlertAssetTests(unittest.TestCase):
             ),
         )
 
+    def test_collector_name_does_not_replace_endpoint_when_dhost_is_missing(self):
+        client = FakeIrisClient.__new__(FakeIrisClient)
+        client.paths = PATHS["v2"]
+        client.sync_assets_enabled = True
+        client._asset_sync_done = set()
+        client._asset_sync_lock = asyncio.Lock()
+        client._client = FakeHttpClient()
+        doc = {
+            "host": {"name": "hids-soclab"},
+            "agent": {"name": "hids-soclab"},
+            "asset": {"name": "hids-soclab"},
+            "crowdstrike": {"event_name": "MitreAttack"},
+            "source": {},
+            "destination": {},
+        }
+
+        updated = asyncio.run(client.sync_alert_assets(7, doc))
+
+        self.assertEqual(updated, 0)
+        self.assertEqual(client._client.requests, [])
+
 
 class CrowdStrikeAlertIocTests(unittest.TestCase):
     def test_file_hash_is_attached_as_ioc_before_enrichment(self):
@@ -90,6 +111,34 @@ class CrowdStrikeAlertIocTests(unittest.TestCase):
         self.assertEqual(iocs[0]["ioc_value"], file_hash)
         self.assertEqual(iocs[0]["ioc_type_id"], 17)
         self.assertEqual(iocs[0]["ioc_tlp_id"], 2)
+
+
+class RawAlertPayloadTests(unittest.TestCase):
+    def test_build_payload_keeps_original_larger_than_previous_500kb_limit(self):
+        client = IrisClient.__new__(IrisClient)
+        client.min_wazuh_level = 0
+        client.max_wazuh_level = 0
+        client.show_event = True
+        client.assets_in_description = False
+        client.iocs_in_description = False
+        client.asset_type_id = 1
+        client.severity_map = {"medium": 4}
+        client.customer_id = 1
+        client.status_id = None
+        client.source_link_tpl = ""
+        client.ioc_type_ids = {}
+        client.tlp_id = None
+        original = "raw-event|" * 60_000
+        doc = {
+            "log_uuid": "raw-log",
+            "original": original,
+            "event": {"action": "test", "severity": 3, "outcome": "alert"},
+            "risk": {"level": "medium"},
+        }
+
+        payload = client.build_payload(doc)
+
+        self.assertEqual(payload["alert_source_content"]["original"], original)
 
 
 if __name__ == "__main__":

@@ -20,7 +20,6 @@ from typing import Any, Callable
 
 import orjson
 
-MAX_ORIGINAL_CHARS = 6000
 KNOWN_KEYS = ("event", "asset", "reputation", "geolocation", "domain")
 WAZUH_OUTCOME_INFER = os.environ.get("WAZUH_OUTCOME_INFER", "true").lower() == "true"
 
@@ -200,11 +199,7 @@ def norm_wazuh(p: dict) -> dict:
         "agent": agent_info,
         "data_source": "wazuh",
         # Disimpan sebagai STRING (bukan objek) agar tidak merusak mapping Elasticsearch
-        "original": orjson.dumps({
-            "rule": {"id": rule.get("id"), "level": level, "description": rule.get("description"), "groups": groups},
-            "agent": agent_info, "decoder": _dict(p.get("decoder")).get("name"),
-            "location": p.get("location"), "full_log": str(p.get("full_log", ""))[:1500], "data": data,
-        }, default=str).decode()[:MAX_ORIGINAL_CHARS],
+        "original": orjson.dumps(p, default=str).decode(),
     }
     if _srcip(data):
         out["source"] = {"ip": _srcip(data)}
@@ -322,7 +317,7 @@ def norm_opencti(payload: dict) -> dict:
     domain = _first(_dict(p.get("domain")).get("name"), p.get("domain_name"))
     if domain:
         out["domain"] = {**_dict(p.get("domain")), "name": domain}
-    out.setdefault("original", orjson.dumps(payload, default=str).decode()[:MAX_ORIGINAL_CHARS])
+    out.setdefault("original", orjson.dumps(payload, default=str).decode())
     return out
 
 
@@ -355,7 +350,7 @@ def norm_glpi(payload: dict) -> dict:
     source_ip = _first(_dict(p.get("source")).get("ip"), p.get("source_ip"), p.get("ip"))
     if source_ip and _valid_ip(source_ip):
         out["source"] = {**_dict(p.get("source")), "ip": _valid_ip(source_ip)}
-    out.setdefault("original", orjson.dumps(payload, default=str).decode()[:MAX_ORIGINAL_CHARS])
+    out.setdefault("original", orjson.dumps(payload, default=str).decode())
     return out
 
 
@@ -638,7 +633,7 @@ def norm_crowdstrike(payload: dict) -> dict:
         "data_domains": extensions.get("dataDomains"),
         "offset": _cef_label_value(extensions, "Offset"),
     }
-    out["original"] = orjson.dumps(payload, default=str).decode()[:MAX_ORIGINAL_CHARS]
+    out["original"] = orjson.dumps(payload, default=str).decode()
     return out
 
 
@@ -695,5 +690,5 @@ def normalize(source: str, payload: dict) -> dict:
     data.setdefault("data_source", source)
     # Skema tidak dikenali: sertakan payload asli agar tetap terlihat di Logstash/IRIS
     if "original" not in data and not any(k in data for k in KNOWN_KEYS):
-        data["original"] = orjson.dumps(payload, default=str).decode()[:MAX_ORIGINAL_CHARS]
+        data["original"] = orjson.dumps(payload, default=str).decode()
     return data
