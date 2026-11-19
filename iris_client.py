@@ -570,8 +570,11 @@ class IrisClient:
         agent_ip = _display(agent_info.get("ip"), 80)
 
         level = str(risk.get("level", "medium")).lower()
-        what = _md_escape(ev.get("action") or ev.get("category") or "event", 80)
+        what = _md_escape(ev.get("action") or ev.get("category") or "event", 150)
         who = _md_escape(src.get("ip") or asset.get("name") or "unknown", 80)
+        user_name = _display(_d(doc.get("user")).get("name"), 80)
+        if user_name and user_name not in what:
+            who = f"{who} (user: {user_name})"
 
         destination = _d(doc.get("destination"))
         observables = _d(doc.get("enrichment")).get("observables") or []
