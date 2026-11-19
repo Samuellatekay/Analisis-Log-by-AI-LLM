@@ -384,22 +384,56 @@ _CEF_EXTENSION_KEYS = frozenset({
 _CEF_EXTENSION_KEY_RE = re.compile(
     r"(?<!\\)(?:^|\s)([A-Za-z][A-Za-z0-9]*)="
 )
+_CEF_START_RE = re.compile(r"CEF:\d+\|")
+
+
+def _extract_cef_from_string(value: Any) -> str | None:
+    """Return the CEF payload starting at the first `CEF:<n>|` marker.
+
+    Wazuh `full_log` may arrive with a syslog prefix (e.g.
+    `Nov 19 12:00:00 host CEF:0|...`) or other noise before the CEF header.
+    Search for the marker instead of requiring the string to start with `CEF:`.
+
+    If the marker is embedded inside a JSON envelope (`{"full_log": "CEF:0|..."}`),
+    return ``None`` so the caller can JSON-decode first; otherwise the trailing
+    ``"}`` would be captured as part of the CEF payload.
+    """
+    if not isinstance(value, str):
+        return None
+    match = _CEF_START_RE.search(value)
+    if match is None:
+        return None
+    prefix = value[:match.start()]
+    # Syslog prefixes (timestamp/hostname) never contain JSON delimiters.
+    if "{" in prefix or '"' in prefix:
+        return None
+    payload = value[match.start():].strip()
+    if not payload:
+        return None
+    # CEF is line-based; drop anything after a newline (e.g. syslog multi-line).
+    for delimiter in ("\n", "\r"):
+        cut = payload.find(delimiter)
+        if cut != -1:
+            payload = payload[:cut].rstrip()
+    return payload or None
 
 
 def _extract_cef(payload: dict) -> str | None:
     candidates = [payload]
     for key in ("data", "event", "log", "raw"):
         nested = payload.get(key)
-        if isinstance(nested, str) and nested.lstrip().startswith("CEF:"):
-            return nested.strip()
-        if isinstance(nested, dict):
+        if isinstance(nested, str):
+            cef = _extract_cef_from_string(nested)
+            if cef:
+                return cef
+        elif isinstance(nested, dict):
             candidates.append(nested)
 
     for candidate in candidates:
         for key in ("message", "full_log", "log", "raw", "cef", "original"):
-            value = candidate.get(key)
-            if isinstance(value, str) and value.lstrip().startswith("CEF:"):
-                return value.strip()
+            cef = _extract_cef_from_string(candidate.get(key))
+            if cef:
+                return cef
     return None
 
 
@@ -457,6 +491,8 @@ def _cef_severity(value: str) -> int:
         return 1
     if severity > 10:
         severity /= 10
+    if severity <= 0:
+        return 1
     if severity <= 3:
         return 2
     if severity <= 6:
@@ -555,7 +591,10 @@ def norm_crowdstrike(payload: dict) -> dict:
 
     threat = {
         key: extensions[key]
-        for key in ("tactic", "technique", "objective", "patternDisposition")
+        for key in (
+            "tactic", "tacticId", "technique", "techniqueId",
+            "objective", "patternDisposition", "patternId",
+        )
         if extensions.get(key)
     }
     if threat:

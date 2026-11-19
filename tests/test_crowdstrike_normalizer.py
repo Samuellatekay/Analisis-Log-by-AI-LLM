@@ -86,6 +86,22 @@ class CrowdStrikeNormalizerTests(unittest.TestCase):
         self.assertEqual(result["event"]["severity"], 5)
         self.assertEqual(result["host"]["name"], "ubuntu2402-soclab")
 
+    def test_extracts_cef_after_syslog_prefix_in_full_log(self):
+        full_log = "Nov 19 12:00:00 hids-soclab " + CEF_CRITICAL
+        result = normalize("crowdstrike", {"full_log": full_log})
+
+        self.assertEqual(result["data_source"], "crowdstrike")
+        self.assertEqual(result["event"]["severity"], 5)
+        self.assertEqual(result["host"]["name"], "ubuntu2402-soclab")
+        self.assertEqual(result["threat"]["tactic"], "Falcon Overwatch")
+
+    def test_severity_zero_maps_to_informational(self):
+        cef = CEF_CRITICAL.replace("|1.0|EppDetectionSummaryEvent|", "|1.0|InfoEvent|")
+        cef = cef.replace("EppDetectionSummaryEvent|90|", "InfoEvent|0|")
+        result = normalize("crowdstrike", {"message": cef})
+
+        self.assertEqual(result["event"]["severity"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
