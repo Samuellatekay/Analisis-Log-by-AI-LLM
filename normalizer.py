@@ -153,6 +153,16 @@ def is_wazuh(p: dict) -> bool:
         "agent" in p or "manager" in p or _dict(p.get("event")).get("dataset") == "wazuh.alerts")
 
 
+def _clean_wazuh_desc(desc: str) -> str:
+    """Hapus makro kosong dari deskripsi Wazuh (mis. 'on host by user ,')."""
+    desc = re.sub(r"\bon host\s*(?:by user\s*)?,", ",", desc, flags=re.I)
+    desc = re.sub(r"\bon host\s*", " ", desc, flags=re.I)
+    desc = re.sub(r"\bby user\s*,", ",", desc, flags=re.I)
+    desc = re.sub(r"\bby user\s*", " ", desc, flags=re.I)
+    desc = re.sub(r"\s+", " ", desc).strip()
+    return desc
+
+
 def norm_wazuh(p: dict) -> dict:
     """Alert Wazuh -> skema internal. Field kosong tidak disertakan."""
     rule, agent, data = _dict(p.get("rule")), _dict(p.get("agent")), _dict(p.get("data"))
@@ -194,7 +204,7 @@ def norm_wazuh(p: dict) -> dict:
         "@timestamp": p.get("@timestamp") or p.get("timestamp"),
         "event": {"severity": wazuh_severity(level), "outcome": _wazuh_outcome(data, groups),
                   "category": [_wazuh_category(groups)],
-                  "action": str(rule.get("description", "Wazuh alert"))[:200],
+                  "action": _clean_wazuh_desc(str(rule.get("description", "Wazuh alert")))[:200],
                   "wazuh_level": level, "rule_id": rule.get("id")},
         "host": {"name": host}, "asset": {"name": host},  # criticality dicari di Redis asset:<nama>
         "agent": agent_info,
@@ -539,7 +549,11 @@ def norm_crowdstrike(payload: dict) -> dict:
     version, vendor, product, device_version, signature_id, name, severity, raw_ext = parts
     extensions = _cef_extensions(raw_ext)
     host_name = extensions.get("dhost") or extensions.get("deviceHostName")
-    user_name = extensions.get("duser") or extensions.get("suser")
+    user_name = (
+        extensions.get("duser")
+        or extensions.get("suser")
+        or extensions.get("sourceUserName")
+    )
     action = extensions.get("msg") or name or signature_id
     event: dict[str, Any] = {
         "severity": _cef_severity(severity),
