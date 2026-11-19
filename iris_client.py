@@ -298,7 +298,7 @@ def _glpi_items(asset: dict) -> list[dict]:
     return [asset]
 
 
-def _asset_targets(doc: dict) -> list[dict]:
+def _asset_targets(doc: dict, *, include_unknown: bool = False) -> list[dict]:
     """Susun daftar {candidates, fields}: nama yang mungkin dipakai aset di IRIS + data GLPI."""
     src, dst = _d(doc.get("source")), _d(doc.get("destination"))
     agent = _d(doc.get("agent"))
@@ -307,17 +307,30 @@ def _asset_targets(doc: dict) -> list[dict]:
     dst_ip = _display(dst.get("ip"), 80)
 
     if not src.get("ip") and not dst.get("ip"):
-        sides = [(dst.get("ip"), _d(dst.get("asset")) or _d(doc.get("asset")), agent_host)]
+        sides = [(
+            dst.get("ip"),
+            _d(dst.get("asset")) or _d(doc.get("asset")),
+            agent_host,
+            "destination",
+        )]
     else:
         sides = [
-            (src.get("ip"), _d(src.get("asset")), None if src.get("ip") else agent_host),
+            (
+                src.get("ip"),
+                _d(src.get("asset")),
+                None if src.get("ip") else agent_host,
+                "source",
+            ),
             (dst.get("ip"), _d(dst.get("asset")),
-             agent_host if (not dst_ip or dst_ip == agent_ip) else None),
+             agent_host if (not dst_ip or dst_ip == agent_ip) else None, "destination"),
         ]
 
     targets: list[dict] = []
-    for side_ip, side_asset, host_hint in sides:
+    for side_ip, side_asset, host_hint, role in sides:
         items = _glpi_items(side_asset)
+        is_glpi_asset = bool(items)
+        if not items and include_unknown and host_hint:
+            items = [{"name": host_hint}]
         for item in items[:10]:
             cands: list[str] = []
 
@@ -337,7 +350,11 @@ def _asset_targets(doc: dict) -> list[dict]:
             if not cands:
                 continue
 
-            lines = _format_asset({"items": [item]}, side_ip, host_hint)
+            lines = (
+                _format_asset({"items": [item]}, side_ip, host_hint)
+                if is_glpi_asset
+                else _format_asset(side_asset, side_ip, host_hint)
+            )
             fields = {
                 "description": ("Sumber: GLPI (disinkronkan otomatis oleh Analisis_Log)\n"
                                 + "\n".join(lines))[:3500],
@@ -346,7 +363,10 @@ def _asset_targets(doc: dict) -> list[dict]:
                 "ip": (str(priv[0]) if isinstance(priv, list) and priv else None) or _display(item.get("ip"), 80),
             }
             targets.append({"candidates": cands, "glpi_lines": lines,
-                            "fields": {k: v for k, v in fields.items() if v}})
+                            "fields": {k: v for k, v in fields.items() if v},
+                            "asset_name": _display(item.get("name"), 150)
+                            or _display(host_hint, 150) or _display(side_ip, 80),
+                            "role": role})
     return targets
 
 
@@ -1057,7 +1077,7 @@ class IrisClient:
             return 0
         if hasattr(doc, "doc") and isinstance(doc.doc, dict):
             doc = doc.doc
-        targets = _asset_targets(doc if isinstance(doc, dict) else {})
+        targets = _asset_targets(doc if isinstance(doc, dict) else {}, include_unknown=True)
         if not targets:
             return 0
         sig = f"alert:{alert_id}:" + hashlib.sha1(orjson.dumps(targets, option=orjson.OPT_SORT_KEYS)).hexdigest()
@@ -1076,6 +1096,19 @@ class IrisClient:
                     str(x.get("asset_name") or "").lower() in cands
                     or str(x.get("asset_ip") or "").lower() in cands)), None)
                 if a is None:
+                    role = str(t.get("role") or "").lower()
+                    if role:
+                        role_matches = [
+                            x for x in assets
+                            if x["asset_id"] not in used
+                            and role in {
+                                tag.strip()
+                                for tag in str(x.get("asset_tags") or "").lower().split(",")
+                            }
+                        ]
+                        if len(role_matches) == 1:
+                            a = role_matches[0]
+                if a is None:
                     complete = False
                     log.info("IRIS: alert %s: aset untuk %s belum ditemukan", alert_id, t["candidates"][:3])
                     continue
@@ -1084,10 +1117,11 @@ class IrisClient:
                 role = ("Source (kemungkinan penyerang)" if "source" in tag
                         else "Destination (host yang diserang)" if "destination" in tag else "")
                 new_desc = ((role + "\n") if role else "") + "\n".join(t["glpi_lines"])
-                if (a.get("asset_description") or "") == new_desc:
+                new_name = t.get("asset_name") or a.get("asset_name")
+                if (a.get("asset_description") or "") == new_desc and a.get("asset_name") == new_name:
                     continue
                 body = {
-                    "asset_name": a.get("asset_name"),
+                    "asset_name": new_name,
                     "asset_type_id": a.get("asset_type_id"),
                     "asset_description": new_desc,
                     "asset_ip": a.get("asset_ip") or t["fields"].get("ip") or "",
