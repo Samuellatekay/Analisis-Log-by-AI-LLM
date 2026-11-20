@@ -207,9 +207,11 @@ Salin `.env.example` menjadi `.env`, lalu isi nilai konfigurasi Redis, PostgreSQ
 Logstash, dan IRIS:
 
 `RISK_ENGINE_URL` harus menunjuk ke Risk Engine yang dapat dijangkau dari container
-`app`; `RISK_STRATEGY` menerima `linear` atau `ahp_2026`. Kegagalan sementara saat
-menghubungi Risk Engine akan membuat batch dicoba ulang, sedangkan respons HTTP 4xx
-selain 429 dikirim ke dead-letter stream.
+`app`; `RISK_STRATEGY` menerima `linear` atau `ahp_2026`. `RISK_ENGINE_MAX_CONCURRENCY`
+membatasi permintaan bersamaan dari aplikasi ke Risk Engine (default 16); sesuaikan
+berdasarkan hasil uji beban layanan Risk Engine. Kegagalan sementara saat menghubungi
+Risk Engine akan membuat batch dicoba ulang, sedangkan respons HTTP 4xx selain 429
+dikirim ke dead-letter stream.
 
 ```sh
 docker compose up -d --build

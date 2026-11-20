@@ -30,6 +30,7 @@ class RiskAssetMetadataTests(unittest.TestCase):
         self.app = App.__new__(App)
         self.app.s = SimpleNamespace(risk_strategy="ahp_2026")
         self.app.risk_client = _RiskClient()
+        self.app.risk_semaphore = asyncio.Semaphore(16)
 
     def _build_record(self, data):
         asyncio.run(

@@ -165,6 +165,7 @@ class Settings:
     risk_normalize: bool
     shutdown_grace_s: float
     risk_engine_url: str
+    risk_engine_max_concurrency: int
     risk_strategy: str
 
     @classmethod
@@ -205,6 +206,7 @@ class Settings:
             risk_normalize=_e("RISK_NORMALIZE", "false").lower() == "true",
             shutdown_grace_s=float(_e("SHUTDOWN_GRACE_S", "20")),
             risk_engine_url=_e("RISK_ENGINE_URL", "http://soc-risk-engine:8000"),
+            risk_engine_max_concurrency=max(1, int(_e("RISK_ENGINE_MAX_CONCURRENCY", "16"))),
             risk_strategy=risk_strategy,
         )
 
@@ -840,11 +842,14 @@ class App:
         self.iris = IrisClient.from_env(os.environ)
         self.iris_queue: asyncio.Queue = asyncio.Queue(maxsize=s.iris_queue_max)
         self._host = socket.gethostname()
-        
-        # TAMBAHKAN INI: Client HTTP untuk Risk Engine Microservice
+        self.risk_semaphore = asyncio.Semaphore(s.risk_engine_max_concurrency)
         self.risk_client = httpx.AsyncClient(
-            base_url=s.risk_engine_url, 
-            timeout=httpx.Timeout(2.0, connect=1.0)
+            base_url=s.risk_engine_url,
+            timeout=httpx.Timeout(2.0, connect=1.0, pool=2.0),
+            limits=httpx.Limits(
+                max_connections=s.risk_engine_max_concurrency,
+                max_keepalive_connections=s.risk_engine_max_concurrency,
+            ),
         )
 
     # ---- lifecycle
@@ -1356,7 +1361,10 @@ class App:
         what = str(ev.get("action") or ev.get("category") or "unknown")[:80]
         return f"repeat:{who}:{what}"
 
-    # UBAH FUNGSI INI MENJADI ASYNC DAN GUNAKAN HTTP POST KE RISK ENGINE
+    async def _calculate_risk(self, payload: dict) -> httpx.Response:
+        async with self.risk_semaphore:
+            return await self.risk_client.post("/calculate", json=payload)
+
     async def _build_record(self, msg_id: str, data: dict, repeat: int, crit: float | None,
                             now: datetime) -> Record:
         # 1. Siapkan payload untuk soc-risk-engine
@@ -1412,7 +1420,7 @@ class App:
         }
 
         # 2. Jika Risk Engine gagal, biarkan batch di-retry oleh consumer.
-        response = await self.risk_client.post("/calculate", json=payload)
+        response = await self._calculate_risk(payload)
         if 400 <= response.status_code < 500 and response.status_code != 429:
             raise RiskEngineRejected(msg_id, response.status_code)
         response.raise_for_status()

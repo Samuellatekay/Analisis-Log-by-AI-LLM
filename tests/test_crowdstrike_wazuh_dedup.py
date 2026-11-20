@@ -74,6 +74,7 @@ class CrowdStrikeWazuhDedupTests(unittest.TestCase):
         app = App.__new__(App)
         app.s = SimpleNamespace(risk_strategy="ahp_2026")
         app.risk_client = RiskClient()
+        app.risk_semaphore = asyncio.Semaphore(16)
         return asyncio.run(
             app._build_record(
                 msg_id,
