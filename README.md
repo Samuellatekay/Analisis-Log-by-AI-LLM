@@ -191,6 +191,15 @@ Receiver meneruskan seluruh teks `incident_report` yang diterima tanpa batas
 karakter atau trim whitespace. Jika log jumlah karakter menunjukkan laporan
 sudah tidak lengkap saat diterima, teks yang hilang harus diperbaiki pada
 layanan pengirim; receiver tidak dapat memulihkan teks yang tidak dikirim.
+Untuk lonjakan alert, `stream_iris.py` memindai halaman IRIS ke Redis Stream,
+lalu memproses antrean dengan worker paralel. Konfigurasi utamanya:
+`IRIS_ALERT_PAGE_SIZE` (default 100), `IRIS_ALERT_WORKERS` (4), dan
+`IRIS_ALERT_MAX_ATTEMPTS` (8). Alert gagal setelah percobaan maksimum disimpan
+di stream dead-letter `<IRIS_ALERT_QUEUE_STREAM>:dead` untuk pemeriksaan manual.
+Antrean bertahan saat proses `iris-stream` restart selama Redis menyimpan datanya.
+Pengiriman menggunakan semantik at-least-once: jika proses berhenti setelah server
+eksternal menerima alert tetapi sebelum ACK Redis tersimpan, alert dapat terkirim
+ulang; penerima sebaiknya menduplikasi berdasarkan `alert_id`.
 
 ## Konfigurasi dan menjalankan
 
