@@ -146,6 +146,11 @@ def build_minimal_payload(detail_data):
         "log_uuid": detail_data.get("alert_source_ref"),
         "alert_description": full_description or detail_data.get("alert_description", ""),
     }
+    if asc_dict:
+        payload["alert_source_content"] = asc_dict
+        related_events = asc_dict.get("related_events")
+        if isinstance(related_events, list):
+            payload["related_events"] = related_events
 
     raw_original = None
     if "original" in detail_data:

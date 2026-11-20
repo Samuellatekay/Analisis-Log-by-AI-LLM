@@ -106,6 +106,14 @@ sehingga detail GLPI/OpenCTI dan IOC tidak berulang. Riwayat alert/escalation IR
 ## DFIR-IRIS
 
 Atur `IRIS_ENABLED`, `IRIS_URL`, `IRIS_API_KEY`, dan `IRIS_CUSTOMER_ID` di `.env`.
+Untuk instalasi multi-customer, `IRIS_CUSTOMER_ROUTING_MAP` dapat memilih
+customer alert/case dari hostname manager, hostname agent/endpoint, atau keyword
+pada action event. Formatnya `ID:pola1|pola2,ID:pola3`; contoh
+`1:customer-a|hids-a,2:customer-b|hids-b`. Pencocokan tidak peka huruf besar/kecil.
+Jika tidak ada pola yang cocok atau beberapa customer cocok, aplikasi memakai
+`IRIS_CUSTOMER_ID` sebagai fallback dan mencatat warning. Entri map yang salah
+format atau pola duplikat lintas customer menghentikan startup agar routing tidak
+diam-diam salah. Pastikan ID dan pola sesuai dengan customer/manager di IRIS/Wazuh.
 Pilih `IRIS_MODE=alert`, `alert_case`, atau `case`. Gunakan `IRIS_MIN_RISK` dan
 `IRIS_MIN_WAZUH_LEVEL` untuk mengatur ambang pengiriman. Skor risiko dihitung
 terpisah dari level Wazuh.

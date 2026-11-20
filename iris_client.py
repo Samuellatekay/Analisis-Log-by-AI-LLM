@@ -452,6 +452,36 @@ def _case_tags_str(current: dict) -> str:
     return str(tags)
 
 
+def _parse_customer_routing_map(raw: str) -> dict[int, tuple[str, ...]]:
+    routes: dict[int, list[str]] = {}
+    pattern_owners: dict[str, int] = {}
+    for entry in filter(None, (part.strip() for part in raw.split(","))):
+        customer_text, separator, patterns_text = entry.partition(":")
+        if not separator or not customer_text.strip().isdigit():
+            raise ValueError(
+                "IRIS_CUSTOMER_ROUTING_MAP harus berformat ID:hostname|keyword"
+            )
+        customer_id = int(customer_text.strip())
+        patterns = tuple(
+            pattern.strip().casefold()
+            for pattern in patterns_text.split("|")
+            if pattern.strip()
+        )
+        if customer_id <= 0 or not patterns:
+            raise ValueError(
+                "IRIS_CUSTOMER_ROUTING_MAP memerlukan ID positif dan minimal satu hostname/keyword"
+            )
+        for pattern in patterns:
+            owner = pattern_owners.get(pattern)
+            if owner is not None and owner != customer_id:
+                raise ValueError(
+                    f"Pola customer {pattern!r} dipakai oleh ID {owner} dan {customer_id}"
+                )
+            pattern_owners[pattern] = customer_id
+        routes.setdefault(customer_id, []).extend(patterns)
+    return {customer_id: tuple(patterns) for customer_id, patterns in routes.items()}
+
+
 # ---- Bagian "Analisis AI (LLM)" yang ditambahkan stream_receiver ke deskripsi alert/case.
 # Disimpan di akhir deskripsi sebagai section ber-judul "## Analisis AI (LLM) - <8 huruf uuid>"
 # supaya bisa diganti per log_uuid (tanpa dobel) dan dipertahankan saat deskripsi ditulis ulang.
@@ -489,6 +519,8 @@ class IrisClient:
         self.api_version = api_version
         self.paths = PATHS[api_version]
         self.customer_id = customer_id
+        self.customer_routing_map: dict[int, tuple[str, ...]] = {}
+        self._customer_route_warnings: set[str] = set()
         self._severity_explicit = False
         self.min_wazuh_level = 0
         self.max_wazuh_level = 0
@@ -533,10 +565,14 @@ class IrisClient:
             k, _, v = pair.partition(":")
             smap[k.strip().lower()] = int(v)
         status = env.get("IRIS_STATUS_ID", "").strip()
+        customer_routing_map = _parse_customer_routing_map(
+            env.get("IRIS_CUSTOMER_ROUTING_MAP", "")
+        )
         obj = cls(url, key, int(env.get("IRIS_CUSTOMER_ID", "1")), verify,
                   float(env.get("IRIS_TIMEOUT_S", "30")), smap,
                   int(status) if status else None, env.get("IRIS_SOURCE_LINK_TEMPLATE", ""),
                   env.get("IRIS_API_VERSION", "v2").lower())
+        obj.customer_routing_map = customer_routing_map
         obj._severity_explicit = bool(env.get("IRIS_SEVERITY_MAP", "").strip())
         obj.min_wazuh_level = int(env.get("IRIS_MIN_WAZUH_LEVEL", "0") or 0)
         obj.max_wazuh_level = int(env.get("IRIS_MAX_WAZUH_LEVEL", "0") or 0)
@@ -578,6 +614,55 @@ class IrisClient:
         if lvl < self.min_wazuh_level:
             return False
         return not (self.max_wazuh_level and lvl > self.max_wazuh_level)
+
+    def _customer_id_for(self, doc: dict) -> int:
+        routes = getattr(self, "customer_routing_map", {})
+        if not routes:
+            return self.customer_id
+
+        agent = _d(doc.get("agent"))
+        host = _d(doc.get("host"))
+        crowdstrike = _d(doc.get("crowdstrike"))
+        event = _d(doc.get("event"))
+        values = (
+            agent.get("manager"),
+            agent.get("name"),
+            host.get("name"),
+            crowdstrike.get("host_name"),
+            event.get("action"),
+            event.get("reason"),
+            doc.get("message"),
+        )
+        searchable = [str(value).casefold() for value in values if value]
+        categories = event.get("category")
+        if isinstance(categories, list):
+            searchable.extend(str(value).casefold() for value in categories if value)
+
+        matched_ids = {
+            customer_id
+            for customer_id, patterns in routes.items()
+            if any(pattern in value for pattern in patterns for value in searchable)
+        }
+        if len(matched_ids) == 1:
+            return matched_ids.pop()
+
+        warning_key = "unmatched" if not matched_ids else "ambiguous"
+        warnings = getattr(self, "_customer_route_warnings", set())
+        if warning_key not in warnings:
+            warnings.add(warning_key)
+            self._customer_route_warnings = warnings
+            if matched_ids:
+                log.warning(
+                    "Alert cocok dengan beberapa customer %s; menggunakan IRIS_CUSTOMER_ID=%s.",
+                    sorted(matched_ids),
+                    self.customer_id,
+                )
+            else:
+                log.warning(
+                    "Tidak ada rute customer yang cocok; menggunakan IRIS_CUSTOMER_ID=%s.",
+                    self.customer_id,
+                )
+        return self.customer_id
 
     def build_payload(self, doc: dict) -> dict:
         if hasattr(doc, "doc") and isinstance(doc.doc, dict):
@@ -784,7 +869,7 @@ class IrisClient:
             "alert_source_ref": str(doc.get("log_uuid")),
             "alert_source_content": safe_doc,
             "alert_severity_id": self.severity_map.get(level, 4),
-            "alert_customer_id": self.customer_id,
+            "alert_customer_id": self._customer_id_for(doc),
             "alert_source_event_time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "alert_tags": ",".join(tags),
             "alert_assets": alert_assets,
@@ -1250,7 +1335,9 @@ class IrisClient:
             index = {
                 str(r.get("normalized_name") or r.get("name") or "").lower(): r
                 for r in rows
-                if isinstance(r, dict) and r.get("client_id") in (None, self.customer_id)
+                if isinstance(r, dict) and r.get("client_id") in (
+                    None, self._customer_id_for(doc)
+                )
             }
 
             updated, complete, used = 0, True, set()
@@ -1336,7 +1423,7 @@ class IrisClient:
     async def create_case(self, doc: dict) -> int | None:
         p = self.build_payload(doc)
         body = {"case_name": p["alert_title"][:250], "case_description": self._case_text(p),
-                "case_customer": self.customer_id, "case_soc_id": str(doc.get("log_uuid"))}
+                "case_customer": p["alert_customer_id"], "case_soc_id": str(doc.get("log_uuid"))}
         if self.case_summary_field:
             body[self.case_summary_field] = body["case_description"]
         d = await self._post(self.paths["case"], body)

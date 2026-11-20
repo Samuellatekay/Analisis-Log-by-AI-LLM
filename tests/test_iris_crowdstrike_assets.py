@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 
-from iris_client import IrisClient, PATHS
+from iris_client import IrisClient, PATHS, _parse_customer_routing_map
 
 
 class FakeResponse:
@@ -139,6 +139,51 @@ class RawAlertPayloadTests(unittest.TestCase):
         payload = client.build_payload(doc)
 
         self.assertEqual(payload["alert_source_content"]["original"], original)
+
+    def test_customer_routing_uses_manager_or_keyword_and_falls_back_when_unknown(self):
+        client = IrisClient.__new__(IrisClient)
+        client.customer_id = 99
+        client.customer_routing_map = _parse_customer_routing_map(
+            "1:customer-a|hids-a,2:customer-b|hids-b"
+        )
+        client._customer_route_warnings = set()
+        client.min_wazuh_level = 0
+        client.max_wazuh_level = 0
+        client.show_event = True
+        client.assets_in_description = False
+        client.iocs_in_description = False
+        client.asset_type_id = 1
+        client.severity_map = {"medium": 4}
+        client.status_id = None
+        client.source_link_tpl = ""
+        client.ioc_type_ids = {}
+        client.tlp_id = None
+
+        self.assertEqual(
+            client._customer_id_for({"agent": {"manager": "wazuh-hids-a-prod"}}),
+            1,
+        )
+        self.assertEqual(
+            client._customer_id_for({"event": {"action": "Alert for CUSTOMER-B"}}),
+            2,
+        )
+        self.assertEqual(
+            client._customer_id_for({"agent": {"manager": "unmapped-manager"}}),
+            99,
+        )
+        self.assertEqual(
+            client.build_payload({
+                "event": {"action": "Alert for CUSTOMER-B", "severity": 3},
+                "risk": {"level": "medium"},
+            })["alert_customer_id"],
+            2,
+        )
+
+    def test_customer_routing_rejects_ambiguous_or_malformed_maps(self):
+        with self.assertRaises(ValueError):
+            _parse_customer_routing_map("not-a-customer-map")
+        with self.assertRaises(ValueError):
+            _parse_customer_routing_map("1:hids,2:hids")
 
 
 if __name__ == "__main__":
