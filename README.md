@@ -159,7 +159,12 @@ secara langsung dan tidak dipengaruhi sakelar ini.
 
 Pengiriman alert dilakukan melalui antrean worker IRIS. Satu kombinasi sumber dan
 aksi dideduplikasi selama `IRIS_DEDUP_WINDOW_S`. `IRIS_WORKERS` mengatur jumlah
-worker; `IRIS_QUEUE_MAX` membatasi antrean.
+worker; `IRIS_QUEUE_MAX` membatasi antrean dalam memori. Jika penuh, consumer
+menunggu ruang tersedia dan tidak membuang alert; pesan sumber baru di-ACK setelah
+alert memenuhi syarat sudah masuk antrean IRIS. Menaikkan `IRIS_QUEUE_MAX` hanya
+menambah ruang untuk lonjakan sementara. Jika antrean terus bertambah, tingkatkan
+`IRIS_WORKERS` hanya setelah memastikan kapasitas API IRIS dan pantau latensi serta
+error API.
 
 Saat alert dieskalasi menjadi case, deskripsi alert disalin ke Case Summary.
 Eskalasi otomatis ditangani langsung; `stream-receiver` juga memeriksa relasi

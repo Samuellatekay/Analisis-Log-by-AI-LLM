@@ -260,6 +260,7 @@ class CrowdStrikeWazuhDedupTests(unittest.TestCase):
         app.iris_queue.put_nowait(Record(
             "detection", detection_uuid, datetime.now(timezone.utc), "2026.11.19", 64.84, detection
         ))
+        app.s.iris_min_risk = 60
 
         async def run_worker():
             worker = asyncio.create_task(app._iris_worker())

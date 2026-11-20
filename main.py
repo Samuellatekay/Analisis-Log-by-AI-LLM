@@ -1077,9 +1077,10 @@ class App:
             records_ok = records
         if dlq:
             await self._send_dlq(dlq)
+        if records_ok:
+            await self._enqueue_iris(records_ok)
         await ack()
         if records_ok:
-            self._enqueue_iris(records_ok)
             ts = [i.ts_ms for i in items if i.ts_ms]
             e2e = f" e2e_max={(time.time() * 1000 - min(ts)) / 1000:.3f}s" if ts else ""
             level = logging.WARNING if sent_s > LATENCY_BUDGET_S else logging.DEBUG
@@ -1152,7 +1153,7 @@ class App:
                                 orjson.dumps(record.doc).decode()))
                 log.error("Logstash tidak tersedia; %d alert hasil enrichment tetap "
                           "diteruskan ke antrean IRIS", len(records))
-            self._enqueue_iris(records)
+            await self._enqueue_iris(records)
             log.info("Enrichment dicocokkan ke %d alert", len(records))
         elif parsed:
             log.info("Enrichment disimpan untuk pencocokan; alert terkait belum ditemukan")
@@ -1482,19 +1483,23 @@ class App:
         log.error("%d pesan dikirim ke DLQ (%s)", len(items), self.s.dlq_key)
 
     # ---- DFIR-IRIS
-    def _enqueue_iris(self, records: list[Record]) -> None:
+    async def _enqueue_iris(self, records: list[Record]) -> None:
         for record in records:
-            self._to_iris(record)
+            await self._to_iris(record)
 
-    def _to_iris(self, r: Record) -> None:
+    async def _to_iris(self, r: Record) -> None:
         if r.doc.get("data_source") in {"opencti", "glpi"}:
             return
         if not self.iris or r.risk_score < self.s.iris_min_risk or not self.iris.allows(r.doc):
             return
-        try:
-            self.iris_queue.put_nowait(r)
-        except asyncio.QueueFull:
-            log.warning("Antrean IRIS penuh; alert %s tidak dikirim", r.log_uuid)
+        if self.iris_queue.full():
+            log.warning(
+                "Antrean IRIS penuh (%d); menahan pemrosesan sampai ada ruang "
+                "(alert=%s).",
+                self.iris_queue.maxsize,
+                r.log_uuid,
+            )
+        await self.iris_queue.put(r)
 
     @staticmethod
     def _who(doc: dict) -> str:
